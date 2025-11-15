@@ -23,15 +23,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv(" decencyTOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 SHEET_ID = "1HBdZBWjlplVdZ4a7A5hdXxPyb2vyQ68ntIJ-oPfRwhA"
-RANGE_NAME = "Support!A:B"  # ← Проверьте точное имя листа!
+RANGE_NAME = "Support!A:B"
 
-# Проверка переменных
+# === АДМИН (из переменной окружения) ===
+ADMIN_ID_STR = os.getenv("ADMIN_ID")
+if not ADMIN_ID_STR:
+    logger.error("ОШИБКА: Не задан ADMIN_ID в переменных окружения!")
+    exit(1)
+
+try:
+    ADMIN_IDS = [int(uid.strip()) for uid in ADMIN_ID_STR.split(",") if uid.strip()]
+    if not ADMIN_IDS:
+        raise ValueError
+    logger.info(f"Админы загружены: {ADMIN_IDS}")
+except ValueError:
+    logger.error("ОШИБКА: ADMIN_ID должен быть числом или списком через запятую! Пример: 123456789,987654321")
+    exit(1)
+
+# Проверка остальных переменных
 if not all([TELEGRAM_TOKEN, GROQ_API_KEY, GOOGLE_CREDENTIALS]):
-    logger.error("ОШИБКА: Не заданы переменные в Render!")
+    logger.error("ОШИБКА: Не заданы TELEGRAM_TOKEN, GROQ_API_KEY или GOOGLE_CREDENTIALS!")
     exit(1)
 logger.info("Переменные загружены.")
 
@@ -57,19 +72,19 @@ except Exception as e:
     logger.error(f"Ошибка Groq: {e}")
     exit(1)
 
-# === КЕШИРОВАННАЯ БАЗА ЗНАНИЙ (с \n) ===
+# === КЕШИРОВАННАЯ БАЗА ЗНАНИЙ ===
 @lru_cache(maxsize=1)
 def get_knowledge_base():
     try:
         logger.info(f"Читаем Google Sheets: {RANGE_NAME}")
         result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
-        rows = result.get("values", [])[1:]  # Пропускаем заголовок
+        rows = result.get("values", [])[1:]
         kb_entries = []
         for r in rows:
             problem = r[0].strip() if len(r) > 0 else ""
             solution = r[1].strip() if len(r) > 1 else "Нет решения"
             kb_entries.append(f"Проблема: {problem}\nРешение: {solution}")
-        kb = "\n\n".join(kb_entries)  # Двойной \n — разделитель записей
+        kb = "\n\n".join(kb_entries)
         logger.info(f"База знаний загружена: {len(rows)} записей.")
         return kb or "База знаний пуста."
     except Exception as e:
@@ -84,55 +99,72 @@ SYSTEM_PROMPT = """
 Отвечай кратко, по-русски, шаг за шагом.
 """
 
-# === КОМАНДА /reload ===
+# === КОМАНДЫ АДМИНА ===
+async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    context.bot_data["paused"] = True
+    await update.message.reply_text("Бот приостановлен. Используй /resume")
+
+async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    context.bot_data["paused"] = False
+    await update.message.reply_text("Бот возобновлён!")
+
+async def status_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    status = "приостановлен" if context.bot_data.get("paused", False) else "работает"
+    await update.message.reply_text(f"Бот {status}")
+
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Доступ запрещён.")
+        return
     get_knowledge_base.cache_clear()
     logger.info("Кеш сброшен по команде /reload")
     await update.message.reply_text("База знаний обновлена!")
 
-# === ОБРАБОТКА СООБЩЕНИЙ (ТЕКСТ + ПОДПИСИ К МЕДИА) ===
+# === ОБРАБОТКА СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
-    # === Получаем текст: из .text или .caption ===
-    text = (message.text or message.caption or "").strip()
+    # === ПРОВЕРКА ПАУЗЫ ===
+    if context.bot_data.get("paused", False):
+        if message.text == "/status" and update.effective_user.id in ADMIN_IDS:
+            await message.reply_text("Бот приостановлен.")
+        return
 
-    # Игнорируем команды и пустые сообщения
+    # === Текст или подпись ===
+    text = (message.text or message.caption or "").strip()
     if not text or text.startswith("/"):
         return
 
-    logger.info(f"Сообщение (текст/подпись): {text[:50]}...")
+    logger.info(f"Сообщение: {text[:50]}...")
 
-    # === Загружаем базу знаний ===
     kb = get_knowledge_base()
     kb_blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
     user_query = text.lower().strip()
     best_score = 0
     best_solution = None
 
-    # === Поиск по базе знаний ===
     for block in kb_blocks:
         lines = [line.strip() for line in block.split("\n")]
         if len(lines) < 2 or not lines[0].lower().startswith("проблема:"):
             continue
-        problem = lines[0][10:].strip()  # Убираем "Проблема: "
+        problem = lines[0][10:].strip()
         score = fuzz.ratio(user_query, problem.lower())
         if score > 85 and score > best_score:
             best_score = score
-            solution_lines = []
-            for line in lines[1:]:
-                cleaned = line.replace("Решение: ", "", 1).strip()
-                if cleaned:
-                    solution_lines.append(cleaned)
+            solution_lines = [line.replace("Решение: ", "", 1).strip() for line in lines[1:] if line.strip()]
             best_solution = "\n".join(solution_lines)
 
-    # === Ответ из базы ===
     if best_solution:
         await message.reply_text(best_solution)
         logger.info(f"Ответ из базы (схожесть: {best_score}%)")
         return
 
-    # === Fallback: Groq ===
     full_prompt = SYSTEM_PROMPT.format(kb=kb) + f"\n\nЗапрос: {text}"
     try:
         response = client.chat.completions.create(
@@ -148,11 +180,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка Groq: {e}")
         await message.reply_text("Извини, временная ошибка.")
 
-# === АВТООБНОВЛЕНИЕ КЕША КАЖДЫЕ 5 МИНУТ ===
+# === АВТООБНОВЛЕНИЕ ===
 def schedule_auto_reload(app):
     def clear_cache(ctx):
         get_knowledge_base.cache_clear()
-        logger.info("Автообновление: кеш базы знаний сброшен")
+        logger.info("Автообновление: кеш сброшен")
     app.job_queue.run_repeating(clear_cache, interval=300, first=10)
 
 # === ЗАПУСК ===
@@ -160,18 +192,21 @@ if __name__ == "__main__":
     logger.info("Запуск бота...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # === Хендлеры ===
-    # Обрабатываем: текст ИЛИ любое медиа с подписью (фото, видео, документы, голосовые и т.д.)
+    # Автопауза
+    if os.getenv("BOT_PAUSED", "false").lower() == "true":
+        app.bot_data["paused"] = True
+        logger.info("Бот в режиме паузы (BOT_PAUSED=true)")
+
+    # Хендлеры
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) |
         (filters.CAPTION & ~filters.COMMAND),
         handle_message
     ))
-
     app.add_handler(CommandHandler("reload", reload_kb))
+    app.add_handler(CommandHandler("pause", pause_bot))
+    app.add_handler(CommandHandler("resume", resume_bot))
+    app.add_handler(CommandHandler("status", status_bot))
 
-    # Автообновление кеша
     schedule_auto_reload(app)
-
-    # Запуск
     app.run_polling(drop_pending_updates=True)
