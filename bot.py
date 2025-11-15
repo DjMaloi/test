@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 SHEET_ID = "1HBdZBWjlplVdZ4a7A5hdXxPyb2vyQ68ntIJ-oPfRwhA"
-RANGE_NAME = "Sheet1!A:B"
+RANGE_NAME = "Support!A:B"
 
 # Проверка переменных
 if not all([TELEGRAM_TOKEN, GROQ_API_KEY, GOOGLE_CREDENTIALS]):
