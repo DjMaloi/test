@@ -90,30 +90,32 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Кеш сброшен по команде /reload")
     await update.message.reply_text("База знаний обновлена!")
 
-# === ОБРАБОТКА СООБЩЕНИЙ ===
+# === ОБРАБОТКА СООБЩЕНИЙ (ТЕКСТ + ПОДПИСИ К МЕДИА) ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    message = update.message
+
+    # === Получаем текст: из .text или .caption ===
+    text = (message.text or message.caption or "").strip()
+
+    # Игнорируем команды и пустые сообщения
     if not text or text.startswith("/"):
         return
 
-    logger.info(f"Сообщение: {text[:50]}...")
+    logger.info(f"Сообщение (текст/подпись): {text[:50]}...")
 
+    # === Загружаем базу знаний ===
     kb = get_knowledge_base()
     kb_blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
-
     user_query = text.lower().strip()
     best_score = 0
     best_solution = None
 
-    # Поиск по базе
+    # === Поиск по базе знаний ===
     for block in kb_blocks:
         lines = [line.strip() for line in block.split("\n")]
-        if len(lines) < 2:
+        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"):
             continue
-        if not lines[0].lower().startswith("проблема:"):
-            continue
-
-        problem = lines[0][10:].strip()
+        problem = lines[0][10:].strip()  # Убираем "Проблема: "
         score = fuzz.ratio(user_query, problem.lower())
         if score > 85 and score > best_score:
             best_score = score
@@ -124,13 +126,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     solution_lines.append(cleaned)
             best_solution = "\n".join(solution_lines)
 
-    # Ответ из базы
+    # === Ответ из базы ===
     if best_solution:
-        await update.message.reply_text(best_solution)
+        await message.reply_text(best_solution)
         logger.info(f"Ответ из базы (схожесть: {best_score}%)")
         return
 
-    # Groq
+    # === Fallback: Groq ===
     full_prompt = SYSTEM_PROMPT.format(kb=kb) + f"\n\nЗапрос: {text}"
     try:
         response = client.chat.completions.create(
@@ -140,31 +142,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temperature=0.7,
         )
         reply = response.choices[0].message.content.strip()
-        await update.message.reply_text(reply)
+        await message.reply_text(reply)
         logger.info("Ответ от Groq")
     except Exception as e:
         logger.error(f"Ошибка Groq: {e}")
-        await update.message.reply_text("Извини, временная ошибка.")
+        await message.reply_text("Извини, временная ошибка.")
 
 # === АВТООБНОВЛЕНИЕ КЕША КАЖДЫЕ 5 МИНУТ ===
 def schedule_auto_reload(app):
     def clear_cache(ctx):
         get_knowledge_base.cache_clear()
         logger.info("Автообновление: кеш базы знаний сброшен")
-
     app.job_queue.run_repeating(clear_cache, interval=300, first=10)
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
     logger.info("Запуск бота...")
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Хендлеры
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # === Хендлеры ===
+    # Обрабатываем: текст ИЛИ любое медиа с подписью (фото, видео, документы, голосовые и т.д.)
+    app.add_handler(MessageHandler(
+        (filters.TEXT & ~filters.COMMAND) |
+        (filters.CAPTION & ~filters.COMMAND),
+        handle_message
+    ))
+
     app.add_handler(CommandHandler("reload", reload_kb))
 
-    # Автообновление
+    # Автообновление кеша
     schedule_auto_reload(app)
 
+    # Запуск
     app.run_polling(drop_pending_updates=True)
