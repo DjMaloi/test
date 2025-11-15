@@ -23,38 +23,77 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
-TELEGRAM_TOKEN = os.getenv(" decencyTOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 SHEET_ID = "1HBdZBWjlplVdZ4a7A5hdXxPyb2vyQ68ntIJ-oPfRwhA"
 RANGE_NAME = "Support!A:B"
 
-# === АДМИН (из переменной окружения) ===
+# === ПРОВЕРКА КАЖДОЙ ПЕРЕМЕННОЙ ОТДЕЛЬНО ===
+errors = []
+
+# 1. TELEGRAM_TOKEN
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+if not TELEGRAM_TOKEN:
+    errors.append("TELEGRAM_TOKEN не задан")
+elif not TELEGRAM_TOKEN.strip():
+    errors.append("TELEGRAM_TOKEN пустой")
+else:
+    logger.info("TELEGRAM_TOKEN загружен")
+
+# 2. GROQ_API_KEY
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    errors.append("GROQ_API_KEY не задан")
+elif not GROQ_API_KEY.strip():
+    errors.append("GROQ_API_KEY пустой")
+else:
+    logger.info("GROQ_API_KEY загружен")
+
+# 3. GOOGLE_CREDENTIALS
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+if not GOOGLE_CREDENTIALS:
+    errors.append("GOOGLE_CREDENTIALS не задан")
+elif not GOOGLE_CREDENTIALS.strip():
+    errors.append("GOOGLE_CREDENTIALS пустой")
+else:
+    try:
+        creds_info = json.loads(GOOGLE_CREDENTIALS)
+        required_keys = ["type", "project_id", "private_key", "client_email"]
+        missing = [k for k in required_keys if k not in creds_info]
+        if missing:
+            errors.append(f"GOOGLE_CREDENTIALS: отсутствуют ключи: {', '.join(missing)}")
+        else:
+            logger.info("GOOGLE_CREDENTIALS — валидный JSON")
+    except json.JSONDecodeError as e:
+        errors.append(f"GOOGLE_CREDENTIALS — невалидный JSON: {e}")
+
+# 4. ADMIN_ID
 ADMIN_ID_STR = os.getenv("ADMIN_ID")
 if not ADMIN_ID_STR:
-    logger.error("ОШИБКА: Не задан ADMIN_ID в переменных окружения!")
-    exit(1)
+    errors.append("ADMIN_ID не задан")
+elif not ADMIN_ID_STR.strip():
+    errors.append("ADMIN_ID пустой")
+else:
+    try:
+        ADMIN_IDS = [int(uid.strip()) for uid in ADMIN_ID_STR.split(",") if uid.strip()]
+        if not ADMIN_IDS:
+            raise ValueError
+        logger.info(f"Админы загружены: {ADMIN_IDS}")
+    except ValueError:
+        errors.append("ADMIN_ID должен быть числом или списком чисел через запятую")
 
-try:
-    ADMIN_IDS = [int(uid.strip()) for uid in ADMIN_ID_STR.split(",") if uid.strip()]
-    if not ADMIN_IDS:
-        raise ValueError
-    logger.info(f"Админы загружены: {ADMIN_IDS}")
-except ValueError:
-    logger.error("ОШИБКА: ADMIN_ID должен быть числом или списком через запятую! Пример: 123456789,987654321")
+# === ВЫВОД ОШИБОК ===
+if errors:
+    logger.error("ОШИБКИ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ:")
+    for err in errors:
+        logger.error(f"  → {err}")
+    logger.error("Исправь переменные в Render → Environment и сделай Manual Deploy!")
     exit(1)
-
-# Проверка остальных переменных
-if not all([TELEGRAM_TOKEN, GROQ_API_KEY, GOOGLE_CREDENTIALS]):
-    logger.error("ОШИБКА: Не заданы TELEGRAM_TOKEN, GROQ_API_KEY или GOOGLE_CREDENTIALS!")
-    exit(1)
-logger.info("Переменные загружены.")
+else:
+    logger.info("Все переменные окружения успешно загружены!")
 
 # === GOOGLE SHEETS ===
 try:
-    creds_info = json.loads(GOOGLE_CREDENTIALS)
     creds = Credentials.from_service_account_info(
-        creds_info,
+        json.loads(GOOGLE_CREDENTIALS),
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
     )
     service = build("sheets", "v4", credentials=creds)
@@ -130,13 +169,11 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
-    # === ПРОВЕРКА ПАУЗЫ ===
     if context.bot_data.get("paused", False):
         if message.text == "/status" and update.effective_user.id in ADMIN_IDS:
             await message.reply_text("Бот приостановлен.")
         return
 
-    # === Текст или подпись ===
     text = (message.text or message.caption or "").strip()
     if not text or text.startswith("/"):
         return
@@ -192,12 +229,10 @@ if __name__ == "__main__":
     logger.info("Запуск бота...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Автопауза
     if os.getenv("BOT_PAUSED", "false").lower() == "true":
         app.bot_data["paused"] = True
         logger.info("Бот в режиме паузы (BOT_PAUSED=true)")
 
-    # Хендлеры
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) |
         (filters.CAPTION & ~filters.COMMAND),
