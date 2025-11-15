@@ -1,140 +1,87 @@
-import telebot
-import pandas as pd
-import requests
-import json
-import re
-from datetime import datetime
-import threading
 import os
-from dotenv import load_dotenv
+import logging
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from groq import Groq
 
-# Загрузка переменных из .env
-load_dotenv()
+# Настройка логов
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# === НАСТРОЙКИ ===
-TOKEN = os.getenv('TOKEN')  # Токен от @BotFather
-GROQ_API_KEY = os.getenv('GROQ_API_KEY')  # Ключ с console.groq.com
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1HBdZBWjlplVdZ4a7A5hdXxPyb2vyQ68ntIJ-oPfRwhA/export?format=csv"  # Твоя ссылка!
+# Переменные (замени на свои или используй env в Railway)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ТВОЙ_ТОКЕН_ЗДЕСЬ")  # Из @BotFather
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "ТВОЙ_GROQ_КЛЮЧ_ЗДЕСЬ")  # Из console.groq.com
+SHEET_ID = "1HBdZBWjlplVdZ4a7A5hdXxPyb2vyQ68ntIJ-oPfRwhA"  # Твоя таблица
+RANGE_NAME = "Sheet1!A:B"  # A=Проблема, B=Решение (измени, если структура другая)
 
-if not TOKEN or not GROQ_API_KEY:
-    raise ValueError("❌ Укажите TOKEN и GROQ_API_KEY в .env файле!")
+# Проверка переменных
+if "ТВОЙ_ТОКЕН_ЗДЕСЬ" in TELEGRAM_TOKEN or "ТВОЙ_GROQ_КЛЮЧ_ЗДЕСЬ" in GROQ_API_KEY:
+    logger.error("ЗАМЕНИ ТОКЕНЫ В КОДЕ ИЛИ В ENV!")
+    exit(1)
 
-bot = telebot.TeleBot(TOKEN)
+# Google Sheets подключение
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+creds = Credentials.from_service_account_file('service_account.json', scopes=SCOPES)
+service = build('sheets', 'v4', credentials=creds)
+sheet_service = service.spreadsheets()
 
-# Загрузка базы знаний
-def load_knowledge_base():
+def get_knowledge_base():
+    """Читает базу из твоей таблицы"""
     try:
-        df = pd.read_csv(SHEET_URL)
-        print(f"✅ Загружено {len(df)} записей из базы.")
-        return df
+        result = sheet_service.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
+        rows = result.get('values', [])
+        if not rows or len(rows) < 2:
+            return "База знаний пуста. Добавь строки в таблицу."
+        # Пропускаем заголовок
+        kb_rows = rows[1:]
+        kb_text = "\n".join([f"Проблема: {row[0]}\nРешение: {row[1] if len(row) > 1 else 'Нет решения'}" for row in kb_rows if row])
+        logger.info(f"Загружено {len(kb_rows)} проблем из таблицы.")
+        return kb_text
     except Exception as e:
-        print(f"❌ Ошибка загрузки: {e}")
-        return pd.DataFrame(columns=['keywords', 'answer', 'tags', 'priority', 'last_updated'])
+        logger.error(f"Ошибка чтения таблицы: {e}")
+        return "Ошибка доступа к базе. Проверь шаринг с Service Account."
 
-df = load_knowledge_base()
+# Groq клиент
+client = Groq(api_key=GROQ_API_KEY)
 
-# === ПОИСК В БАЗЕ ЗНАНИЙ (с приоритетом) ===
-def search_in_kb(question):
-    q = question.lower().strip()
-    best_match = None
-    best_priority = float('inf')  # Ищем самый высокий приоритет (меньшее число)
+SYSTEM_PROMPT = """
+Ты — умный бот техподдержки. Используй ТОЛЬКО эту базу знаний для ответов (не придумывай ничего лишнего):
+{kb}
+
+Если запрос не совпадает с базой, скажи: "Не нашёл точного решения. Опиши проблему подробнее или обратись к модератору."
+Отвечай кратко, по-русски, в 2–3 шага. Будь полезным и дружелюбным.
+"""
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text or text.startswith('/'):
+        return
+
+    logger.info(f"Новое сообщение: {text[:50]}...")
     
-    for _, row in df.iterrows():
-        keywords_str = str(row['keywords']).lower()
-        keywords = [k.strip() for k in keywords_str.split(',')]
-        if any(kw in q for kw in keywords):
-            priority = int(row['priority']) if pd.notna(row['priority']) else 999
-            if priority < best_priority:
-                best_priority = priority
-                best_match = row['answer']
-    
-    return best_match
-
-# === ИИ-ОТВЕТ (Groq + Llama 3.1) ===
-def ask_ai(question, kb_context=""):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    prompt = f"""
-Ты — техподдержка. Отвечай кратко, по делу, на русском языке.
-Если есть контекст из базы — используй его как основу.
-
-Контекст из базы знаний: {kb_context}
-
-Вопрос: {question}
-
-Ответ (с HTML-тегами для форматирования, если нужно):
-    """.strip()
-
-    payload = {
-        "model": "llama-3.1-70b-versatile",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.5,
-        "max_tokens": 300
-    }
+    # Загружаем базу
+    kb = get_knowledge_base()
+    full_prompt = SYSTEM_PROMPT.format(kb=kb) + f"\n\nЗапрос пользователя: {text}"
 
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=15)
-        if r.status_code == 200:
-            return r.json()['choices'][0]['message']['content'].strip()
-        else:
-            return "⚠️ Ошибка ИИ. Попробуйте позже или напишите @admin."
+        response = client.chat.completions.create(
+            model="llama3-8b-8192",  # Бесплатная быстрая модель
+            messages=[{"role": "system", "content": full_prompt}],
+            max_tokens=250,
+            temperature=0.7  # Для естественности
+        )
+        reply = response.choices[0].message.content.strip()
+        await update.message.reply_text(reply)
+        logger.info("Ответ отправлен успешно.")
     except Exception as e:
-        print(f"❌ ИИ-ошибка: {e}")
-        return "⚠️ Не могу связаться с ИИ. Обратитесь к администратору."
+        logger.error(f"Ошибка Groq: {e}")
+        await update.message.reply_text("Извини, временная ошибка. Попробуй перефразировать вопрос.")
 
-# === ОБРАБОТЧИК СООБЩЕНИЙ ===
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    if message.chat.type not in ['group', 'supergroup']:
-        return  # Только в группах
-
-    text = message.text or ""
-    bot_username = bot.get_me().username.lower()
-    # Активация: упоминание @bot или прямое сообщение
-    if not (text.startswith(f'@{bot_username}') or bot_username in text.lower()):
-        return
-
-    question = re.sub(r'@[A-Za-z0-9_]+', '', text).strip()  # Убираем @mentions
-    if not question or len(question) < 3:
-        bot.reply_to(message, "❓ Уточните вопрос, пожалуйста.")
-        return
-
-    # 1. Поиск в базе (с контекстом для ИИ)
-    kb_answer = search_in_kb(question)
-    kb_context = ""  # Для ИИ, если не нашли
-    if kb_answer:
-        bot.reply_to(message, kb_answer, parse_mode='HTML')
-        print(f"✅ KB-ответ на: {question[:50]}...")
-        return
-    else:
-        # Ищем похожие для контекста ИИ
-        q_lower = question.lower()
-        similar = df[df['keywords'].str.lower().str.contains('|'.join([w for w in q_lower.split() if len(w)>2]), na=False)]
-        if not similar.empty:
-            kb_context = similar.iloc[0]['answer']  # Берем первый похожий
-
-    # 2. ИИ-ответ
-    msg = bot.reply_to(message, "🔍 Ищу решение...", quote=True)
-    ai_answer = ask_ai(question, kb_context)
-    bot.edit_message_text(ai_answer, message.chat.id, msg.message_id, parse_mode='HTML')
-    print(f"🤖 ИИ-ответ на: {question[:50]}...")
-
-# === АВТО-ОБНОВЛЕНИЕ БАЗЫ ===
-def update_kb():
-    global df
-    df = load_knowledge_base()
-    print("🔄 База обновлена.")
-
-# Каждые 5 минут
-def scheduler():
-    update_kb()
-    threading.Timer(300.0, scheduler).start()
-scheduler()
-
-# === ЗАПУСК ===
+# Запуск бота
 if __name__ == "__main__":
-    print("🚀 Бот запущен! База: OK.")
-    bot.infinity_polling()
+    logger.info("🚀 Бот запускается...")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling(drop_pending_updates=True)
