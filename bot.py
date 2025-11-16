@@ -31,7 +31,7 @@ PAUSED = False
 SHEET_ID = os.getenv("SHEET_ID")
 RANGE_NAME = "Support!A:B"
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
-PORT = int(os.getenv("PORT", "10000"))
+PORT = int  # (int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # === ПРОВЕРКА ПЕРЕМЕННЫХ ===
@@ -269,8 +269,7 @@ def schedule_auto_reload(app):
 if __name__ == "__main__":
     logger.info("Запуск бота в режиме WEBHOOK...")
 
-    # Глобальная пауза при старте
-    global PAUSED
+    # Устанавливаем начальное состояние паузы (БЕЗ global!)
     PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
     if PAUSED:
         logger.warning("Бот запущен в режиме ПАУЗЫ")
