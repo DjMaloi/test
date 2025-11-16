@@ -23,54 +23,56 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
-SHEET_ID = "1HBdZBWjlplVdZ4a7A5hdXxPyb2vyQ68ntIJ-oPfRwhA"
+SHEET_ID = os.getenv("SHEET_ID")
 RANGE_NAME = "Support!A:B"
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
 
-# === ПРОВЕРКА КАЖДОЙ ПЕРЕМЕННОЙ ОТДЕЛЬНО ===
+# === ПРОВЕРКА ПЕРЕМЕННЫХ ===
 errors = []
 
 # 1. TELEGRAM_TOKEN
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    errors.append("TELEGRAM_TOKEN не задан")
-elif not TELEGRAM_TOKEN.strip():
-    errors.append("TELEGRAM_TOKEN пустой")
+if not TELEGRAM_TOKEN or not TELEGRAM_TOKEN.strip():
+    errors.append("TELEGRAM_TOKEN не задан или пустой")
 else:
     logger.info("TELEGRAM_TOKEN загружен")
 
 # 2. GROQ_API_KEY
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    errors.append("GROQ_API_KEY не задан")
-elif not GROQ_API_KEY.strip():
-    errors.append("GROQ_API_KEY пустой")
+if not GROQ_API_KEY or not GROQ_API_KEY.strip():
+    errors.append("GROQ_API_KEY не задан или пустой")
 else:
     logger.info("GROQ_API_KEY загружен")
 
-# 3. GOOGLE_CREDENTIALS
-GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
-if not GOOGLE_CREDENTIALS:
-    errors.append("GOOGLE_CREDENTIALS не задан")
-elif not GOOGLE_CREDENTIALS.strip():
-    errors.append("GOOGLE_CREDENTIALS пустой")
+# 3. SHEET_ID
+if not SHEET_ID or not SHEET_ID.strip():
+    errors.append("SHEET_ID не задан")
+else:
+    logger.info("SHEET_ID загружен")
+
+# 4. GOOGLE_CREDENTIALS_PATH
+if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
+    errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
 else:
     try:
-        creds_info = json.loads(GOOGLE_CREDENTIALS)
-        required_keys = ["type", "project_id", "private_key", "client_email"]
+        with open(GOOGLE_CREDENTIALS_PATH) as f:
+            creds_info = json.load(f)
+        required_keys = ["type", "project_id", "private_key_id", "private_key", "client_email"]
         missing = [k for k in required_keys if k not in creds_info]
         if missing:
             errors.append(f"GOOGLE_CREDENTIALS: отсутствуют ключи: {', '.join(missing)}")
         else:
             logger.info("GOOGLE_CREDENTIALS — валидный JSON")
     except json.JSONDecodeError as e:
-        errors.append(f"GOOGLE_CREDENTIALS — невалидный JSON: {e}")
+        errors.append("GOOGLE_CREDENTIALS — невалидный JSON. Проверь файл.")
+        logger.debug(f"JSON parse error in {GOOGLE_CREDENTIALS_PATH}: {e}")
+    except Exception as e:
+        errors.append(f"Ошибка чтения credentials: {e}")
 
-# 4. ADMIN_ID
-ADMIN_ID_STR = os.getenv("ADMIN_ID")
-if not ADMIN_ID_STR:
+# 5. ADMIN_ID
+ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
+if not ADMIN_ID_STR.strip():
     errors.append("ADMIN_ID не задан")
-elif not ADMIN_ID_STR.strip():
-    errors.append("ADMIN_ID пустой")
 else:
     try:
         ADMIN_IDS = [int(uid.strip()) for uid in ADMIN_ID_STR.split(",") if uid.strip()]
@@ -84,16 +86,18 @@ else:
 if errors:
     logger.error("ОШИБКИ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ:")
     for err in errors:
-        logger.error(f"  → {err}")
-    logger.error("Исправь переменные в Render → Environment и сделай Manual Deploy!")
+        logger.error(f" → {err}")
+    logger.error("Исправь переменные и файлы, затем сделай Manual Deploy!")
     exit(1)
 else:
     logger.info("Все переменные окружения успешно загружены!")
 
 # === GOOGLE SHEETS ===
 try:
+    with open(GOOGLE_CREDENTIALS_PATH) as f:
+        creds_info = json.load(f)
     creds = Credentials.from_service_account_info(
-        json.loads(GOOGLE_CREDENTIALS),
+        creds_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
     )
     service = build("sheets", "v4", credentials=creds)
@@ -105,7 +109,7 @@ except Exception as e:
 
 # === GROQ ===
 try:
-    client = Groq(api_key=GROQ_API_KEY)
+    client = Groq(api_key=GROQ_API_KEY, timeout=10)  # таймаут 10 сек
     logger.info("Groq API подключён.")
 except Exception as e:
     logger.error(f"Ошибка Groq: {e}")
@@ -117,18 +121,20 @@ def get_knowledge_base():
     try:
         logger.info(f"Читаем Google Sheets: {RANGE_NAME}")
         result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
-        rows = result.get("values", [])[1:]
+        rows = result.get("values", [])[1:]  # пропускаем заголовок
         kb_entries = []
         for r in rows:
             problem = r[0].strip() if len(r) > 0 else ""
             solution = r[1].strip() if len(r) > 1 else "Нет решения"
-            kb_entries.append(f"Проблема: {problem}\nРешение: {solution}")
+            if problem:
+                kb_entries.append(f"Проблема: {problem}\nРешение: {solution}")
         kb = "\n\n".join(kb_entries)
         logger.info(f"База знаний загружена: {len(rows)} записей.")
         return kb or "База знаний пуста."
     except Exception as e:
         logger.error(f"Ошибка чтения Sheets: {e}")
-        return "Ошибка доступа к базе знаний."
+        get_knowledge_base.cache_clear()  # СБРАСЫВАЕМ КЕШ ПРИ ОШИБКЕ
+        return "Временная ошибка базы знаний. Попробуй позже."
 
 # === СИСТЕМНЫЙ ПРОМПТ ===
 SYSTEM_PROMPT = """
@@ -138,28 +144,36 @@ SYSTEM_PROMPT = """
 Отвечай кратко, по-русски, шаг за шагом.
 """
 
-# === КОМАНДЫ АДМИНА ===
-async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === КОМАНДЫ АДМИНА (ТОЛЬКО В ЛИЧКЕ) ===
+async def admin_only_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Эта команда работает только в личных сообщениях.")
+        return False
     if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("Доступ запрещён.")
+        return False
+    return True
+
+async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only_in_private(update, context):
         return
     context.bot_data["paused"] = True
     await update.message.reply_text("Бот приостановлен. Используй /resume")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not await admin_only_in_private(update, context):
         return
     context.bot_data["paused"] = False
     await update.message.reply_text("Бот возобновлён!")
 
 async def status_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    if not await admin_only_in_private(update, context):
         return
     status = "приостановлен" if context.bot_data.get("paused", False) else "работает"
     await update.message.reply_text(f"Бот {status}")
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Доступ запрещён.")
+    if not await admin_only_in_private(update, context):
         return
     get_knowledge_base.cache_clear()
     logger.info("Кеш сброшен по команде /reload")
@@ -167,22 +181,22 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ОБРАБОТКА СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-
     if context.bot_data.get("paused", False):
-        if message.text == "/status" and update.effective_user.id in ADMIN_IDS:
-            await message.reply_text("Бот приостановлен.")
+        if update.effective_chat.type == "private" and update.effective_user.id in ADMIN_IDS:
+            if update.message.text == "/status":
+                await update.message.reply_text("Бот приостановлен.")
         return
 
-    text = (message.text or message.caption or "").strip()
-    if not text or text.startswith("/"):
+    text = (update.message.text or update.message.caption or "").strip()
+    if not text or text.startswith("/") or len(text) > 1000:
         return
 
     logger.info(f"Сообщение: {text[:50]}...")
 
     kb = get_knowledge_base()
     kb_blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
-    user_query = text.lower().strip()
+
+    user_query = text.lower()
     best_score = 0
     best_solution = None
 
@@ -194,11 +208,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         score = fuzz.ratio(user_query, problem.lower())
         if score > 85 and score > best_score:
             best_score = score
-            solution_lines = [line.replace("Решение: ", "", 1).strip() for line in lines[1:] if line.strip()]
+            solution_lines = []
+            for line in lines[1:]:
+                if line.lower().startswith("решение:"):
+                    solution_lines.append(line[9:].strip())
+                else:
+                    solution_lines.append(line)
             best_solution = "\n".join(solution_lines)
 
     if best_solution:
-        await message.reply_text(best_solution)
+        await update.message.reply_text(best_solution)
         logger.info(f"Ответ из базы (схожесть: {best_score}%)")
         return
 
@@ -211,18 +230,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temperature=0.7,
         )
         reply = response.choices[0].message.content.strip()
-        await message.reply_text(reply)
+        await update.message.reply_text(reply)
         logger.info("Ответ от Groq")
     except Exception as e:
         logger.error(f"Ошибка Groq: {e}")
-        await message.reply_text("Извини, временная ошибка.")
+        await update.message.reply_text("Извини, временная ошибка. Попробуй позже.")
 
 # === АВТООБНОВЛЕНИЕ ===
 def schedule_auto_reload(app):
     def clear_cache(ctx):
         get_knowledge_base.cache_clear()
         logger.info("Автообновление: кеш сброшен")
-    app.job_queue.run_repeating(clear_cache, interval=300, first=10)
+    app.job_queue.run_once(clear_cache, when=10)
+    app.job_queue.run_repeating(clear_cache, interval=300)
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
