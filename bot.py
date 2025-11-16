@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import asyncio
 from functools import lru_cache
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -12,6 +13,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
 from groq import Groq
 from rapidfuzz import fuzz
 
@@ -22,10 +24,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# === ГЛОБАЛЬНЫЙ ФЛАГ ПАУЗЫ ===
+PAUSED = False
+
 # === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
 SHEET_ID = os.getenv("SHEET_ID")
 RANGE_NAME = "Support!A:B"
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
+PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # === ПРОВЕРКА ПЕРЕМЕННЫХ ===
 errors = []
@@ -50,7 +57,13 @@ if not SHEET_ID or not SHEET_ID.strip():
 else:
     logger.info("SHEET_ID загружен")
 
-# 4. GOOGLE_CREDENTIALS_PATH
+# 4. RENDER_EXTERNAL_URL
+if not WEBHOOK_URL or not WEBHOOK_URL.strip():
+    errors.append("RENDER_EXTERNAL_URL не задан (пример: https://your-bot.onrender.com)")
+else:
+    logger.info("RENDER_EXTERNAL_URL загружен")
+
+# 5. GOOGLE_CREDENTIALS_PATH
 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
     errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
 else:
@@ -63,13 +76,12 @@ else:
             errors.append(f"GOOGLE_CREDENTIALS: отсутствуют ключи: {', '.join(missing)}")
         else:
             logger.info("GOOGLE_CREDENTIALS — валидный JSON")
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError:
         errors.append("GOOGLE_CREDENTIALS — невалидный JSON. Проверь файл.")
-        logger.debug(f"JSON parse error in {GOOGLE_CREDENTIALS_PATH}: {e}")
     except Exception as e:
         errors.append(f"Ошибка чтения credentials: {e}")
 
-# 5. ADMIN_ID
+# 6. ADMIN_ID
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 if not ADMIN_ID_STR.strip():
     errors.append("ADMIN_ID не задан")
@@ -109,7 +121,7 @@ except Exception as e:
 
 # === GROQ ===
 try:
-    client = Groq(api_key=GROQ_API_KEY, timeout=10)  # таймаут 10 сек
+    client = Groq(api_key=GROQ_API_KEY, timeout=10)
     logger.info("Groq API подключён.")
 except Exception as e:
     logger.error(f"Ошибка Groq: {e}")
@@ -121,7 +133,7 @@ def get_knowledge_base():
     try:
         logger.info(f"Читаем Google Sheets: {RANGE_NAME}")
         result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
-        rows = result.get("values", [])[1:]  # пропускаем заголовок
+        rows = result.get("values", [])[1:]
         kb_entries = []
         for r in rows:
             problem = r[0].strip() if len(r) > 0 else ""
@@ -133,7 +145,7 @@ def get_knowledge_base():
         return kb or "База знаний пуста."
     except Exception as e:
         logger.error(f"Ошибка чтения Sheets: {e}")
-        get_knowledge_base.cache_clear()  # СБРАСЫВАЕМ КЕШ ПРИ ОШИБКЕ
+        get_knowledge_base.cache_clear()
         return "Временная ошибка базы знаний. Попробуй позже."
 
 # === СИСТЕМНЫЙ ПРОМПТ ===
@@ -144,8 +156,8 @@ SYSTEM_PROMPT = """
 Отвечай кратко, по-русски, шаг за шагом.
 """
 
-# === КОМАНДЫ АДМИНА (ТОЛЬКО В ЛИЧКЕ) ===
-async def admin_only_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === АДМИН-КОМАНДЫ (ТОЛЬКО В ЛИЧКЕ) ===
+async def admin_only_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if update.effective_chat.type != "private":
         await update.message.reply_text("Эта команда работает только в личных сообщениях.")
         return False
@@ -157,19 +169,21 @@ async def admin_only_in_private(update: Update, context: ContextTypes.DEFAULT_TY
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only_in_private(update, context):
         return
-    context.bot_data["paused"] = True
+    global PAUSED
+    PAUSED = True
     await update.message.reply_text("Бот приостановлен. Используй /resume")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only_in_private(update, context):
         return
-    context.bot_data["paused"] = False
+    global PAUSED
+    PAUSED = False
     await update.message.reply_text("Бот возобновлён!")
 
 async def status_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only_in_private(update, context):
         return
-    status = "приостановлен" if context.bot_data.get("paused", False) else "работает"
+    status = "приостановлен" if PAUSED else "работает"
     await update.message.reply_text(f"Бот {status}")
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,13 +193,20 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("Кеш сброшен по команде /reload")
     await update.message.reply_text("База знаний обновлена!")
 
+async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id in ADMIN_IDS:
+        await update.message.reply_text("OK" if not PAUSED else "PAUSED")
+    else:
+        await update.message.reply_text("OK")
+
 # === ОБРАБОТКА СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.bot_data.get("paused", False):
+    # === БЕЗОПАСНАЯ ПАУЗА: ВСЕГДА ОТВЕЧАЕМ 200 OK ===
+    if PAUSED:
         if update.effective_chat.type == "private" and update.effective_user.id in ADMIN_IDS:
             if update.message.text == "/status":
                 await update.message.reply_text("Бот приостановлен.")
-        return
+        return  # ← 200 OK, процесс жив
 
     text = (update.message.text or update.message.caption or "").strip()
     if not text or text.startswith("/") or len(text) > 1000:
@@ -244,15 +265,21 @@ def schedule_auto_reload(app):
     app.job_queue.run_once(clear_cache, when=10)
     app.job_queue.run_repeating(clear_cache, interval=300)
 
-# === ЗАПУСК ===
+# === ЗАПУСК (WEBHOOK) ===
 if __name__ == "__main__":
-    logger.info("Запуск бота...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    logger.info("Запуск бота в режиме WEBHOOK...")
 
-    if os.getenv("BOT_PAUSED", "false").lower() == "true":
-        app.bot_data["paused"] = True
-        logger.info("Бот в режиме паузы (BOT_PAUSED=true)")
+    # Глобальная пауза при старте
+    global PAUSED
+    PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
+    if PAUSED:
+        logger.warning("Бот запущен в режиме ПАУЗЫ")
 
+    # HTTPX с пулом соединений
+    request = HTTPXRequest(connection_pool_size=100)
+    app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
+
+    # Хендлеры
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) |
         (filters.CAPTION & ~filters.COMMAND),
@@ -262,6 +289,28 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_bot))
+    app.add_handler(CommandHandler("health", health_check))
 
+    # Автообновление
     schedule_auto_reload(app)
-    app.run_polling(drop_pending_updates=True)
+
+    # Webhook
+    async def main():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+        )
+        logger.info(f"Webhook запущен: {WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+        await asyncio.Event().wait()
+
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
+    finally:
+        asyncio.run(app.stop())
+        asyncio.run(app.shutdown())
