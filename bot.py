@@ -260,7 +260,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === АВТООБНОВЛЕНИЕ ===
 def schedule_auto_reload(app):
-    def clear_cache(ctx):
+    async def clear_cache(ctx):
         get_knowledge_base.cache_clear()
         logger.info("Автообновление: кеш сброшен")
     app.job_queue.run_once(clear_cache, when=10)
