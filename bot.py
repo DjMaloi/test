@@ -31,7 +31,6 @@ PAUSED = False
 SHEET_ID = os.getenv("SHEET_ID")
 RANGE_NAME = "Support!A:B"
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
-#PORT = int  # (int(os.getenv("PORT", "10000"))
 PORT = int(os.getenv("PORT", "10000"))
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
@@ -263,6 +262,7 @@ def schedule_auto_reload(app):
     async def clear_cache(ctx):
         get_knowledge_base.cache_clear()
         logger.info("Автообновление: кеш сброшен")
+
     app.job_queue.run_once(clear_cache, when=10)
     app.job_queue.run_repeating(clear_cache, interval=300)
 
@@ -270,7 +270,7 @@ def schedule_auto_reload(app):
 if __name__ == "__main__":
     logger.info("Запуск бота в режиме WEBHOOK...")
 
-    # Устанавливаем начальное состояние паузы (БЕЗ global!)
+    # Устанавливаем начальное состояние паузы
     PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
     if PAUSED:
         logger.warning("Бот запущен в режиме ПАУЗЫ")
@@ -298,13 +298,25 @@ if __name__ == "__main__":
     async def main():
         await app.initialize()
         await app.start()
+
+        # === РЕГИСТРАЦИЯ WEBHOOK У TELEGRAM ===
+        webhook_info = await app.bot.get_webhook_info()
+        expected_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+        if webhook_info.url != expected_url:
+            await app.bot.set_webhook(url=expected_url)
+            logger.info(f"Webhook зарегистрирован: {expected_url}")
+        else:
+            logger.info("Webhook уже зарегистрирован")
+
+        # === ЗАПУСК WEBHOOK ===
         await app.updater.start_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=TELEGRAM_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+            webhook_url=expected_url
         )
-        logger.info(f"Webhook запущен: {WEBHOOK_URL}/{TELEGRAM_TOKEN}")
+        logger.info(f"Webhook запущен: {expected_url}")
+
         await asyncio.Event().wait()
 
     try:
