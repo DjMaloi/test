@@ -1,7 +1,6 @@
 import os
 import json
 import logging
-import asyncio
 from functools import lru_cache
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -31,8 +30,6 @@ PAUSED = False
 SHEET_ID = os.getenv("SHEET_ID")
 RANGE_NAME = "Support!A:B"
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
-PORT = int(os.getenv("PORT", "10000"))
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # === ПРОВЕРКА ПЕРЕМЕННЫХ ===
 errors = []
@@ -57,13 +54,7 @@ if not SHEET_ID or not SHEET_ID.strip():
 else:
     logger.info("SHEET_ID загружен")
 
-# 4. RENDER_EXTERNAL_URL
-if not WEBHOOK_URL or not WEBHOOK_URL.strip():
-    errors.append("RENDER_EXTERNAL_URL не задан (пример: https://your-bot.onrender.com)")
-else:
-    logger.info("RENDER_EXTERNAL_URL загружен")
-
-# 5. GOOGLE_CREDENTIALS_PATH
+# 4. GOOGLE_CREDENTIALS_PATH
 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
     errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
 else:
@@ -81,7 +72,7 @@ else:
     except Exception as e:
         errors.append(f"Ошибка чтения credentials: {e}")
 
-# 6. ADMIN_ID
+# 5. ADMIN_ID
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 if not ADMIN_ID_STR.strip():
     errors.append("ADMIN_ID не задан")
@@ -199,19 +190,14 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("OK")
 
-# === ОТЛАДКА: Лог входящих webhook ===
-async def webhook_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"DEBUG: Входящий webhook: user={update.effective_user.id if update.effective_user else 'None'}, text={update.message.text if update.message else 'None'}")
-    return handle_message(update, context)
-
 # === ОБРАБОТКА СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # === БЕЗОПАСНАЯ ПАУЗА: ВСЕГДА ОТВЕЧАЕМ 200 OK ===
+    # === БЕЗОПАСНАЯ ПАУЗА ===
     if PAUSED:
         if update.effective_chat.type == "private" and update.effective_user.id in ADMIN_IDS:
             if update.message.text == "/status":
                 await update.message.reply_text("Бот приостановлен.")
-        return  # ← 200 OK, процесс жив
+        return
 
     text = (update.message.text or update.message.caption or "").strip()
     if not text or text.startswith("/") or len(text) > 1000:
@@ -271,9 +257,9 @@ def schedule_auto_reload(app):
     app.job_queue.run_once(clear_cache, when=10)
     app.job_queue.run_repeating(clear_cache, interval=300)
 
-# === ЗАПУСК (WEBHOOK) ===
+# === ЗАПУСК (POLLING) ===
 if __name__ == "__main__":
-    logger.info("Запуск бота в режиме WEBHOOK...")
+    logger.info("Запуск бота в режиме POLLING (временно, без webhook)...")
 
     # Устанавливаем начальное состояние паузы
     PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
@@ -284,11 +270,11 @@ if __name__ == "__main__":
     request = HTTPXRequest(connection_pool_size=100)
     app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-    # Хендлеры (с отладкой)
+    # Хендлеры
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) |
         (filters.CAPTION & ~filters.COMMAND),
-        webhook_debug  # ← Отладка
+        handle_message
     ))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
@@ -299,35 +285,6 @@ if __name__ == "__main__":
     # Автообновление
     schedule_auto_reload(app)
 
-    # Webhook
-    async def main():
-        await app.initialize()
-        await app.start()
-
-        # === РЕГИСТРАЦИЯ WEBHOOK ===
-        expected_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
-        webhook_info = await app.bot.get_webhook_info()
-        if webhook_info.url != expected_url:
-            await app.bot.set_webhook(url=expected_url)
-            logger.info(f"Webhook зарегистрирован: {expected_url}")
-        else:
-            logger.info("Webhook уже зарегистрирован")
-
-        # === ЗАПУСК WEBHOOK ===
-        await app.updater.start_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TELEGRAM_TOKEN,
-            webhook_url=expected_url
-        )
-        logger.info(f"Webhook запущен: {expected_url}")
-
-        await asyncio.Event().wait()
-
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот остановлен.")
-    finally:
-        asyncio.run(app.stop())
-        asyncio.run(app.shutdown())
+    # === POLLING (работает на Render до 15 мин, потом sleep) ===
+    logger.info("Polling запущен. Бот будет активен ~15 минут после активности.")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
