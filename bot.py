@@ -199,6 +199,11 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("OK")
 
+# === ОТЛАДКА: Лог входящих webhook ===
+async def webhook_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"DEBUG: Входящий webhook: user={update.effective_user.id if update.effective_user else 'None'}, text={update.message.text if update.message else 'None'}")
+    return handle_message(update, context)
+
 # === ОБРАБОТКА СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === БЕЗОПАСНАЯ ПАУЗА: ВСЕГДА ОТВЕЧАЕМ 200 OK ===
@@ -279,11 +284,11 @@ if __name__ == "__main__":
     request = HTTPXRequest(connection_pool_size=100)
     app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-    # Хендлеры
+    # Хендлеры (с отладкой)
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) |
         (filters.CAPTION & ~filters.COMMAND),
-        handle_message
+        webhook_debug  # ← Отладка
     ))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
@@ -299,9 +304,9 @@ if __name__ == "__main__":
         await app.initialize()
         await app.start()
 
-        # === РЕГИСТРАЦИЯ WEBHOOK У TELEGRAM ===
-        webhook_info = await app.bot.get_webhook_info()
+        # === РЕГИСТРАЦИЯ WEBHOOK ===
         expected_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+        webhook_info = await app.bot.get_webhook_info()
         if webhook_info.url != expected_url:
             await app.bot.set_webhook(url=expected_url)
             logger.info(f"Webhook зарегистрирован: {expected_url}")
