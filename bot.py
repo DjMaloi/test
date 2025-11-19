@@ -11,6 +11,7 @@ from telegram.ext import (
     CommandHandler,
     filters,
     ContextTypes,
+    DispatcherHandlerStop,  # ← ЭТО ВАЖНО!
 )
 from telegram.request import HTTPXRequest
 from groq import Groq
@@ -34,14 +35,15 @@ if not SHEET_ID: errors.append("SHEET_ID пустой")
 
 # ADMIN_IDS
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
-ADMIN_IDS = [int(x) for x in ADMIN_ID_STR.split(",") if x.strip()] if ADMIN_ID_STR.strip() else []
-if not ADMIN_IDS: errors.append("ADMIN_ID не задан")
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_ID_STR.split(",") if x.strip()] if ADMIN_ID_STR.strip() else []
+if not ADMIN_IDS:
+    errors.append("ADMIN_ID не задан")
 
-# ALLOWED_GROUP_IDS (можно пустым — тогда бот работает везде)
+# ALLOWED_GROUP_IDS
 ALLOWED_GROUP_IDS = []
 if os.getenv("ALLOWED_GROUP_IDS", "").strip():
     try:
-        ALLOWED_GROUP_IDS = [int(x) for x in os.getenv("ALLOWED_GROUP_IDS").split(",") if x.strip()]
+        ALLOWED_GROUP_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_GROUP_IDS").split(",") if x.strip()]
     except:
         errors.append("ALLOWED_GROUP_IDS — ошибка формата")
 
@@ -77,32 +79,32 @@ SYSTEM_PROMPT = """Ты — бот техподдержки. Используй 
 Если не нашёл — ответь: "Не нашёл точного решения. Опиши подробнее или обратись к модератору."
 Отвечай кратко, по-русски, шаг за шагом."""
 
-# =========================== 1. ЗАЩИТА ГРУПП (включая топики) ===========================
+# =========================== 1. ЗАЩИТА ГРУПП ===========================
 async def restrict_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
     if ALLOWED_GROUP_IDS and chat.id not in ALLOWED_GROUP_IDS:
         try:
-            await context.bot.send_message(chat.id, "Бот работает только в официальных чатах.")
+            await context.bot.send_message(chat.id, "Бот работает только в официальных чатах проекта.")
         except:
             pass
         await context.bot.leave_chat(chat.id)
         logger.warning(f"Покинул группу {chat.id}")
 
-# =========================== 2. ЛИЧКА: только админам ===========================
+# =========================== 2. ЛИЧКА — ТОЛЬКО АДМИНЫ ===========================
 async def private_non_admin_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id in ADMIN_IDS:
-        return  # админы проходят дальше — всё работает
-    # не-админы получают кнопку и дальше ничего
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])  # ← ЗАМЕНИ
+        return  # админ — пропускаем дальше
+    # не-админ — кнопка + стоп
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])  # ← ЗАМЕНИ!
     await update.message.reply_text(
         "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку ниже:",
         reply_markup=keyboard
     )
-    raise DispatcherHandlerStop  # полностью глушим дальнейшую обработку для не-админа
+    raise DispatcherHandlerStop  # ← полностью глушим дальнейшую обработку
 
 # =========================== 3. ОСНОВНАЯ ЛОГИКА ===========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,12 +120,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     kb = get_knowledge_base()
-    # поиск по базе
     best_solution = None
     best_score = 0
     for block in [b.strip() for b in kb.split("\n\n") if b.strip()]:
         lines = [l.strip() for l in block.split("\n")]
-        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"): continue
+        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"):
+            continue
         problem = lines[0][10:].strip()
         score = fuzz.ratio(text.lower(), problem.lower())
         if score > 85 and score > best_score:
@@ -134,7 +136,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(best_solution)
         return
 
-    # Groq
     try:
         resp = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -173,19 +174,17 @@ if __name__ == "__main__":
 
     app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).build()
 
-    # ПОРЯДОК КРИТИЧЕСКИ ВАЖЕН!
+    # КРИТИЧЕСКИ ВАЖНЫЙ ПОРЯДОК:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.ChatType.GROUPS, restrict_groups), group=0)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_non_admin_block)  # блокируем не-админов в личке
-    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))  # основной обработчик
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_non_admin_block))
+    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
 
-    # команды
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reload", reload))
 
-    # автообновление кеша
     app.job_queue.run_repeating(lambda _: get_knowledge_base.cache_clear(), interval=300, first=10)
 
-    logger.info("Бот запущен и готов к работе!")
+    logger.info("Бот успешно запущен!")
     app.run_polling(drop_pending_updates=True)
