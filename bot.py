@@ -4,7 +4,7 @@ import logging
 from functools import lru_cache
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -34,27 +34,23 @@ GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.
 # === ПРОВЕРКА ПЕРЕМЕННЫХ ===
 errors = []
 
-# 1. TELEGRAM_TOKEN
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN or not TELEGRAM_TOKEN.strip():
     errors.append("TELEGRAM_TOKEN не задан или пустой")
 else:
     logger.info("TELEGRAM_TOKEN загружен")
 
-# 2. GROQ_API_KEY
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY or not GROQ_API_KEY.strip():
     errors.append("GROQ_API_KEY не задан или пустой")
 else:
     logger.info("GROQ_API_KEY загружен")
 
-# 3. SHEET_ID
 if not SHEET_ID or not SHEET_ID.strip():
     errors.append("SHEET_ID не задан")
 else:
     logger.info("SHEET_ID загружен")
 
-# 4. GOOGLE_CREDENTIALS_PATH
 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
     errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
 else:
@@ -68,11 +64,10 @@ else:
         else:
             logger.info("GOOGLE_CREDENTIALS — валидный JSON")
     except json.JSONDecodeError:
-        errors.append("GOOGLE_CREDENTIALS — невалидный JSON. Проверь файл.")
+        errors.append("GOOGLE_CREDENTIALS — невалидный JSON")
     except Exception as e:
         errors.append(f"Ошибка чтения credentials: {e}")
 
-# 5. ADMIN_ID
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 if not ADMIN_ID_STR.strip():
     errors.append("ADMIN_ID не задан")
@@ -83,17 +78,15 @@ else:
             raise ValueError
         logger.info(f"Админы загружены: {ADMIN_IDS}")
     except ValueError:
-        errors.append("ADMIN_ID должен быть числом или списком чисел через запятую")
+        errors.append("ADMIN_ID должен быть числом или списком через запятую")
 
-# === ВЫВОД ОШИБОК ===
 if errors:
-    logger.error("ОШИБКИ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ:")
+    logger.error("ОШИБКИ ПЕРЕМЕННЫХ:")
     for err in errors:
         logger.error(f" → {err}")
-    logger.error("Исправь переменные и файлы, затем сделай Manual Deploy!")
     exit(1)
 else:
-    logger.info("Все переменные окружения успешно загружены!")
+    logger.info("Все переменные окружения загружены!")
 
 # === GOOGLE SHEETS ===
 try:
@@ -118,7 +111,7 @@ except Exception as e:
     logger.error(f"Ошибка Groq: {e}")
     exit(1)
 
-# === КЕШИРОВАННАЯ БАЗА ЗНАНИЙ ===
+# === КЕШ БАЗЫ ЗНАНИЙ ===
 @lru_cache(maxsize=1)
 def get_knowledge_base():
     try:
@@ -139,7 +132,6 @@ def get_knowledge_base():
         get_knowledge_base.cache_clear()
         return "Временная ошибка базы знаний. Попробуй позже."
 
-# === СИСТЕМНЫЙ ПРОМПТ ===
 SYSTEM_PROMPT = """
 Ты — бот техподдержки. Используй ТОЛЬКО эту базу знаний:
 {kb}
@@ -147,7 +139,31 @@ SYSTEM_PROMPT = """
 Отвечай кратко, по-русски, шаг за шагом.
 """
 
-# === АДМИН-КОМАНДЫ (ТОЛЬКО В ЛИЧКЕ) ===
+# === БЛОКИРОВКА ЛИЧКИ ОТ НЕ-АДМИНОВ + КНОПКА ===
+async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return  # в группах всё работает как обычно
+
+    if update.effective_user.id in ADMIN_IDS:
+        return  # админы могут писать всё
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            text="Связаться с поддержкой",
+            url="https://t.me/alexeymaloi"  # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
+            # Замени на свой ник, ссылку в группу или на другого админа
+            # Пример: "https://t.me/your_nick" или "https://t.me/+abc123"
+        )
+    ]])
+
+    await update.message.reply_text(
+        "Писать боту в личку могут только администраторы.\n"
+        "Если нужна помощь — нажми кнопку ниже:",
+        reply_markup=keyboard
+    )
+    return  # останавливаем дальнейшую обработку
+
+# === АДМИН-КОМАНДЫ ===
 async def admin_only_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if update.effective_chat.type != "private":
         await update.message.reply_text("Эта команда работает только в личных сообщениях.")
@@ -192,7 +208,6 @@ async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ОБРАБОТКА СООБЩЕНИЙ ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # === БЕЗОПАСНАЯ ПАУЗА ===
     if PAUSED:
         if update.effective_chat.type == "private" and update.effective_user.id in ADMIN_IDS:
             if update.message.text == "/status":
@@ -204,10 +219,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     logger.info(f"Сообщение: {text[:50]}...")
-
     kb = get_knowledge_base()
     kb_blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
-
     user_query = text.lower()
     best_score = 0
     best_solution = None
@@ -248,43 +261,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка Groq: {e}")
         await update.message.reply_text("Извини, временная ошибка. Попробуй позже.")
 
-# === АВТООБНОВЛЕНИЕ ===
+# === АВТООБНОВЛЕНИЕ КЕША ===
 def schedule_auto_reload(app):
     async def clear_cache(ctx):
         get_knowledge_base.cache_clear()
         logger.info("Автообновление: кеш сброшен")
-
     app.job_queue.run_once(clear_cache, when=10)
     app.job_queue.run_repeating(clear_cache, interval=300)
 
-# === ЗАПУСК (POLLING) ===
+# === ЗАПУСК БОТА ===
 if __name__ == "__main__":
-    logger.info("Запуск бота в режиме POLLING (временно, без webhook)...")
-
-    # Устанавливаем начальное состояние паузы
+    logger.info("Запуск бота...")
     PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
     if PAUSED:
         logger.warning("Бот запущен в режиме ПАУЗЫ")
 
-    # HTTPX с пулом соединений
     request = HTTPXRequest(connection_pool_size=100)
     app = Application.builder().token(TELEGRAM_TOKEN).request(request).build()
 
-    # Хендлеры
+    # ВАЖНО: ЭТОТ ХЕНДЛЕР ПЕРВЫЙ — блокирует личку от всех кроме админов
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_non_admin_private))
+
+    # Основные хендлеры
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) |
         (filters.CAPTION & ~filters.COMMAND),
         handle_message
     ))
+
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_bot))
     app.add_handler(CommandHandler("health", health_check))
 
-    # Автообновление
     schedule_auto_reload(app)
 
-    # === POLLING (работает на Render до 15 мин, потом sleep) ===
-    logger.info("Polling запущен. Бот будет активен ~15 минут после активности.")
+    logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
