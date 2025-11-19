@@ -22,86 +22,79 @@ logger = logging.getLogger(__name__)
 PAUSED = False
 
 # =========================== ПЕРЕМЕННЫЕ ===========================
-errors = []
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN: errors.append("TELEGRAM_TOKEN пустой")
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY: errors.append("GROQ_API_KEY пустой")
-
 SHEET_ID = os.getenv("SHEET_ID")
-if not SHEET_ID: errors.append("SHEET_ID пустой")
-
-# ADMIN_IDS
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
-ADMIN_IDS = [int(x.strip()) for x in ADMIN_ID_STR.split(",") if x.strip()] if ADMIN_ID_STR.strip() else []
-if not ADMIN_IDS: errors.append("ADMIN_ID не задан")
+ALLOWED_GROUP_IDS_STR = os.getenv("ALLOWED_GROUP_IDS", "")
 
-# ALLOWED_GROUP_IDS
-ALLOWED_GROUP_IDS = []
-if os.getenv("ALLOWED_GROUP_IDS", "").strip():
-    try:
-        ALLOWED_GROUP_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_GROUP_IDS").split(",") if x.strip()]
-    except:
-        errors.append("ALLOWED_GROUP_IDS — ошибка формата")
-
-if errors:
-    for e in errors: logger.error(e)
+if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SHEET_ID, ADMIN_ID_STR]):
+    logger.error("Отсутствуют обязательные переменные окружения!")
     exit(1)
+
+ADMIN_IDS = [int(x.strip()) for x in ADMIN_ID_STR.split(",") if x.strip()]
+ALLOWED_GROUP_IDS = [int(x.strip()) for x in ALLOWED_GROUP_IDS_STR.split(",") if x.strip()] if ALLOWED_GROUP_IDS_STR.strip() else []
 
 logger.info(f"Админы: {ADMIN_IDS}")
 logger.info(f"Разрешённые группы: {ALLOWED_GROUP_IDS or 'все'}")
 
 # =========================== GOOGLE & GROQ ===========================
-with open(os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")) as f:
-    creds_info = json.load(f)
-creds = Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+creds = Credentials.from_service_account_file(
+    os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json"),
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+)
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
-client = Groq(api_key=GROQ_API_KEY, timeout=10)
+client = Groq(api_key=GROQ_API_KEY)
 
 # =========================== БАЗА ЗНАНИЙ ===========================
 @lru_cache(maxsize=1)
 def get_knowledge_base():
     try:
         rows = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute().get("values", [])[1:]
-        entries = [f"Проблема: {r[0].strip()}\nРешение: {r[1].strip() if len(r)>1 else '—'}" for r in rows if r and r[0].strip()]
-        return "\n\n".join(entries) or "База пуста"
+        entries = []
+        for r in rows:
+            if len(r) >= 1 and r[0].strip():
+                problem = r[0].strip()
+                solution = r[1].strip() if len(r) > 1 else "Нет решения"
+                entries.append(f"Проблема: {problem}\nРешение: {solution}")
+        kb = "\n\n".join(entries)
+        return kb or "База знаний пуста"
     except Exception as e:
-        logger.error(e)
-        return "Ошибка базы знаний"
+        logger.error(f"Ошибка Google Sheets: {e}")
+        return "Ошибка загрузки базы знаний"
 
 SYSTEM_PROMPT = """Ты — бот техподдержки. Используй ТОЛЬКО эту базу знаний:
 {kb}
 Если не нашёл — ответь: "Не нашёл точного решения. Опиши подробнее или обратись к модератору."
-Отвечай кратко, по-русски, шаг за шагом."""
+Отвечай кратко и по делу, по-русски."""
 
-# =========================== 1. ЗАЩИТА ГРУПП (включая топики) ===========================
+# =========================== 1. ЗАЩИТА ГРУПП ===========================
 async def restrict_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
+    return
     if ALLOWED_GROUP_IDS and chat.id not in ALLOWED_GROUP_IDS:
         try:
             await context.bot.send_message(chat.id, "Бот работает только в официальных чатах проекта.")
         except:
             pass
         await context.bot.leave_chat(chat.id)
-        logger.warning(f"Покинул группу {chat.id}")
+        logger.warning(f"Покинул запрещённую группу {chat.id}")
 
-# =========================== 2. ЛИЧКА — БЛОК НЕ-АДМИНОВ ===========================
+# =========================== 2. БЛОК ЛИЧКИ ДЛЯ НЕ-АДМИНОВ ===========================
 async def block_private_non_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id in ADMIN_IDS:
-        return  # админы проходят дальше
-    # не-админы — кнопка и стоп
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])  # ← ЗАМЕНИ!
+        return  # админ — пропускаем дальше
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])  # ← СЮДА СВОЙ НИК!
     await update.message.reply_text(
         "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку:",
         reply_markup=keyboard
     )
-    return  # просто return — дальше обработка не пойдёт
+    return  # не-админ — дальше обработка не идёт
 
 # =========================== 3. ОСНОВНАЯ ЛОГИКА ===========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,9 +108,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = get_knowledge_base()
     best_solution = None
     best_score = 0
+
     for block in [b.strip() for b in kb.split("\n\n") if b.strip()]:
         lines = [l.strip() for l in block.split("\n")]
-        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"): continue
+        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"):
+            continue
         problem = lines[0][10:].strip()
         score = fuzz.ratio(text.lower(), problem.lower())
         if score > 85 and score > best_score:
@@ -137,8 +132,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(resp.choices[0].message.content.strip())
     except Exception as e:
-        logger.error(e)
-        await update.message.reply_text("Временная ошибка")
+        logger.error(f"Groq error: {e}")
+        await update.message.reply_text("Временная ошибка, попробуй позже")
 
 # =========================== АДМИН-КОМАНДЫ ===========================
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,12 +148,12 @@ async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
-    await update.message.reply_text(f"Статус: {'приостановлен' if PAUSED else 'работает'}")
+    await update.message.reply_text(f"Бот {'приостановлен' if PAUSED else 'работает'}")
 
 async def reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     get_knowledge_base.cache_clear()
-    await update.message.reply_text("База обновлена")
+    await update.message.reply_text("База знаний обновлена")
 
 # =========================== ЗАПУСК ===========================
 if __name__ == "__main__":
@@ -166,7 +161,7 @@ if __name__ == "__main__":
 
     app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).build()
 
-    # ВАЖНЫЙ ПОРЯДОК:
+    # САМЫЙ ВАЖНЫЙ ПОРЯДОК ХЕНДЛЕРОВ:
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.ChatType.GROUPS, restrict_groups))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private_non_admins))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION & ~filters.COMMAND, handle_message))
@@ -176,7 +171,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reload", reload))
 
-    app.job_queue.run_repeating(lambda _: get_knowledge_base.cache_clear(), interval=300, first=10)
+    # ПРАВИЛЬНОЕ автообновление без падений
+    async def clear_cache_job(context):
+        get_knowledge_base.cache_clear()
+    app.job_queue.run_repeating(clear_cache_job, interval=300, first=10)
 
-    logger.info("Бот запущен!")
+    logger.info("Бот запущен и готов!")
     app.run_polling(drop_pending_updates=True)
