@@ -9,9 +9,8 @@ from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
-    filters,
     ContextTypes,
-    DispatcherHandlerStop,  # ← ЭТО ВАЖНО!
+    filters,
 )
 from telegram.request import HTTPXRequest
 from groq import Groq
@@ -36,8 +35,7 @@ if not SHEET_ID: errors.append("SHEET_ID пустой")
 # ADMIN_IDS
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_ID_STR.split(",") if x.strip()] if ADMIN_ID_STR.strip() else []
-if not ADMIN_IDS:
-    errors.append("ADMIN_ID не задан")
+if not ADMIN_IDS: errors.append("ADMIN_ID не задан")
 
 # ALLOWED_GROUP_IDS
 ALLOWED_GROUP_IDS = []
@@ -60,7 +58,6 @@ with open(os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")) as f:
 creds = Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
-
 client = Groq(api_key=GROQ_API_KEY, timeout=10)
 
 # =========================== БАЗА ЗНАНИЙ ===========================
@@ -72,14 +69,14 @@ def get_knowledge_base():
         return "\n\n".join(entries) or "База пуста"
     except Exception as e:
         logger.error(e)
-        return "Ошибка загрузки базы знаний"
+        return "Ошибка базы знаний"
 
 SYSTEM_PROMPT = """Ты — бот техподдержки. Используй ТОЛЬКО эту базу знаний:
 {kb}
 Если не нашёл — ответь: "Не нашёл точного решения. Опиши подробнее или обратись к модератору."
 Отвечай кратко, по-русски, шаг за шагом."""
 
-# =========================== 1. ЗАЩИТА ГРУПП ===========================
+# =========================== 1. ЗАЩИТА ГРУПП (включая топики) ===========================
 async def restrict_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
@@ -92,19 +89,19 @@ async def restrict_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.leave_chat(chat.id)
         logger.warning(f"Покинул группу {chat.id}")
 
-# =========================== 2. ЛИЧКА — ТОЛЬКО АДМИНЫ ===========================
-async def private_non_admin_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================== 2. ЛИЧКА — БЛОК НЕ-АДМИНОВ ===========================
+async def block_private_non_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id in ADMIN_IDS:
-        return  # админ — пропускаем дальше
-    # не-админ — кнопка + стоп
+        return  # админы проходят дальше
+    # не-админы — кнопка и стоп
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])  # ← ЗАМЕНИ!
     await update.message.reply_text(
-        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку ниже:",
+        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку:",
         reply_markup=keyboard
     )
-    raise DispatcherHandlerStop  # ← полностью глушим дальнейшую обработку
+    return  # просто return — дальше обработка не пойдёт
 
 # =========================== 3. ОСНОВНАЯ ЛОГИКА ===========================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,17 +112,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
-    if len(text) > 1000:
-        await update.message.reply_text("Слишком длинное сообщение")
-        return
-
     kb = get_knowledge_base()
     best_solution = None
     best_score = 0
     for block in [b.strip() for b in kb.split("\n\n") if b.strip()]:
         lines = [l.strip() for l in block.split("\n")]
-        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"):
-            continue
+        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"): continue
         problem = lines[0][10:].strip()
         score = fuzz.ratio(text.lower(), problem.lower())
         if score > 85 and score > best_score:
@@ -146,7 +138,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(resp.choices[0].message.content.strip())
     except Exception as e:
         logger.error(e)
-        await update.message.reply_text("Временная ошибка, попробуй позже")
+        await update.message.reply_text("Временная ошибка")
 
 # =========================== АДМИН-КОМАНДЫ ===========================
 async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -174,10 +166,10 @@ if __name__ == "__main__":
 
     app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).build()
 
-    # КРИТИЧЕСКИ ВАЖНЫЙ ПОРЯДОК:
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.ChatType.GROUPS, restrict_groups), group=0)
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_non_admin_block))
-    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
+    # ВАЖНЫЙ ПОРЯДОК:
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.ChatType.GROUPS, restrict_groups))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private_non_admins))
+    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION & ~filters.COMMAND, handle_message))
 
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
@@ -186,5 +178,5 @@ if __name__ == "__main__":
 
     app.job_queue.run_repeating(lambda _: get_knowledge_base.cache_clear(), interval=300, first=10)
 
-    logger.info("Бот успешно запущен!")
+    logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True)
