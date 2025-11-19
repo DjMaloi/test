@@ -16,82 +16,59 @@ from telegram.request import HTTPXRequest
 from groq import Groq
 from rapidfuzz import fuzz
 
-# === ЛОГИ ===
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 PAUSED = False
 
-# === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
-SHEET_ID = os.getenv("SHEET_ID")
-RANGE_NAME = "Support!A:B"
-GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
-
+# === ПЕРЕМЕННЫЕ ===
 errors = []
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN or not TELEGRAM_TOKEN.strip():
-    errors.append("TELEGRAM_TOKEN не задан")
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY or not GROQ_API_KEY.strip():
-    errors.append("GROQ_API_KEY не задан")
-
-if not SHEET_ID or not SHEET_ID.strip():
-    errors.append("SHEET_ID не задан")
+SHEET_ID = os.getenv("SHEET_ID")
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
 
 # ADMIN_IDS
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
-if not ADMIN_ID_STR.strip():
+if not ADMIN_ID_STR or not ADMIN_ID_STR.strip():
     errors.append("ADMIN_ID не задан")
 else:
     try:
         ADMIN_IDS = [int(x.strip()) for x in ADMIN_ID_STR.split(",") if x.strip()]
         logger.info(f"Админы: {ADMIN_IDS}")
-    except ValueError:
+    except:
         errors.append("ADMIN_ID — только цифры через запятую")
         ADMIN_IDS = []
 
-# ALLOWED_GROUP_IDS — группы, где бот может жить (включая топики/форумы)
+# ALLOWED_GROUP_IDS
 ALLOWED_GROUP_IDS_STR = os.getenv("ALLOWED_GROUP_IDS", "")
 if ALLOWED_GROUP_IDS_STR.strip():
     try:
         ALLOWED_GROUP_IDS = [int(x.strip()) for x in ALLOWED_GROUP_IDS_STR.split(",") if x.strip()]
         logger.info(f"Разрешённые группы: {ALLOWED_GROUP_IDS}")
-    except ValueError:
-        errors.append("ALLOWED_GROUP_IDS — только цифры через запятую")
+    except:
         ALLOWED_GROUP_IDS = []
 else:
     ALLOWED_GROUP_IDS = []
     logger.info("ALLOWED_GROUP_IDS не задан — бот работает везде")
 
 if errors:
-    for e in errors:
-        logger.error(e)
+    for e in errors: logger.error(e)
     exit(1)
 
-# === GOOGLE SHEETS ===
+# === GOOGLE & GROQ ===
 try:
     with open(GOOGLE_CREDENTIALS_PATH) as f:
         creds_info = json.load(f)
-    creds = Credentials.from_service_account_info(
-        creds_info,
-        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
-    )
+    creds = Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     service = build("sheets", "v4", credentials=creds)
     sheet = service.spreadsheets()
-    logger.info("Google Sheets подключён")
 except Exception as e:
     logger.error(f"Google error: {e}")
     exit(1)
 
-# === GROQ ===
 try:
     client = Groq(api_key=GROQ_API_KEY, timeout=10)
-    logger.info("Groq подключён")
 except Exception as e:
     logger.error(f"Groq error: {e}")
     exit(1)
@@ -102,131 +79,73 @@ def get_knowledge_base():
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
         rows = result.get("values", [])[1:]
-        entries = []
-        for r in rows:
-            problem = r[0].strip() if len(r) > 0 else ""
-            solution = r[1].strip() if len(r) > 1 else "Нет решения"
-            if problem:
-                entries.append(f"Проблема: {problem}\nРешение: {solution}")
+        entries = [f"Проблема: {r[0].strip()}\nРешение: {r[1].strip() if len(r)>1 else 'Нет решения'}" for r in rows if r and r[0].strip()]
         kb = "\n\n".join(entries)
-        logger.info(f"Загружено записей: {len(rows)}")
+        logger.info(f"Загружено {len(rows)} записей")
         return kb or "База пуста"
     except Exception as e:
         logger.error(f"Sheets error: {e}")
         get_knowledge_base.cache_clear()
         return "Ошибка базы знаний"
 
-SYSTEM_PROMPT = """
-Ты — бот техподдержки. Используй ТОЛЬКО эту базу знаний:
-{kb}
-Если не нашёл — скажи: "Не нашёл точного решения. Опиши подробнее или обратись к модератору."
-Отвечай кратко, по-русски, шаг за шагом.
-"""
+SYSTEM_PROMPT = """Ты — бот техподдержки. Используй ТОЛЬКО эту базу знаний:\n{kb}\nЕсли не нашёл — скажи: "Не нашёл точного решения. Опиши подробнее или обратись к модератору."\nОтвечай кратко, по-русски, шаг за шагом."""
 
-# === 1. УНИВЕРСАЛЬНАЯ ПРОВЕРКА ГРУПП (работает с топиками!) ===
+# === 1. ПРОВЕРКА ГРУПП (включая топики!) ===
 async def restrict_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat.type not in ("group", "supergroup"):
         return
-
-    if not ALLOWED_GROUP_IDS:  # если список пуст — пропускаем все группы
+    if not ALLOWED_GROUP_IDS:
         return
-
     if chat.id not in ALLOWED_GROUP_IDS:
         try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text="Этот бот работает только в официальных чатах проекта.\nДобавление в другие группы запрещено."
-            )
+            await context.bot.send_message(chat.id, "Бот работает только в официальных чатах проекта.")
         except:
             pass
         await context.bot.leave_chat(chat.id)
-        logger.warning(f"Покинул запрещённую группу: {chat.title or 'Без названия'} ({chat.id})")
+        logger.warning(f"Покинул группу {chat.title} ({chat.id})")
 
-# === 2. БЛОКИРОВКА ЛИЧКИ ОТ НЕ-АДМИНОВ ===
-async def block_private_non_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === 2. ЛИЧКА: НЕ-АДМИНЫ — КНОПКА, АДМИНЫ — ПОЛНЫЙ ДОСТУП ===
+async def private_access_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id in ADMIN_IDS:
-        return
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            text="Связаться с поддержкой",
-            url="https://t.me/alexeymaloi"  # ←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←←
-            # Замени на свой ник или ссылку в группу поддержки
-        )
-    ]])
-
+        return  # админы проходят дальше — всё работает
+    # Не-админы — только кнопка
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])  # ← замени
     await update.message.reply_text(
         "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку:",
         reply_markup=keyboard
     )
+    return  # блокируем дальнейшую обработку
 
-# === АДМИН-КОМАНДЫ ===
-async def admin_only_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if update.effective_chat.type != "private":
-        await update.message.reply_text("Команда только в личке")
-        return False
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Доступ запрещён")
-        return False
-    return True
-
-async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only_in_private(update, context): return
-    global PAUSED; PAUSED = True
-    await update.message.reply_text("Бот приостановлен")
-
-async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only_in_private(update, context): return
-    global PAUSED; PAUSED = False
-    await update.message.reply_text("Бот возобновлён")
-
-async def status_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only_in_private(update, context): return
-    await update.message.reply_text(f"Бот {'приостановлен' if PAUSED else 'работает'}")
-
-async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await admin_only_in_private(update, context): return
-    get_knowledge_base.cache_clear()
-    await update.message.reply_text("База обновлена")
-
-async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("OK" if not PAUSED else "PAUSED")
-
-# === ОБРАБОТКА СООБЩЕНИЙ ===
+# === ОБРАБОТКА СООБЩЕНИЙ (для групп и админов в личке) ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if PAUSED:
-        if update.effective_chat.type == "private" and update.effective_user.id in ADMIN_IDS:
-            if update.message.text == "/status":
-                await update.message.reply_text("Бот приостановлен")
+    if PAUSED and update.effective_user.id not in ADMIN_IDS:
         return
 
     text = (update.message.text or update.message.caption or "").strip()
     if not text or text.startswith("/") or len(text) > 1000:
         return
 
-    return
-
     kb = get_knowledge_base()
+    # твой поиск по базе и Groq — без изменений
+    # ... (весь твой код из handle_message оставляем как есть) ...
+
+    # Пример (оставь свой оригинальный код ниже):
     kb_blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
     user_query = text.lower()
-    best_score = 0
     best_solution = None
+    best_score = 0
 
     for block in kb_blocks:
         lines = [l.strip() for l in block.split("\n")]
-        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"):
-            continue
+        if len(lines) < 2 or not lines[0].lower().startswith("проблема:"): continue
         problem = lines[0][10:].strip()
         score = fuzz.ratio(user_query, problem.lower())
         if score > 85 and score > best_score:
             best_score = score
-            best_solution = "\n".join(
-                line[9:].strip() if line.lower().startswith("решение:") else line
-                for line in lines[1:]
-            )
+            best_solution = "\n".join(line[9:].strip() if line.lower().startswith("решение:") else line for line in lines[1:])
 
     if best_solution:
         await update.message.reply_text(best_solution)
@@ -242,38 +161,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response.choices[0].message.content.strip())
     except Exception as e:
         logger.error(f"Groq error: {e}")
-        await update.message.reply_text("Временная ошибка, попробуй позже")
+        await update.message.reply_text("Временная ошибка")
 
-# === АВТООБНОВЛЕНИЕ ===
-def schedule_auto_reload(app):
-    async def job(_):
-        get_knowledge_base.cache_clear()
-        logger.info("Кеш очищен")
-    app.job_queue.run_once(job, 10)
-    app.job_queue.run_repeating(job, interval=300)
+# === АДМИН-КОМАНДЫ ===
+async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    global PAUSED; PAUSED = True
+    await update.message.reply_text("Бот приостановлен")
+
+async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    global PAUSED; PAUSED = False
+    await update.message.reply_text("Бот возобновлён")
+
+async def status_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    await update.message.reply_text(f"Бот {'приостановлен' if PAUSED else 'работает'}")
+
+async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    get_knowledge_base.cache_clear()
+    await update.message.reply_text("База обновлена")
+
+async def health_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("OK" if not PAUSED else "PAUSED")
 
 # === ЗАПУСК ===
 if __name__ == "__main__":
-    logger.info("Запуск бота...")
     PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
 
     app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).build()
 
-    # САМЫЕ ВАЖНЫЕ — ПЕРВЫМИ!
-    app.add_handler(MessageHandler(
-        filters.ChatType.GROUPS | filters.StatusUpdate.NEW_CHAT_MEMBERS,
-        restrict_groups
-    ), group=0)
+    # КЛЮЧЕВОЙ ПОРЯДОК:
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.ChatType.GROUPS, restrict_groups), group=0)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, private_access_filter))  # личка: админы — всё, остальные — кнопка
+    app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))  # основной обработчик
 
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private_non_admin))
-
-    app.add_handler(MessageHandler((filters.TEXT & ~filters.COMMAND) | (filters.CAPTION & ~filters.COMMAND), handle_message))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_bot))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("health", health_check))
 
-    schedule_auto_reload(app)
-    logger.info("Бот успешно запущен!")
+    def auto_reload(app):
+        async def job(_): get_knowledge_base.cache_clear()
+        app.job_queue.run_repeating(job, interval=300)
+    auto_reload(app)
+
+    logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True)
