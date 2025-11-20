@@ -314,8 +314,8 @@ if __name__ == "__main__":
 
     app.add_error_handler(error_handler)
 
-    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=5)
-    app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
+    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
+    #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
     app.run_polling(drop_pending_updates=True)
