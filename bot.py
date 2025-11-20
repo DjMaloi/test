@@ -131,64 +131,59 @@ def get_embedder():
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
     return embedder
 
-@lru_cache(maxsize=1)
-def get_knowledge_base() -> str:
-    try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
-        values = result.get("values", [])
-        if not values:
-            return ""
-        rows = values[1:] if len(values) > 1 and "проблема" in str(values[0][0]).lower() else values
-        entries = [f"Проблема: {row[0].strip()}\nРешение: {row[1].strip()}" for row in rows if len(row) >= 2 and row[0].strip()]
-        kb = "\n\n".join(entries)
-        logger.info(f"Загружено {len(entries)} записей из таблицы")
-        return kb
-    except Exception as e:
-        logger.error(f"Ошибка чтения таблицы: {e}")
-        return ""
-
 async def update_vector_db_safe():
     global collection
     logger.info("=== Обновление векторной базы ===")
-    kb = get_knowledge_base()
-    if not kb:
-        collection = None
-        return
-
-    blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
-    docs, ids, metadatas = [], [], []
-    for i, block in enumerate(blocks):
-        lines = [l.strip() for l in block.split("\n")]
-        if len(lines) < 2:
-            continue
-        problem = lines[0].replace("Проблема:", "", 1).strip()
-        solution = "\n".join(lines[1:]).replace("Решение:", "", 1).strip()
-        docs.append(f"Проблема: {problem}\nРешение: {solution}")
-        ids.append(f"kb_{i}")
-        metadatas.append({"problem": problem, "solution": solution})
-
     try:
-        chroma_client.delete_collection("support_kb")
-    except:
-        pass
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
+        values = result.get("values", [])
+        if not values or len(values) < 2:
+            logger.warning("Таблица пустая")
+            collection = None
+            return
 
-    collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
-    for i in range(0, len(docs), 100):
-        collection.add(
-            documents=docs[i:i + 100],
-            ids=ids[i:i + 100],
-            metadatas=metadatas[i:i + 100]
-        )
-    logger.info(f"Векторная база обновлена: {len(docs)} документов ✅")
+        docs, ids, metadatas = [], [], []
+        for i, row in enumerate(values):
+            if i == 0:  # пропускаем первую строку (если там заголовок)
+                continue
+            if len(row) < 2:
+                continue
+            question = row[0].strip()
+            answer = row[1].strip()
+            if not question or not answer:
+                continue
+
+            # Эмбеддим вопрос + ответ вместе — максимальная точность
+            full_text = f"{question} {answer}"
+            docs.append(full_text)
+            ids.append(f"kb_{i}")
+            metadatas.append({"question": question, "answer": answer})
+
+        try:
+            chroma_client.delete_collection("support_kb")
+        except:
+            pass
+
+        collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
+        for j in range(0, len(docs), 100):
+            collection.add(
+                documents=docs[j:j+100],
+                ids=ids[j:j+100],
+                metadatas=metadatas[j:j+100]
+            )
+        logger.info(f"Векторная база обновлена: {len(docs)} записей ✅")
+    except Exception as e:
+        logger.error(f"Ошибка обновления базы: {e}")
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEMAPHORE = asyncio.Semaphore(6)
 
 def preprocess_text(text: str) -> str:
     text = text.lower()
+    text = text.strip(" .,!?()[]'\"…\n\r\t")
     text = re.sub(r'[^а-яa-z0-9\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip() or "пустой_вопрос"
 
 # ============================ ОСНОВНОЙ ХЕНДЛЕР ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -209,6 +204,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats["cached"] = stats.get("cached", 0) + 1
         save_stats(stats)
         await context.bot.send_message(chat_id=chat_id, text=response_cache[cache_key])
+        logger.info("Ответ из кэша!")
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -223,17 +219,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             candidates = list(zip(results["distances"][0], results["metadatas"][0]))
             candidates.sort(key=lambda x: x[0])
 
-            # СУПЕР-МЯГКИЕ ПОРОГИ + ПРИНУДИТЕЛЬНЫЙ ТОП-1
             for dist, meta in candidates:
                 if dist <= 0.92:
                     relevant.append(meta)
 
             if candidates:
                 best_dist, best_meta = candidates[0]
-                if best_meta not in [r for r in relevant]:
+                if best_meta not in relevant:
                     relevant.insert(0, best_meta)
                 source_type = f"best_{best_dist:.3f}"
-                logger.info(f"Найдено! Лучшее совпадение: {best_dist:.4f} → {best_meta['problem']}")
 
             relevant = relevant[:12]
             query_cache[cache_key] = relevant
@@ -242,30 +236,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         relevant = query_cache.get(cache_key, [])
 
-    # Fallback — если вообще ничего
     if not relevant and collection and collection.count() > 0:
         try:
-            fb_emb = get_embedder().encode("поддержка помощь интернет").tolist()
+            fb_emb = get_embedder().encode("помощь поддержка интернет").tolist()
             fb = collection.query(query_embeddings=[fb_emb], n_results=5, include=["metadatas"])
             relevant = [m for m in fb["metadatas"][0]]
             source_type = "fallback"
         except:
             pass
 
-    # Контекст — всегда есть
-    context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]) if relevant else get_knowledge_base()
+    context_str = "\n\n".join([f"Вопрос: {m['question']}\nОтвет: {m['answer']}" for m in relevant]) if relevant else "База временно недоступна"
 
-    # ЖЁСТКИЙ ПРОМПТ — ЗАПРЕЩАЕМ ОТМАЗКИ
-    prompt = f"""Ты — специалист техподдержки. Отвечай ТОЛЬКО по базе знаний ниже.
-ВАЖНО: В базе ВСЕГДА есть подходящая запись. Бери САМУЮ ПЕРВУЮ (она самая релевантная).
-Адаптируй её под вопрос пользователя. НИКОГДА не говори "к сожалению нет решения", "пока нет", "передал специалисту" — это строго запрещено.
+    prompt = f"""Ты — специалист техподдержки. Отвечай ТОЛЬКО по базе ниже.
+Бери САМУЮ ПЕРВУЮ запись — она всегда самая релевантная.
+Адаптируй ответ под вопрос пользователя. НИКОГДА не говори "нет решения", "передал специалисту" и т.п.
 
-База знаний (первая запись — самая подходящая):
+База (первая — самая подходящая):
 {context_str}
 
-Вопрос: {raw_text}
+Вопрос пользователя: {raw_text}
 
-Ответ (дружелюбно, кратко, по делу):"""
+Ответ:"""
 
     reply = None
     async with GROQ_SEMAPHORE:
@@ -288,16 +279,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats["groq_fallback"] = stats.get("groq_fallback", 0) + 1
             save_stats(stats)
 
-    # АБСОЛЮТНЫЙ FALLBACK
     if not reply or len(reply) < 10:
-        if relevant:
-            reply = relevant[0]['solution']
-        else:
-            reply = "Ваш вопрос зафиксирован. Специалист ответит вам лично в ближайшее время."
+        reply = relevant[0]['answer'] if relevant else "Ваш вопрос зафиксирован. Специалист ответит в ближайшее время."
 
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
-    logger.info(f"Ответ отправлен | Совпадений: {len(relevant)} | Источник: {source_type}")
+    logger.info(f"Ответ отправлен | Совпадений: {len(relevant)} | Кэш ключ: {cache_key[:16]}...")
 
 # ============================ АДМИНКИ ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,7 +294,7 @@ async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
-    get_knowledge_base.cache_clear()
+    get_knowledge_base.cache_clear = lambda: None  # просто очищаем кэш
     await update_vector_db_safe()
     await update.message.reply_text("База обновлена!")
 
@@ -327,7 +314,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paused = "Пауза" if is_paused() else "Работает"
     coll_count = collection.count() if collection else 0
     await update.message.reply_text(
-        f"Статус: {paused}\nЗаписей: {coll_count}\nЗапросов: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}"
+        f"Статус: {paused}\n"
+        f"Записей: {coll_count}\n"
+        f"Всего: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}"
     )
 
 # ============================ ЗАПУСК ============================
@@ -345,5 +334,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — ФИНАЛЬНАЯ НЕУБИВАЕМАЯ ВЕРСИЯ 20.11.2025")
+    logger.info("Бот запущен — ФИНАЛЬНАЯ ВЕРСИЯ ПОД ТВОЮ ТАБЛИЦУ БЕЗ ЗАГОЛОВКОВ (20.11.2025)")
     app.run_polling(drop_pending_updates=True)
