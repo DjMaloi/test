@@ -213,8 +213,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Chroma ошибка: {e}")
 
     if not best_answer:
-        best_answer = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
-
+        #best_answer = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
+        # Просто ничего не отвечаем и выходим из функции
+            return
     reply = best_answer
     if source != "fallback" and len(best_answer) < 1000:
         prompt = f"""Перефразируй коротко и дружелюбно. Сохрани весь смысл.
