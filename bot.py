@@ -16,6 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
+from telegram.error import BadRequest
 
 from groq import Groq
 
@@ -112,7 +113,7 @@ def get_knowledge_base() -> str:
         logger.error(f"Ошибка чтения таблицы: {e}")
         return ""
 
-# ============================ ОБНОВЛЕНИЕ ВЕКТОРНОЙ БАЗЫ (ФИКСЕД) ============================
+# ============================ ОБНОВЛЕНИЕ ВЕКТОРНОЙ БАЗЫ ============================
 async def update_vector_db():
     kb_text = get_knowledge_base()
     if not kb_text:
@@ -133,7 +134,7 @@ async def update_vector_db():
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
 
-    # УДАЛЯЕМ ВСЮ КОЛЛЕКЦИЮ ЦЕЛИКОМ (это единственный надёжный способ в Chroma 0.5.x)
+    # УДАЛЯЕМ ВСЮ КОЛЛЕКЦИЮ ЦЕЛИКОМ
     try:
         chroma_client.delete_collection("support_kb")
         logger.info("Старая коллекция удалена")
@@ -156,28 +157,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/") or len(text) > 1500:
         return
 
-    logger.info(f"Запрос от {update.effective_user.id}: {text[:80]}...")
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    logger.info(f"Запрос от {user_id} в чате {chat_id}: {text[:80]}...")
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     await asyncio.sleep(2 + len(text.split()) / 10)  # 2–8 сек задержка
 
     # Семантический поиск
-    collection = chroma_client.get_collection(name="support_kb")
-    query_emb = embedder.encode(text).tolist()
-    results = collection.query(query_embeddings=[query_emb], n_results=6, include=["metadatas"])
+    try:
+        collection = chroma_client.get_collection(name="support_kb")
+        query_emb = embedder.encode(text).tolist()
+        results = collection.query(query_embeddings=[query_emb], n_results=6, include=["metadatas"])
 
-    relevant = results["metadatas"][0] if results["metadatas"] else []
-    if not relevant:
-        await update.message.reply_text(
-            "Точного решения по вашему вопросу пока нет в базе знаний.\n"
-            "Опишите проблему подробнее — передам специалисту."
-        )
-        return
+        relevant = results["metadatas"][0] if results["metadatas"] else []
+        if not relevant:
+            await context.bot.send_message(chat_id=chat_id, text="Точного решения по вашему вопросу пока нет в базе знаний.\nОпишите проблему подробнее — передам специалисту.")
+            return
 
-    context_blocks = [f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]
-    context = "\n\n".join(context_blocks)
+        context_blocks = [f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]
+        context = "\n\n".join(context_blocks)
 
-    prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
+        prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
 Отвечай ТОЛЬКО на основе информации ниже. Ничего не придумывай.
 
 База знаний:
@@ -191,9 +192,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Вопрос: {text}
 Ответ:"""
 
-    try:
         response = client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
+            model="llama-3.3-70b-versatile",  # ← ФИКС: Новая модель вместо устаревшей
             messages=[{"role": "system", "content": prompt}],
             max_tokens=600,
             temperature=0.3,
@@ -206,29 +206,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(reply) > 900:
             for part in reply.split("\n\n"):
-                await update.message.reply_text(part.strip())
+                await context.bot.send_message(chat_id=chat_id, text=part.strip())
                 await asyncio.sleep(0.7)
             await asyncio.sleep(1)
-            await update.message.reply_text("Если не помогло — уточните, что происходит сейчас.")
+            await context.bot.send_message(chat_id=chat_id, text="Если не помогло — уточните, что происходит сейчас.")
         else:
-            await update.message.reply_text(reply)
+            await context.bot.send_message(chat_id=chat_id, text=reply)
             if hash(text) % 10 < 7:
                 await asyncio.sleep(1.5)
-                await update.message.reply_text("Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
+                await context.bot.send_message(chat_id=chat_id, text="Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
 
     except Exception as e:
-        logger.error(f"Ошибка Groq: {e}")
-        await update.message.reply_text("Сервис временно недоступен. Попробуйте через пару минут.")
+        logger.error(f"Ошибка в handle_message (чат {chat_id}, юзер {user_id}): {e}")
+        try:
+            # Fallback: используем send_message вместо reply_text (реже падает на правах)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Сервис временно недоступен. Попробуйте через пару минут."
+            )
+        except BadRequest as te:
+            logger.error(f"Telegram BadRequest в чате {chat_id}: {te} — проверьте права бота в чате!")
+        except Exception as te:
+            logger.error(f"Дополнительная ошибка Telegram: {te}")
 
 # ============================ БЛОКИРОВКА ЛИЧКИ И АДМИНКИ ============================
 async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or update.effective_user.id in ADMIN_IDS:
         return
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
-    await update.message.reply_text(
-        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку:",
-        reply_markup=keyboard
-    )
+    try:
+        await update.message.reply_text(
+            "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку:",
+            reply_markup=keyboard
+        )
+    except BadRequest:
+        logger.warning("Не удалось ответить в приватке — права?")
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or update.effective_user.id not in ADMIN_IDS:
