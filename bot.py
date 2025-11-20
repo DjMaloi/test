@@ -34,7 +34,7 @@ SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 
-# проверка переменных (без изменений)
+# Проверка переменных
 errors = []
 for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_KEY"), (SHEET_ID, "SHEET_ID")]:
     if not var or not var.strip():
@@ -53,7 +53,7 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# пауза + статистика (без изменений)
+# Паузa и статистика
 PAUSE_FILE = "/app/paused.flag"
 STATS_FILE = "/app/stats.json"
 
@@ -91,10 +91,12 @@ def save_stats(s):
         pass
 
 stats = load_stats()
+
+# Кэши
 query_cache = TTLCache(maxsize=5000, ttl=3600)
 response_cache = TTLCache(maxsize=3000, ttl=86400)
 
-# Google Sheets + Chroma + embedder (без изменений до update_vector_db_safe)
+# Google Sheets
 try:
     creds = Credentials.from_service_account_file(
         GOOGLE_CREDENTIALS_PATH,
@@ -107,6 +109,7 @@ except Exception as e:
     logger.error(f"Google Sheets ошибка: {e}")
     exit(1)
 
+# Chroma + модель эмбеддингов
 chroma_client = chromadb.PersistentClient(path="/app/chroma")
 collection = None
 embedder = None
@@ -123,9 +126,9 @@ def get_embedder():
                 cache_folder=MODEL_CACHE_DIR,
                 device="cpu"
             )
-            logger.info("Модель загружена из кэша")
+            logger.info("Модель загружена из локального кэша")
         except Exception:
-            logger.warning("Скачиваем модель один раз...")
+            logger.warning("Кэша нет — скачиваем модель один раз...")
             os.environ.pop("HF_HUB_OFFLINE", None)
             os.environ.pop("TRANSFORMERS_OFFLINE", None)
             embedder = SentenceTransformer(
@@ -139,7 +142,6 @@ def get_embedder():
 
 @lru_cache(maxsize=1)
 def get_knowledge_base() -> str:
-    # без изменений
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
@@ -185,7 +187,9 @@ async def update_vector_db_safe():
     except:
         pass
 
-    collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
+    collection = chroma_client.get_or_create_collection(
+        "support_kb", metadata={"hnsw:space": "cosine"}
+    )
     batch_size = 100
     for i in range(0, len(docs), batch_size):
         collection.add(
@@ -213,7 +217,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cache_key = md5(text.lower().encode()).hexdigest()
     if cache_key in response_cache:
-       37        stats["cached"] += 1
+        stats["cached"] = stats.get("cached", 0) + 1
         save_stats(stats)
         await context.bot.send_message(chat_id=chat_id, text=response_cache[cache_key])
         return
@@ -251,7 +255,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logger.error(f"Ошибка Chroma: {e}")
-            relevant = []
+
     else:
         relevant = query_cache.get(cache_key, [])
 
@@ -278,7 +282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats["groq_calls"] = stats.get("groq_calls", 0) + 1
         save_stats(stats)
         try:
-            response = await groq_client.chat.completions.create(
+            response = awaitAdm groq_client.chat.completions.create(
                 model="llama-3.1-70b-versatile",
                 messages=[{"role": "system", "content": prompt}],
                 max_tokens=600,
@@ -293,9 +297,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
 
-# ============================ АДМИНКИ И ЗАПУСК ============================
-# (все админские команды без изменений — копируй из твоего старого файла)
-
+# ============================ АДМИНКИ ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
@@ -309,17 +311,20 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("База знаний обновлена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     set_paused(True)
     await update.message.reply_text("Бот на паузе")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     set_paused(False)
     await update.message.reply_text("Бот работает")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     s = stats
     paused = "На паузе" if is_paused() else "Работает"
     coll_count = collection.count() if collection else 0
@@ -329,6 +334,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Запросов: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)}"
     )
 
+# ============================ ЗАПУСК ============================
 if __name__ == "__main__":
     app = Application.builder()\
         .token(TELEGRAM_TOKEN)\
@@ -347,5 +353,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — финальная версия под твою базу (ноябрь 2025)")
+    logger.info("Бот запущен — финальная версия (hard_threshold=0.52)")
     app.run_polling(drop_pending_updates=True)
