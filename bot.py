@@ -23,6 +23,9 @@ from groq import Groq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
+# ============================ ОТКЛЮЧЕНИЕ TELEMETRY CHROMA (фикс логов) ============================
+os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
+
 # ============================ ЛОГИРОВАНИЕ ============================
 logging.basicConfig(
     level=logging.INFO,
@@ -164,6 +167,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     await asyncio.sleep(2 + len(text.split()) / 10)  # 2–8 сек задержка
 
+    # ФИКС: Сохраняем оригинальный context перед try (чтобы в except не потерять объект)
+    orig_context = context
+
     # Семантический поиск
     try:
         collection = chroma_client.get_collection(name="support_kb")
@@ -172,17 +178,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         relevant = results["metadatas"][0] if results["metadatas"] else []
         if not relevant:
-            await context.bot.send_message(chat_id=chat_id, text="Точного решения по вашему вопросу пока нет в базе знаний.\nОпишите проблему подробнее — передам специалисту.")
+            await orig_context.bot.send_message(chat_id=chat_id, text="Точного решения по вашему вопросу пока нет в базе знаний.\nОпишите проблему подробнее — передам специалисту.")
             return
 
         context_blocks = [f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]
-        context = "\n\n".join(context_blocks)
+        context_str = "\n\n".join(context_blocks)  # Переименовали, чтобы не конфликтовать с context
 
         prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
 Отвечай ТОЛЬКО на основе информации ниже. Ничего не придумывай.
 
 База знаний:
-{context}
+{context_str}
 
 Правила:
 - Если точного ответа нет — скажи: «Точного решения пока нет в базе знаний. Передам коллеге.»
@@ -193,7 +199,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Ответ:"""
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # ← ФИКС: Новая модель вместо устаревшей
+            model="llama-3.3-70b-versatile",  # ← Стабильная модель
             messages=[{"role": "system", "content": prompt}],
             max_tokens=600,
             temperature=0.3,
@@ -206,26 +212,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(reply) > 900:
             for part in reply.split("\n\n"):
-                await context.bot.send_message(chat_id=chat_id, text=part.strip())
+                await orig_context.bot.send_message(chat_id=chat_id, text=part.strip())
                 await asyncio.sleep(0.7)
             await asyncio.sleep(1)
-            await context.bot.send_message(chat_id=chat_id, text="Если не помогло — уточните, что происходит сейчас.")
+            await orig_context.bot.send_message(chat_id=chat_id, text="Если не помогло — уточните, что происходит сейчас.")
         else:
-            await context.bot.send_message(chat_id=chat_id, text=reply)
+            await orig_context.bot.send_message(chat_id=chat_id, text=reply)
             if hash(text) % 10 < 7:
                 await asyncio.sleep(1.5)
-                await context.bot.send_message(chat_id=chat_id, text="Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
+                await orig_context.bot.send_message(chat_id=chat_id, text="Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
 
     except Exception as e:
-        logger.error(f"Ошибка в handle_message (чат {chat_id}, юзер {user_id}): {e}")
+        logger.error(f"Ошибка в handle_message (чат {chat_id}, юзер {user_id}): {type(e).__name__}: {e}")
         try:
-            # Fallback: используем send_message вместо reply_text (реже падает на правах)
-            await context.bot.send_message(
+            # ФИКС: Используем сохранённый orig_context (теперь это объект ContextTypes)
+            await orig_context.bot.send_message(
                 chat_id=chat_id,
                 text="Сервис временно недоступен. Попробуйте через пару минут."
             )
         except BadRequest as te:
-            logger.error(f"Telegram BadRequest в чате {chat_id}: {te} — проверьте права бота в чате!")
+            logger.error(f"Telegram BadRequest в чате {chat_id}: {te} — проверьте права бота!")
         except Exception as te:
             logger.error(f"Дополнительная ошибка Telegram: {te}")
 

@@ -6,11 +6,12 @@ google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
 google-api-python-client==2.149.0
 
-# RAG — новые зависимости
-chromadb==0.5.3
+# RAG — обновлённые версии для фикса telemetry
+chromadb==1.0.15  # ← Фиксит PostHog-ошибку
 sentence-transformers==3.1.1
 torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
 pydantic==2.9.2
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 hnswlib==0.8.0
+posthog>=2.4.0,<6.0.0  # ← Дополнительный фикс для PostHog
