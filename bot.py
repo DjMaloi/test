@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import asyncio
-from functools import lru_cache
 from hashlib import md5
 from cachetools import TTLCache
 import re
@@ -17,7 +16,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
-from telegram.error import NetworkError, TimedOut
+from telegram.error import NetworkError
 from groq import AsyncGroq
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -26,10 +25,6 @@ from sentence_transformers import SentenceTransformer
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 os.environ["POSTHOG_DISABLED"] = "true"
-
-import chromadb as _
-from chromadb.telemetry.posthog import PostHog
-PostHog.disabled = True
 
 # ============================ КОНФИГ ============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
