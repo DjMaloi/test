@@ -184,7 +184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Ответ:"""
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-卒業",
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": prompt}],
             max_tokens=600,
             temperature=0.3,
