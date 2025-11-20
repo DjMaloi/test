@@ -23,7 +23,7 @@ from groq import Groq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# ============================ ОТКЛЮЧЕНИЕ TELEMETRY CHROMA (фикс логов) ============================
+# Отключаем назойливую телеметрию ChromaDB
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
 
 # ============================ ЛОГИРОВАНИЕ ============================
@@ -42,11 +42,7 @@ ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 PAUSED = os.getenv("BOT_PAUSED", "false").lower() == "true"
 
 errors = []
-for var, name in [
-    (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
-    (GROQ_API_KEY, "GROQ_API_KEY"),
-    (SHEET_ID, "SHEET_ID"),
-]:
+for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_KEY"), (SHEET_ID, "SHEET_ID")]:
     if not var or not var.strip():
         errors.append(f"{name} не задан")
 
@@ -96,10 +92,8 @@ def get_knowledge_base() -> str:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         if not values:
-            logger.warning("Таблица пуста")
             return ""
 
-        # Пропускаем заголовок
         rows = values[1:] if len(values) > 0 and ("проблема" in str(values[0][0]).lower() or "keyword" in str(values[0][0]).lower()) else values
 
         entries = []
@@ -120,7 +114,7 @@ def get_knowledge_base() -> str:
 async def update_vector_db():
     kb_text = get_knowledge_base()
     if not kb_text:
-        logger.warning("База знаний пуста — пропускаем обновление векторной базы")
+        logger.warning("База знаний пуста")
         return
 
     blocks = [b.strip() for b in kb_text.split("\n\n") if b.strip()]
@@ -128,8 +122,7 @@ async def update_vector_db():
 
     for i, block in enumerate(blocks):
         lines = [l.strip() for l in block.split("\n")]
-        if len(lines) < 2:
-            continue
+        if len(lines) < 2: continue
         problem = lines[0].replace("Проблема:", "", 1).strip()
         solution = "\n".join(lines[1:]).replace("Решение:", "", 1).strip()
 
@@ -137,19 +130,16 @@ async def update_vector_db():
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
 
-    # УДАЛЯЕМ ВСЮ КОЛЛЕКЦИЮ ЦЕЛИКОМ
     try:
         chroma_client.delete_collection("support_kb")
         logger.info("Старая коллекция удалена")
-    except Exception as e:
-        logger.info(f"Коллекция не существовала (нормально при первом запуске): {e}")
+    except Exception:
+        logger.info("Коллекция не существовала (нормально при первом запуске)")
 
     if docs:
         collection = chroma_client.get_or_create_collection(name="support_kb")
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"Векторная база успешно обновлена: {len(docs)} записей")
-    else:
-        logger.warning("Нет записей для добавления в векторную базу")
+        logger.info(f"Векторная база обновлена: {len(docs)} записей")
 
 # ============================ ОБРАБОТКА СООБЩЕНИЙ ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -165,12 +155,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Запрос от {user_id} в чате {chat_id}: {text[:80]}...")
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    await asyncio.sleep(2 + len(text.split()) / 10)  # 2–8 сек задержка
+    await asyncio.sleep(2 + len(text.split()) / 10)
 
-    # ФИКС: Сохраняем оригинальный context перед try (чтобы в except не потерять объект)
     orig_context = context
 
-    # Семантический поиск
     try:
         collection = chroma_client.get_collection(name="support_kb")
         query_emb = embedder.encode(text).tolist()
@@ -178,11 +166,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         relevant = results["metadatas"][0] if results["metadatas"] else []
         if not relevant:
-            await orig_context.bot.send_message(chat_id=chat_id, text="Точного решения по вашему вопросу пока нет в базе знаний.\nОпишите проблему подробнее — передам специалисту.")
+            await orig_context.bot.send_message(chat_id=chat_id,
+                text="Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту.")
             return
 
         context_blocks = [f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]
-        context_str = "\n\n".join(context_blocks)  # Переименовали, чтобы не конфликтовать с context
+        context_str = "\n\n".join(context_blocks)
 
         prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
 Отвечай ТОЛЬКО на основе информации ниже. Ничего не придумывай.
@@ -191,22 +180,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 {context_str}
 
 Правила:
-- Если точного ответа нет — скажи: «Точного решения пока нет в базе знаний. Передам коллеге.»
 - Кратко, по-русски, по делу, используй списки.
-- Пиши как живой человек, без смайликов и лишних восклицаний.
+- Пиши как живой человек.
 
 Вопрос: {text}
 Ответ:"""
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # ← Стабильная модель
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": prompt}],
             max_tokens=600,
             temperature=0.3,
         )
         reply = response.choices[0].message.content.strip()
 
-        # Защита от редких галлюцинаций
         if any(w in reply.lower() for w in ["не знаю", "не уверен", "не могу найти"]):
             reply = "Точного решения пока нет в базе знаний.\nПередам ваш запрос — ответим скоро."
 
@@ -223,37 +210,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await orig_context.bot.send_message(chat_id=chat_id, text="Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
 
     except Exception as e:
-        logger.error(f"Ошибка в handle_message (чат {chat_id}, юзер {user_id}): {type(e).__name__}: {e}")
+        logger.error(f"Ошибка в handle_message (чат {chat_id}): {e}")
         try:
-            # ФИКС: Используем сохранённый orig_context (теперь это объект ContextTypes)
-            await orig_context.bot.send_message(
-                chat_id=chat_id,
-                text="Сервис временно недоступен. Попробуйте через пару минут."
-            )
+            await orig_context.bot.send_message(chat_id=chat_id,
+                text="Сервис временно недоступен. Попробуйте через пару минут.")
         except BadRequest as te:
-            logger.error(f"Telegram BadRequest в чате {chat_id}: {te} — проверьте права бота!")
+            logger.error(f"Telegram BadRequest в чате {chat_id}: {te}")
         except Exception as te:
-            logger.error(f"Дополнительная ошибка Telegram: {te}")
+            logger.error(f"Не удалось отправить fallback: {te}")
 
-# ============================ БЛОКИРОВКА ЛИЧКИ И АДМИНКИ ============================
+# ============================ БЛОКИРОВКА ЛИЧКИ (ТОЛЬКО АДМИНЫ) ============================
 async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or update.effective_user.id in ADMIN_IDS:
+    if update.effective_chat.type != "private":
         return
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
-    try:
-        await update.message.reply_text(
-            "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку:",
-            reply_markup=keyboard
-        )
-    except BadRequest:
-        logger.warning("Не удалось ответить в приватке — права?")
+    if update.effective_user.id in ADMIN_IDS:
+        return  # ← админы могут писать в личку
 
+    # Остальные получают только кнопку
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
+    await update.message.reply_text(
+        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку ниже:",
+        reply_markup=keyboard
+    )
+
+# ============================ АДМИН-КОМАНДЫ ============================
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or update.effective_user.id not in ADMIN_IDS:
         return
     get_knowledge_base.cache_clear()
     await update_vector_db()
-    await update.message.reply_text("База знаний и векторная база перезагружены!")
+    await update.message.reply_text("База знаний перезагружена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -271,13 +257,14 @@ async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).build()
 
+    # Порядок важен!
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_non_admin_private))
     app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
+
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
 
-    # Первая загрузка через 3 сек после старта + каждые 10 минут
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
