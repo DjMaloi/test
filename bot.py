@@ -22,6 +22,8 @@ from sentence_transformers import SentenceTransformer
 
 # ============================ КОНФИГ ============================
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
+os.environ["HF_HUB_OFFLINE"] = "1"           # важная строка №1
+os.environ["TRANSFORMERS_OFFLINE"] = "1"     # важная строка №2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 
-# Проверка переменных
+# проверка переменных
 errors = []
 for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_KEY"), (SHEET_ID, "SHEET_ID")]:
     if not var or not var.strip():
@@ -50,7 +52,7 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# ============================ ПАУЗА + СТАТИСТИКА ============================
+# пауза + статистика
 PAUSE_FILE = "/app/paused.flag"
 STATS_FILE = "/app/stats.json"
 
@@ -89,11 +91,11 @@ def save_stats(s):
 
 stats = load_stats()
 
-# ============================ КЭШИ ============================
+# кэши
 query_cache = TTLCache(maxsize=5000, ttl=3600)
 response_cache = TTLCache(maxsize=3000, ttl=86400)
 
-# ============================ GOOGLE SHEETS ============================
+# Google Sheets
 try:
     creds = Credentials.from_service_account_file(
         GOOGLE_CREDENTIALS_PATH,
@@ -106,17 +108,35 @@ except Exception as e:
     logger.error(f"Google Sheets ошибка: {e}")
     exit(1)
 
-# ============================ CHROMA + ЭМБЕДДЕР ============================
+# Chroma + оффлайн-модель
 chroma_client = chromadb.PersistentClient(path="/app/chroma")
-embedder = None  # ленивая загрузка
 collection = None
+embedder = None
+MODEL_CACHE_DIR = "/app/model_cache"
 
 def get_embedder():
     global embedder
     if embedder is None:
-        logger.info("Загружаем модель эмбеддингов (один раз)...")
-        embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-        logger.info("Модель эмбеддингов загружена")
+        logger.info("Грузим модель эмбеддингов (оффлайн + кэш)...")
+        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+        try:
+            embedder = SentenceTransformer(
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                cache_folder=MODEL_CACHE_DIR,
+                device="cpu"
+            )
+            logger.info("Модель загружена из локального кэша")
+        except Exception as e:
+            logger.warning(f"Кэша нет или повреждён ({e}) — скачиваем модель один раз")
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            embedder = SentenceTransformer(
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                cache_folder=MODEL_CACHE_DIR
+            )
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            logger.info("Модель успешно скачана и закэширована")
     return embedder
 
 @lru_cache(maxsize=1)
@@ -141,10 +161,10 @@ def get_knowledge_base() -> str:
 
 async def update_vector_db_safe():
     global collection
-    logger.info("=== Начало обновления векторной базы ===")
+    logger.info("=== Обновление векторной базы ===")
     kb = get_knowledge_base()
     if not kb:
-        logger.warning("База знаний пуста — пропускаем")
+        logger.warning("База знаний пуста")
         collection = None
         return
 
@@ -168,6 +188,7 @@ async def update_vector_db_safe():
         pass
 
     collection = chroma_client.get_or_create_collection("support_kb")
+
     batch_size = 100
     for i in range(0, len(docs), batch_size):
         collection.add(
@@ -177,7 +198,7 @@ async def update_vector_db_safe():
         )
     logger.info(f"Векторная база успешно обновлена: {len(docs)} документов ✅")
 
-# ============================ GROQ ============================
+# Groq
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEMAPHORE = asyncio.Semaphore(6)
 
@@ -204,7 +225,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # === ВЕКТОРНЫЙ ПОИСК (финальная версия) ===
     relevant = []
     if collection is not None and cache_key not in query_cache:
         try:
@@ -214,49 +234,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n_results=10,
                 include=["metadatas", "distances"]
             )
-            logger.info(f"Векторный поиск успешен для «{text}» — найдено {len(results['distances'][0])} совпадений")
             distances = results["distances"][0]
             metadatas = results["metadatas"][0]
 
-            # Основной порог 0.60 + fallback на топ-3
             for meta, dist in zip(metadatas, distances):
-                if dist < 0.60:
+                if dist < 0.65:                     # широкий порог
                     relevant.append(meta)
                 if len(relevant) >= 4:
                     break
 
             if not relevant:
-                logger.info(f"Порог 0.60 не сработал — берём топ-3 ближайших (дистанции: {[round(d,3) for d in distances[:3]]})")
+                logger.info(f"Порог 0.65 не дал результатов — берём топ-3 ближайших")
                 for i in range(min(3, len(metadatas))):
                     relevant.append(metadatas[i])
 
             query_cache[cache_key] = relevant
-            logger.info(f"Выбрано релевантных записей: {len(relevant)} для запроса «{text}»")
-
-        except Exception as e:
-            logger.error(f"Ошибка Chroma при поиске (база ещё не готова?): {e}")
-            relevant = []  # на случай, если collection существует, но внутри пусто
-    else:
-        if collection is None:
-            logger.warning("Collection ещё None — пользователь спросил раньше, чем база загрузилась")
-        relevant = query_cache.get(cache_key, [])
-            distances = results["distances"][0]
-            metadatas = results["metadatas"][0]
-
-            # Основной порог — 0.60 (оптимально для MiniLM)
-            for meta, dist in zip(metadatas, distances):
-                if dist < 0.60:
-                    relevant.append(meta)
-                if len(relevant) >= 4:
-                    break
-
-            # Если ничего не нашли — берём топ-3 ближайших в любом случае
-            if not relevant:
-                for i in range(min(3, len(metadatas))):
-                    relevant.append(metadatas[i])
-
-            query_cache[cache_key] = relevant
-            logger.info(f"Найдено релевантных: {len(relevant)} для запроса «{text}»")
+            logger.info(f"Найдено релевантных записей: {len(relevant)} (запрос: «{text}»)")
         except Exception as e:
             logger.error(f"Ошибка поиска в Chroma: {e}")
             relevant = []
@@ -289,7 +282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 messages=[{"role": "system", "content": prompt}],
                 max_tokens=500,
                 temperature=0.1,
-                timeout=20,
+                timeout=25,
             )
             reply = response.choices[0].message.content.strip()
         except Exception as e:
@@ -356,9 +349,9 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
 
-    # При старте и каждые 10 минут обновляем базу
-    app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=5)
+    # загружаем модель и базу сразу после старта
+    app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — финальная стабильная версия")
+    logger.info("Бот запущен — 100% рабочая версия ноябрь 2025")
     app.run_polling(drop_pending_updates=True)
