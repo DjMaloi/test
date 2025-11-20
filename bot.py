@@ -53,7 +53,7 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# Паузa и статистика
+# Пауза и статистика
 PAUSE_FILE = "/app/paused.flag"
 STATS_FILE = "/app/stats.json"
 
@@ -109,7 +109,7 @@ except Exception as e:
     logger.error(f"Google Sheets ошибка: {e}")
     exit(1)
 
-# Chroma + модель эмбеддингов
+# Chroma + модель
 chroma_client = chromadb.PersistentClient(path="/app/chroma")
 collection = None
 embedder = None
@@ -203,7 +203,7 @@ async def update_vector_db_safe():
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEMAPHORE = asyncio.Semaphore(6)
 
-# ============================ ОСНОВНОЙ ХЕНДЛЕР ============================
+# ============================ ХЕНДЛЕР СООБЩЕНИЙ ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -282,7 +282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats["groq_calls"] = stats.get("groq_calls", 0) + 1
         save_stats(stats)
         try:
-            response = awaitAdm groq_client.chat.completions.create(
+            response = await groq_client.chat.completions.create(
                 model="llama-3.1-70b-versatile",
                 messages=[{"role": "system", "content": prompt}],
                 max_tokens=600,
@@ -297,7 +297,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
 
-# ============================ АДМИНКИ ============================
+# ============================ АДМИН КОМАНДЫ ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
@@ -353,5 +353,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — финальная версия (hard_threshold=0.52)")
+    logger.info("Бот запущен — финальная рабочая версия (ноябрь 2025)")
     app.run_polling(drop_pending_updates=True)
