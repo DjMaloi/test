@@ -49,6 +49,7 @@ else:
         logger.info(f"Админы: {ADMIN_IDS}")
     except ValueError:
         errors.append("ADMIN_ID — некорректный формат")
+
 if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
@@ -90,7 +91,6 @@ def save_stats(s):
         pass
 
 stats = load_stats()
-
 query_cache = TTLCache(maxsize=5000, ttl=3600)
 response_cache = TTLCache(maxsize=3000, ttl=86400)
 
@@ -188,6 +188,7 @@ async def update_vector_db_safe():
     collection = chroma_client.get_or_create_collection(
         "support_kb", metadata={"hnsw:space": "cosine"}
     )
+
     batch_size = 100
     for i in range(0, len(docs), batch_size):
         collection.add(
@@ -195,28 +196,28 @@ async def update_vector_db_safe():
             ids=ids[i:i + batch_size],
             metadatas=metadatas[i:i + batch_size]
         )
+
     logger.info(f"Векторная база обновлена: {len(docs)} документов ✅")
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEMAPHORE = asyncio.Semaphore(6)
 
-# Предобработка текста (чтобы короткие запросы лучше попадали)
 def preprocess_text(text: str) -> str:
     text = text.lower()
     text = re.sub(r'[^а-яa-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-# ============================ ОСНОВНОЙ ХЕНДЛЕР ============================
+# ============================ НОВАЯ ОСНОВНАЯ ФУНКЦИЯ ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
+
     raw_text = (update.message.text or update.message.caption or "").strip()
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
 
     text = preprocess_text(raw_text)
-
     chat_id = update.effective_chat.id
     stats["total"] = stats.get("total", 0) + 1
     save_stats(stats)
@@ -231,6 +232,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     relevant = []
+    source_type = "no_match"
+
+    # 1. Поиск в векторной базе
     if collection is not None and cache_key not in query_cache:
         try:
             emb = get_embedder().encode(text).tolist()
@@ -240,7 +244,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 include=["metadatas", "distances"]
             )
 
-            hard_threshold = 0.48
+            hard_threshold = 0.45   # чуть мягче — больше точных попаданий
             soft_threshold = 0.78
 
             candidates = list(zip(results["distances"][0], results["metadatas"][0]))
@@ -249,42 +253,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for dist, meta in candidates:
                 if dist <= hard_threshold:
                     relevant.append(meta)
-                    logger.info(f"✓ ТОП (dist={dist:.4f}): {meta['problem'][:90]}")
-                elif dist <= soft_threshold and len(relevant) < 3:
+                elif dist <= soft_threshold and len(relevant) < 5:
                     relevant.append(meta)
-                    logger.info(f"↗ Мягкое (dist={dist:.4f}): {meta['problem'][:90]}")
 
             if relevant:
-                relevant = relevant[:6]
+                relevant = relevant[:8]
+                source_type = "hard_match" if any(d <= hard_threshold for d, _ in candidates) else "soft_match"
 
             query_cache[cache_key] = relevant
-            logger.info(f"Найдено релевантных записей: {len(relevant)}")
-
+            logger.info(f"Chroma: найдено {len(relevant)} релевантных записей")
         except Exception as e:
-            logger.error(f"Ошибка Chroma: {e}")
-
+            logger.error(f"Chroma ошибка: {e}")
     else:
         relevant = query_cache.get(cache_key, [])
 
-    if not relevant:
-        logger.info("Нет релевантных записей — стандартный ответ")
-        reply = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
-        response_cache[cache_key] = reply
-        await context.bot.send_message(chat_id=chat_id, text=reply)
-        return
+    # 2. Fallback — если ничего не нашлось
+    if not relevant and collection and collection.count() > 0:
+        try:
+            fallback_emb = get_embedder().encode("общие вопросы поддержка помощь").tolist()
+            fallback = collection.query(query_embeddings=[fallback_emb], n_results=6, include=["metadatas"])
+            relevant = [m for m in fallback["metadatas"][0]]
+            source_type = "fallback"
+            logger.info("Используем fallback-контекст")
+        except Exception as e:
+            logger.error(f"Fallback ошибка: {e}")
 
-    context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
+    # 3. Формируем контекст для ИИ
+    if relevant:
+        context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
+    else:
+        kb_full = get_knowledge_base()
+        if kb_full and len(kb_full) < 35000:
+            context_str = kb_full
+            source_type = "full_kb"
+        else:
+            context_str = "База знаний временно недоступна или слишком большая."
 
+    # 4. Умный промпт — теперь пользователь ВСЕГДА получает нормальный ответ
     prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
-Отвечай ТОЛЬКО по базе знаний ниже, ничего не придумывай.
+Отвечай ТОЛЬКО на основе базы знаний ниже. Не придумывай ничего нового.
+Если в базе есть точное или очень похожее решение — используй его максимально близко к оригиналу.
+Если решение частичное — дополни логично, но без выдумок.
+Если по вопросу вообще ничего нет — честно скажи: «К сожалению, по этому вопросу у нас пока нет готового решения. Я передал ваш запрос специалисту, ответим в ближайшее время.»
 
 База знаний:
 {context_str}
 
 Вопрос пользователя: {raw_text}
 
-Ответ:"""
+Ответ (дружелюбно, кратко, по делу):"""
 
+    # 5. Запрос к Groq
     async with GROQ_SEMAPHORE:
         stats["groq_calls"] = stats.get("groq_calls", 0) + 1
         save_stats(stats)
@@ -292,19 +311,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response = await groq_client.chat.completions.create(
                 model="llama-3.1-70b-versatile",
                 messages=[{"role": "system", "content": prompt}],
-                max_tokens=600,
-                temperature=0.05,
-                timeout=25,
+                max_tokens=700,
+                temperature=0.12,
+                timeout=30,
             )
             reply = response.choices[0].message.content.strip()
+            reply = re.sub(r'^Ответ\s*[:\-]?\s*', '', reply, flags=re.IGNORECASE).strip()
         except Exception as e:
             logger.error(f"Groq ошибка: {e}")
-            reply = "Сервис временно недоступен, попробуйте позже."
+            reply = "Извините, сейчас сервис временно недоступен. Попробуйте чуть позже."
 
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
+    logger.info(f"Ответ отправлен | Источник: {source_type} | Записей в контексте: {len(relevant)}")
 
-# ============================ АДМИНКИ ============================
+# ============================ АДМИНКИ (без изменений) ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
@@ -360,5 +381,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — ФИНАЛЬНАЯ ВЕРСИЯ БЕЗ ВЫРЕЗАННОГО")
+    logger.info("Бот запущен — ФИНАЛЬНАЯ ВЕРСИЯ С ГАРАНТИЕЙ ОТВЕТА НА ЛЮБОЙ ВОПРОС")
     app.run_polling(drop_pending_updates=True)
