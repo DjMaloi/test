@@ -196,13 +196,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}")
 
-        if not best_answer:
-        # Берём самую первую запись из базы как абсолютный fallback
+    if not best_answer:
         try:
             all_entries = collection.get(include=["metadatas"])
             best_answer = all_entries["metadatas"][0]["answer"]
             logger.info("Использован абсолютный fallback — первая запись из базы")
-        except:
+        except Exception as e:
+            logger.warning(f"Fallback ошибка: {e}")
             best_answer = "Ваш вопрос зафиксирован. Специалист ответит в ближайшее время."
     else:
         prompt = f"""Перефразируй коротко и дружелюбно. Не придумывай ничего нового.
