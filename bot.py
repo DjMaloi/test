@@ -3,8 +3,10 @@ import json
 import logging
 import asyncio
 from functools import lru_cache
+
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,10 +16,11 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
-from telegram.error import BadRequest
+
 from groq import Groq
 import chromadb
 from sentence_transformers import SentenceTransformer
+
 
 # Отключаем телеметрию ChromaDB
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
@@ -37,11 +40,17 @@ GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 
 errors = []
-for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_KEY"), (SHEET_ID, "SHEET_ID")]:
+for var, name in [
+    (TELEGRAM_TOKEN, "TELEGRAM_TOKEN"),
+    (GROQ_API_KEY, "GROQ_API_KEY"),
+    (SHEET_ID, "SHEET_ID"),
+]:
     if not var or not var.strip():
         errors.append(f"{name} не задан")
+
 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
     errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
+
 if not ADMIN_ID_STR.strip():
     errors.append("ADMIN_ID не задан")
 else:
@@ -55,8 +64,8 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# ============================ ФАЙЛ-ФЛАГ ПАУЗЫ (РАБОТАЕТ В DOCKER/COOLIFY) ============================
-PAUSE_FILE = "/app/paused.flag"   # путь внутри контейнера
+# ============================ ПАУЗА ЧЕРЕЗ ФАЙЛ-ФЛАГ (работает в Docker/Coolify) ============================
+PAUSE_FILE = "/app/paused.flag"
 
 def is_paused() -> bool:
     return os.path.exists(PAUSE_FILE)
@@ -64,18 +73,17 @@ def is_paused() -> bool:
 def set_paused(state: bool):
     if state:
         open(PAUSE_FILE, "w").close()
-        logger.info("Бот поставлен на паузу (файл-флаг создан)")
+        logger.info("Бот поставлен на паузу")
     else:
         try:
             os.remove(PAUSE_FILE)
-            logger.info("Пауза снята (файл-флаг удалён)")
+            logger.info("Пауза снята")
         except FileNotFoundError:
             pass
 
-# Поддержка паузы при старте через переменную окружения (удобно в Coolify)
+# Поддержка паузы при старте через env (удобно в Coolify)
 if os.getenv("BOT_PAUSED", "").lower() == "true":
     set_paused(True)
-    logger.info("Бот запущен в режиме паузы (BOT_PAUSED=true)")
 
 # ============================ GOOGLE SHEETS ============================
 try:
@@ -89,7 +97,7 @@ try:
     sheet = service.spreadsheets()
     logger.info("Google Sheets подключён")
 except Exception as e:
-    logger.error(f"Ошибка Google Auth: {e}")
+    logger.error(f"Ошибка подключения Google Sheets: {e}")
     exit(1)
 
 # ============================ GROQ ============================
@@ -107,7 +115,10 @@ def get_knowledge_base() -> str:
         values = result.get("values", [])
         if not values:
             return ""
-        rows = values[1:] if len(values) > 0 and ("проблема" in str(values[0][0]).lower() or "keyword" in str(values[0][0]).lower()) else values
+
+        # Пропускаем заголовок, если он есть
+        rows = values[1:] if len(values) > 1 and "проблема" in str(values[0][0]).lower() else values
+
         entries = []
         for row in rows:
             if len(row) >= 2:
@@ -115,6 +126,7 @@ def get_knowledge_base() -> str:
                 solution = row[1].strip()
                 if problem:
                     entries.append(f"Проблема: {problem}\nРешение: {solution}")
+
         kb = "\n\n".join(entries)
         logger.info(f"Загружено {len(entries)} записей из Google Sheets")
         return kb
@@ -128,8 +140,10 @@ async def update_vector_db():
     if not kb_text:
         logger.warning("База знаний пуста")
         return
+
     blocks = [b.strip() for b in kb_text.split("\n\n") if b.strip()]
     docs, ids, metadatas = [], [], []
+
     for i, block in enumerate(blocks):
         lines = [l.strip() for l in block.split("\n")]
         if len(lines) < 2:
@@ -139,10 +153,12 @@ async def update_vector_db():
         docs.append(f"Проблема: {problem}\nРешение: {solution}")
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
+
     try:
         chroma_client.delete_collection("support_kb")
-    except Exception:
+    except:
         pass
+
     if docs:
         collection = chroma_client.get_or_create_collection(name="support_kb")
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
@@ -150,7 +166,6 @@ async def update_vector_db():
 
 # ============================ ОБРАБОТКА СООБЩЕНИЙ ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Проверка паузы — работает во всех воркерах и после рестарта
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
@@ -160,7 +175,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    logger.info(f"Запрос от {user_id} в чате {chat_id}: {text[:80]}...")
+    logger.info(f"Запрос от {user_id} в {chat_id}: {text[:80]}...")
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     await asyncio.sleep(2 + len(text.split()) / 10)
@@ -206,7 +221,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if part.strip():
                     await context.bot.send_message(chat_id=chat_id, text=part.strip())
                     await asyncio.sleep(0.7)
-            await asyncio.sleep(1)
             await context.bot.send_message(chat_id=chat_id, text="Если не помогло — уточните, что происходит сейчас.")
         else:
             await context.bot.send_message(chat_id=chat_id, text=reply)
@@ -215,14 +229,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat_id, text="Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
 
     except Exception as e:
-        logger.error(f"Ошибка в handle_message (чат {chat_id}): {e}", exc_info=True)
+        logger.error(f"Ошибка обработки сообщения: {e}", exc_info=True)
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Сервис временно недоступен. Попробуйте через пару минут."
-            )
-        except Exception as te:
-            logger.error(f"Не удалось отправить fallback: {te}")
+            await context.bot.send_message(chat_id=chat_id, text="Сервис временно недоступен. Попробуйте позже.")
+        except:
+            pass
 
 # ============================ БЛОКИРОВКА ЛИЧКИ ============================
 async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +243,7 @@ async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_
         return
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
     await update.message.reply_text(
-        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку ниже:",
+        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
         reply_markup=keyboard
     )
 
@@ -248,35 +259,37 @@ async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     set_paused(True)
-    await update.message.reply_text("Бот поставлен на паузу\nОбычные пользователи больше не получают автоответы")
+    await update.message.reply_text("Бот на паузе\nОбычные пользователи больше не получают автоответы")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     set_paused(False)
-    await update.message.reply_text("Пауза снята — бот снова работает для всех")
+    await update.message.reply_text("Пауза снята — бот снова работает")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
-    status = "На паузе" if is_paused() else "Работает нормально"
-    await update.message.reply_text(f"Статус бота: {status}")
+    status = "На паузе" if is_paused() else "Работает"
+    await update.message.reply_text(f"Статус: {status}")
 
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("PAUSED" if is_paused() else "OK")
 
 # ============================ ЗАПУСК ============================
 if __name__ == "__main__":
-    app = Application.builder() \
-        .token(TELEGRAM_TOKEN) \
-        .request(HTTPXRequest(connection_pool_size=100)) \
-        .concurrent_updates(False) \   # Один процесс — пауза срабатывает мгновенно и надёжно
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .request(HTTPXRequest(connection_pool_size=100))
+        .concurrent_updates(False)  # один процесс — пауза работает мгновенно
         .build()
+    )
 
-    # Порядок важен!
+    # Обработчики
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_non_admin_private))
 
-    app.add_handler(CommandHandler("reload", reload_kb))
+    app.add_handler(CommandHandler("reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -285,9 +298,9 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
 
-    # Обновление базы знаний
+    # Периодическое обновление базы
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
-    logger.info("Бот запущен и готов к работе!")
+    logger.info("Бот запущен!")
     app.run_polling(drop_pending_updates=True)
