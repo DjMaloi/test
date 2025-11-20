@@ -8,7 +8,7 @@ from cachetools import TTLCache
 import re
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -46,7 +46,6 @@ if not ADMIN_ID_STR.strip():
 else:
     try:
         ADMIN_IDS = [int(i.strip()) for i in ADMIN_ID_STR.split(",") if i.strip()]
-        logger.info(f"Админы: {ADMIN_IDS}")
     except ValueError:
         errors.append("ADMIN_ID — некорректный формат")
 
@@ -174,12 +173,11 @@ async def update_vector_db_safe():
         pass
 
     collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
-    batch_size = 100
-    for i in range(0, len(docs), batch_size):
+    for i in range(0, len(docs), 100):
         collection.add(
-            documents=docs[i:i + batch_size],
-            ids=ids[i:i + batch_size],
-            metadatas=metadatas[i:i + batch_size]
+            documents=docs[i:i + 100],
+            ids=ids[i:i + 100],
+            metadatas=metadatas[i:i + 100]
         )
     logger.info(f"Векторная база обновлена: {len(docs)} документов ✅")
 
@@ -221,54 +219,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if collection and cache_key not in query_cache:
         try:
             emb = get_embedder().encode(text).tolist()
-            results = collection.query(query_embeddings=[emb], n_results=15, include=["metadatas", "distances"])
-            hard_threshold = 0.45
-            soft_threshold = 0.78
+            results = collection.query(query_embeddings=[emb], n_results=20, include=["metadatas", "distances"])
             candidates = list(zip(results["distances"][0], results["metadatas"][0]))
             candidates.sort(key=lambda x: x[0])
 
+            # СУПЕР-МЯГКИЕ ПОРОГИ + ПРИНУДИТЕЛЬНЫЙ ТОП-1
             for dist, meta in candidates:
-                if dist <= hard_threshold:
-                    relevant.append(meta)
-                elif dist <= soft_threshold and len(relevant) < 5:
+                if dist <= 0.92:
                     relevant.append(meta)
 
-            if relevant:
-                relevant = relevant[:8]
-                source_type = "hard_match" if any(d <= hard_threshold for d, _ in candidates) else "soft_match"
+            if candidates:
+                best_dist, best_meta = candidates[0]
+                if best_meta not in [r for r in relevant]:
+                    relevant.insert(0, best_meta)
+                source_type = f"best_{best_dist:.3f}"
+                logger.info(f"Найдено! Лучшее совпадение: {best_dist:.4f} → {best_meta['problem']}")
 
+            relevant = relevant[:12]
             query_cache[cache_key] = relevant
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}")
     else:
         relevant = query_cache.get(cache_key, [])
 
+    # Fallback — если вообще ничего
     if not relevant and collection and collection.count() > 0:
         try:
-            fallback_emb = get_embedder().encode("помощь поддержка вопрос проблема").tolist()
-            fb = collection.query(query_embeddings=[fallback_emb], n_results=6, include=["metadatas"])
+            fb_emb = get_embedder().encode("поддержка помощь интернет").tolist()
+            fb = collection.query(query_embeddings=[fb_emb], n_results=5, include=["metadatas"])
             relevant = [m for m in fb["metadatas"][0]]
             source_type = "fallback"
         except:
             pass
 
-    if relevant:
-        context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
-    else:
-        kb = get_knowledge_base()
-        context_str = kb if kb and len(kb) < 35000 else "База знаний временно недоступна."
+    # Контекст — всегда есть
+    context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]) if relevant else get_knowledge_base()
 
-    prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
-Отвечай ТОЛЬКО по базе знаний ниже. Ничего не придумывай.
-Если есть точное или похожее — используй максимально близко к оригиналу.
-Если информации нет — честно скажи: «К сожалению, по этому вопросу у нас пока нет готового решения. Я передал ваш запрос специалисту, ответим в ближайшее время.»
+    # ЖЁСТКИЙ ПРОМПТ — ЗАПРЕЩАЕМ ОТМАЗКИ
+    prompt = f"""Ты — специалист техподдержки. Отвечай ТОЛЬКО по базе знаний ниже.
+ВАЖНО: В базе ВСЕГДА есть подходящая запись. Бери САМУЮ ПЕРВУЮ (она самая релевантная).
+Адаптируй её под вопрос пользователя. НИКОГДА не говори "к сожалению нет решения", "пока нет", "передал специалисту" — это строго запрещено.
 
-База знаний:
+База знаний (первая запись — самая подходящая):
 {context_str}
 
 Вопрос: {raw_text}
 
-Ответ (дружелюбно, кратко):"""
+Ответ (дружелюбно, кратко, по делу):"""
 
     reply = None
     async with GROQ_SEMAPHORE:
@@ -277,42 +274,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             response = await asyncio.wait_for(
                 groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",  # ← АКТУАЛЬНАЯ РАБОЧАЯ МОДЕЛЬ 2025+
+                    model="llama-3.3-70b-versatile",
                     messages=[{"role": "system", "content": prompt}],
                     max_tokens=700,
-                    temperature=0.12,
+                    temperature=0.1,
                 ),
                 timeout=28
             )
             reply = response.choices[0].message.content.strip()
             reply = re.sub(r'^Ответ\s*[:\-]?\s*', '', reply, flags=re.IGNORECASE).strip()
         except Exception as e:
-            logger.warning(f"Groq не ответил (возможно модель устарела или лимит): {e}")
+            logger.warning(f"Groq упал: {e}")
             stats["groq_fallback"] = stats.get("groq_fallback", 0) + 1
             save_stats(stats)
 
+    # АБСОЛЮТНЫЙ FALLBACK
     if not reply or len(reply) < 10:
         if relevant:
-            best = relevant[0]
-            reply = f"{best['solution']}\n\nЕсли это не совсем то — уточните, пожалуйста, помогу точнее!"
+            reply = relevant[0]['solution']
         else:
-            reply = "Извините, сейчас я не могу связаться с ИИ-сервисом.\nВаш вопрос уже зафиксирован — специалист ответит вам лично в ближайшее время (обычно 5–30 минут).\nСпасибо за обращение!"
+            reply = "Ваш вопрос зафиксирован. Специалист ответит вам лично в ближайшее время."
 
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
-    logger.info(f"Ответ отправлен | Источник: {source_type} | Groq: {'ок' if 'groq_fallback' not in locals() else 'fallback'}")
+    logger.info(f"Ответ отправлен | Совпадений: {len(relevant)} | Источник: {source_type}")
 
 # ============================ АДМИНКИ ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
-        keyboard = [[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]]
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
         await update.message.reply_text("Личные сообщения только для админов.", reply_markup=keyboard)
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     get_knowledge_base.cache_clear()
     await update_vector_db_safe()
-    await update.message.reply_text("База знаний обновлена!")
+    await update.message.reply_text("База обновлена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -327,23 +324,16 @@ async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     s = stats
-    paused = "На паузе" if is_paused() else "Работает"
+    paused = "Пауза" if is_paused() else "Работает"
     coll_count = collection.count() if collection else 0
     await update.message.reply_text(
-        f"Статус: {paused}\n"
-        f"Записей: {coll_count}\n"
-        f"Всего: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}"
+        f"Статус: {paused}\nЗаписей: {coll_count}\nЗапросов: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}"
     )
 
 # ============================ ЗАПУСК ============================
 if __name__ == "__main__":
-    app = Application.builder()\
-        .token(TELEGRAM_TOKEN)\
-        .request(HTTPXRequest(connection_pool_size=100))\
-        .concurrent_updates(False)\
-        .build()
+    app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).concurrent_updates(False).build()
 
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
@@ -355,5 +345,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — АКТУАЛЬНАЯ ВЕРСИЯ НОЯБРЬ 2025 (llama-3.3-70b + полный fallback)")
+    logger.info("Бот запущен — ФИНАЛЬНАЯ НЕУБИВАЕМАЯ ВЕРСИЯ 20.11.2025")
     app.run_polling(drop_pending_updates=True)
