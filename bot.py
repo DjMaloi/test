@@ -214,6 +214,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n_results=10,
                 include=["metadatas", "distances"]
             )
+            logger.info(f"Векторный поиск успешен для «{text}» — найдено {len(results['distances'][0])} совпадений")
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
+
+            # Основной порог 0.60 + fallback на топ-3
+            for meta, dist in zip(metadatas, distances):
+                if dist < 0.60:
+                    relevant.append(meta)
+                if len(relevant) >= 4:
+                    break
+
+            if not relevant:
+                logger.info(f"Порог 0.60 не сработал — берём топ-3 ближайших (дистанции: {[round(d,3) for d in distances[:3]]})")
+                for i in range(min(3, len(metadatas))):
+                    relevant.append(metadatas[i])
+
+            query_cache[cache_key] = relevant
+            logger.info(f"Выбрано релевантных записей: {len(relevant)} для запроса «{text}»")
+
+        except Exception as e:
+            logger.error(f"Ошибка Chroma при поиске (база ещё не готова?): {e}")
+            relevant = []  # на случай, если collection существует, но внутри пусто
+    else:
+        if collection is None:
+            logger.warning("Collection ещё None — пользователь спросил раньше, чем база загрузилась")
+        relevant = query_cache.get(cache_key, [])
             distances = results["distances"][0]
             metadatas = results["metadatas"][0]
 
