@@ -83,7 +83,6 @@ client = Groq(api_key=GROQ_API_KEY)
 
 # ============================ ВЕКТОРНАЯ БАЗА ============================
 chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(name="support_kb")
 embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 
 # ============================ ЗАГРУЗКА БАЗЫ ЗНАНИЙ ============================
@@ -93,9 +92,10 @@ def get_knowledge_base() -> str:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         if not values:
+            logger.warning("Таблица пуста")
             return ""
 
-        # Пропускаем заголовок, если он есть
+        # Пропускаем заголовок
         rows = values[1:] if len(values) > 0 and ("проблема" in str(values[0][0]).lower() or "keyword" in str(values[0][0]).lower()) else values
 
         entries = []
@@ -112,11 +112,11 @@ def get_knowledge_base() -> str:
         logger.error(f"Ошибка чтения таблицы: {e}")
         return ""
 
-# ============================ ОБНОВЛЕНИЕ ВЕКТОРНОЙ БАЗЫ ============================
+# ============================ ОБНОВЛЕНИЕ ВЕКТОРНОЙ БАЗЫ (ФИКСЕД) ============================
 async def update_vector_db():
     kb_text = get_knowledge_base()
     if not kb_text:
-        logger.warning("База знаний пуста")
+        logger.warning("База знаний пуста — пропускаем обновление векторной базы")
         return
 
     blocks = [b.strip() for b in kb_text.split("\n\n") if b.strip()]
@@ -133,10 +133,19 @@ async def update_vector_db():
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
 
-    collection.delete(where={})
+    # УДАЛЯЕМ ВСЮ КОЛЛЕКЦИЮ ЦЕЛИКОМ (это единственный надёжный способ в Chroma 0.5.x)
+    try:
+        chroma_client.delete_collection("support_kb")
+        logger.info("Старая коллекция удалена")
+    except Exception as e:
+        logger.info(f"Коллекция не существовала (нормально при первом запуске): {e}")
+
     if docs:
+        collection = chroma_client.get_or_create_collection(name="support_kb")
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
-    logger.info(f"Векторная база обновлена: {len(docs)} записей")
+        logger.info(f"Векторная база успешно обновлена: {len(docs)} записей")
+    else:
+        logger.warning("Нет записей для добавления в векторную базу")
 
 # ============================ ОБРАБОТКА СООБЩЕНИЙ ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -147,18 +156,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/") or len(text) > 1500:
         return
 
-    logger.info(f"Запрос от {update.effective_user.id}: {text[:80]}")
+    logger.info(f"Запрос от {update.effective_user.id}: {text[:80]}...")
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    await asyncio.sleep(2 + len(text.split()) / 10)
+    await asyncio.sleep(2 + len(text.split()) / 10)  # 2–8 сек задержка
 
     # Семантический поиск
+    collection = chroma_client.get_collection(name="support_kb")
     query_emb = embedder.encode(text).tolist()
     results = collection.query(query_embeddings=[query_emb], n_results=6, include=["metadatas"])
 
     relevant = results["metadatas"][0] if results["metadatas"] else []
     if not relevant:
-        await update.message.reply_text("Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту.")
+        await update.message.reply_text(
+            "Точного решения по вашему вопросу пока нет в базе знаний.\n"
+            "Опишите проблему подробнее — передам специалисту."
+        )
         return
 
     context_blocks = [f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]
@@ -173,7 +186,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Правила:
 - Если точного ответа нет — скажи: «Точного решения пока нет в базе знаний. Передам коллеге.»
 - Кратко, по-русски, по делу, используй списки.
-- Пиши как живой человек, без смайликов.
+- Пиши как живой человек, без смайликов и лишних восклицаний.
 
 Вопрос: {text}
 Ответ:"""
@@ -187,6 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         reply = response.choices[0].message.content.strip()
 
+        # Защита от редких галлюцинаций
         if any(w in reply.lower() for w in ["не знаю", "не уверен", "не могу найти"]):
             reply = "Точного решения пока нет в базе знаний.\nПередам ваш запрос — ответим скоро."
 
@@ -200,13 +214,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(reply)
             if hash(text) % 10 < 7:
                 await asyncio.sleep(1.5)
-                await update.message.reply_text("Если проблема осталась — напишите подробнее, посмотрю ещё.")
+                await update.message.reply_text("Если проблема осталась — напишите подробнее, посмотрю ещё раз.")
 
     except Exception as e:
-        logger.error(f"Groq error: {e}")
+        logger.error(f"Ошибка Groq: {e}")
         await update.message.reply_text("Сервис временно недоступен. Попробуйте через пару минут.")
 
-# ============================ АДМИНКОМАНДЫ И БЛОКИРОВКА ЛИЧКИ ============================
+# ============================ БЛОКИРОВКА ЛИЧКИ И АДМИНКИ ============================
 async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private" or update.effective_user.id in ADMIN_IDS:
         return
@@ -221,7 +235,7 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     get_knowledge_base.cache_clear()
     await update_vector_db()
-    await update.message.reply_text("База знаний перезагружена!")
+    await update.message.reply_text("База знаний и векторная база перезагружены!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -233,7 +247,7 @@ async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     global PAUSED
     PAUSED = False
-    await update.message.reply_text("Бот работает")
+    await update.message.reply_text("Бот снова работает")
 
 # ============================ ЗАПУСК ============================
 if __name__ == "__main__":
@@ -245,7 +259,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
 
-    # Загрузка базы при старте и каждые 10 минут
+    # Первая загрузка через 3 сек после старта + каждые 10 минут
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
