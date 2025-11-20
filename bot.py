@@ -21,7 +21,6 @@ from groq import Groq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-
 # Отключаем телеметрию ChromaDB
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
 
@@ -64,7 +63,7 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# ============================ ПАУЗА ЧЕРЕЗ ФАЙЛ-ФЛАГ (работает в Docker/Coolify) ============================
+# ============================ ПАУЗА ЧЕРЕЗ ФАЙЛ-ФЛАГ ============================
 PAUSE_FILE = "/app/paused.flag"
 
 def is_paused() -> bool:
@@ -81,7 +80,6 @@ def set_paused(state: bool):
         except FileNotFoundError:
             pass
 
-# Поддержка паузы при старте через env (удобно в Coolify)
 if os.getenv("BOT_PAUSED", "").lower() == "true":
     set_paused(True)
 
@@ -97,7 +95,7 @@ try:
     sheet = service.spreadsheets()
     logger.info("Google Sheets подключён")
 except Exception as e:
-    logger.error(f"Ошибка подключения Google Sheets: {e}")
+    logger.error(f"Ошибка Google Auth: {e}")
     exit(1)
 
 # ============================ GROQ ============================
@@ -115,10 +113,7 @@ def get_knowledge_base() -> str:
         values = result.get("values", [])
         if not values:
             return ""
-
-        # Пропускаем заголовок, если он есть
         rows = values[1:] if len(values) > 1 and "проблема" in str(values[0][0]).lower() else values
-
         entries = []
         for row in rows:
             if len(row) >= 2:
@@ -126,7 +121,6 @@ def get_knowledge_base() -> str:
                 solution = row[1].strip()
                 if problem:
                     entries.append(f"Проблема: {problem}\nРешение: {solution}")
-
         kb = "\n\n".join(entries)
         logger.info(f"Загружено {len(entries)} записей из Google Sheets")
         return kb
@@ -140,10 +134,8 @@ async def update_vector_db():
     if not kb_text:
         logger.warning("База знаний пуста")
         return
-
     blocks = [b.strip() for b in kb_text.split("\n\n") if b.strip()]
     docs, ids, metadatas = [], [], []
-
     for i, block in enumerate(blocks):
         lines = [l.strip() for l in block.split("\n")]
         if len(lines) < 2:
@@ -153,12 +145,10 @@ async def update_vector_db():
         docs.append(f"Проблема: {problem}\nРешение: {solution}")
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
-
     try:
         chroma_client.delete_collection("support_kb")
     except:
         pass
-
     if docs:
         collection = chroma_client.get_or_create_collection(name="support_kb")
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
@@ -282,25 +272,21 @@ if __name__ == "__main__":
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .request(HTTPXRequest(connection_pool_size=100))
-        .concurrent_updates(False)  # один процесс — пауза работает мгновенно
+        .concurrent_updates(False)
         .build()
     )
 
-    # Обработчики
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_non_admin_private))
-
-    app.add_handler(CommandHandler("reload_kb))
+    app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
 
-    # Периодическое обновление базы
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
-    logger.info("Бот запущен!")
+    logger.info("Бот запущен и готов к работе!")
     app.run_polling(drop_pending_updates=True)
