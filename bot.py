@@ -263,13 +263,29 @@ async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except: pass
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
     try:
+        # Получаем хеш последнего коммита
+        try:
+            commit_hash = os.popen("git rev-parse --short HEAD").read().strip()
+            if not commit_hash:
+                commit_hash = "не найден"
+        except:
+            commit_hash = "git недоступен"
+
         s = stats
         paused = "Пауза" if is_paused() else "Работает"
         coll_count = collection.count() if collection else 0
-        text = f"Статус: {paused}\nЗаписей: {coll_count}\nВсего: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}"
-        await update.message.reply_text(text)
+        text = (
+            f"Статус: {paused}\n"
+            f"Записей: {coll_count}\n"
+            f"Всего: {s.get('total',0)} | Кэш: {s.get('cached',0)} | "
+            f"Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}\n"
+            f"Commit: <code>{commit_hash}</code>"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
     except Exception as e:
         logger.warning(f"Не удалось отправить /status: {e}")
 
