@@ -235,7 +235,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             hard_threshold = 0.52
-            soft_threshold = 0.68
+            soft_threshold = 0.75
 
             candidates = list(zip(results["distances"][0], results["metadatas"][0]))
             candidates.sort(key=lambda x: x[0])
