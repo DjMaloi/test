@@ -208,11 +208,19 @@ if cache_key in response_cache:
                 include=["metadatas", "distances"]
             )
             relevant = []
-            for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
-                if dist < 0.38:
-                    relevant.append(meta)
-                if len(relevant) >= 4:
-                    break
+relevant = []
+for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
+    if dist < 0.55:  # было 0.38 → стало 0.55
+        relevant.append(meta)
+    if len(relevant) >= 4:
+        break
+
+# Если ничего хорошего не нашлось — берём хотя бы топ-2 самых близких
+if not relevant and results["distances"][0]:
+    top_distances = sorted(results["distances"][0][:2])
+    for dist in top_distances:
+        idx = results["distances"][0].index(dist)
+        relevant.append(results["metadatas"][0][idx])
             query_cache[cache_key] = relevant
         else:
             relevant = query_cache.get(cache_key, [])
