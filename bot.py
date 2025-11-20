@@ -6,7 +6,7 @@ from functools import lru_cache
 from hashlib import md5
 from cachetools import TTLCache
 
-from google.oauth2.service import Credentials
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -96,8 +96,8 @@ def save_stats(s):
 stats = load_stats()
 
 # ============================ КЭШИ ============================
-query_cache = TTLCache(maxsize=5000, ttl=3600)      # эмбеддинги + результаты поиска
-response_cache = TTLCache(maxsize=3000, ttl=86400)  # готовые ответы
+query_cache = TTLCache(maxsize=5000, ttl=3600)
+response_cache = TTLCache(maxsize=3000, ttl=86400)
 
 # ============================ GOOGLE SHEETS ============================
 try:
@@ -181,7 +181,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cache_key = md5(text.lower().encode()).hexdigest()
 
-    # Кэш готового ответа
     if cache_key in response_cache:
         stats["cached"] = stats.get("cached", 0) + 1
         save_stats(stats)
@@ -191,7 +190,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Кэш поиска
         if cache_key not in query_cache and collection is not None:
             emb = embedder.encode(text).tolist()
             results = collection.query(
@@ -302,5 +300,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=2)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
-    logger.info("Бот запущен — финальная версия с volume")
+    logger.info("Бот запущен — финальная версия")
     app.run_polling(drop_pending_updates=True)
