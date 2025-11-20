@@ -188,11 +188,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if collection:
         try:
             emb = get_embedder().encode(text).tolist()
-                        results = collection.query(query_embeddings=[emb], n_results=1, include=["metadatas", "distances"])
+            results = collection.query(query_embeddings=[emb], n_results=1, include=["metadatas", "distances"])
             distance = results["distances"][0][0]
-            if distance < 0.95:  # ← сильно смягчили порог
+            if distance < 0.95:
                 best_answer = results["metadatas"][0][0]["answer"]
-                logger.info(f"Найдено совпадение dist={distance:.3f}: {results['metadatas'][0][0]['question']}")
+                logger.info(f"Найдено совпадение dist={distance:.3f}: {results['metadatas'][0][0]['question'][:80]}")
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}")
 
