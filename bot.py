@@ -8,7 +8,7 @@ from cachetools import TTLCache
 import re
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -77,11 +77,11 @@ if os.getenv("BOT_PAUSED", "").lower() == "true":
 def load_stats():
     if os.path.exists(STATS_FILE):
         try:
-            with open(STATS_FILE) as f:
+            with open(STATS_FILE, "r") as f:
                 return json.load(f)
         except:
-            return {"total": 0, "cached": 0, "groq_calls": 0}
-    return {"total": 0, "cached": 0, "groq_calls": 0}
+            return {"total": 0, "cached": 0, "groq_calls": 0, "groq_fallback": 0}
+    return {"total": 0, "cached": 0, "groq_calls": 0, "groq_fallback": 0}
 
 def save_stats(s):
     try:
@@ -124,18 +124,12 @@ def get_embedder():
                 cache_folder=MODEL_CACHE_DIR,
                 device="cpu"
             )
-            logger.info("Модель загружена из локального кэша")
         except Exception:
-            logger.warning("Кэша нет — скачиваем модель один раз...")
             os.environ.pop("HF_HUB_OFFLINE", None)
             os.environ.pop("TRANSFORMERS_OFFLINE", None)
-            embedder = SentenceTransformer(
-                "paraphrase-multilingual-MiniLM-L12-v2",
-                cache_folder=MODEL_CACHE_DIR
-            )
+            embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", cache_folder=MODEL_CACHE_DIR)
             os.environ["HF_HUB_OFFLINE"] = "1"
             os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            logger.info("Модель скачана и закэширована")
     return embedder
 
 @lru_cache(maxsize=1)
@@ -144,13 +138,9 @@ def get_knowledge_base() -> str:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         if not values:
-            logger.warning("Таблица пуста")
             return ""
         rows = values[1:] if len(values) > 1 and "проблема" in str(values[0][0]).lower() else values
-        entries = []
-        for row in rows:
-            if len(row) >= 2 and row[0].strip():
-                entries.append(f"Проблема: {row[0].strip()}\nРешение: {row[1].strip()}")
+        entries = [f"Проблема: {row[0].strip()}\nРешение: {row[1].strip()}" for row in rows if len(row) >= 2 and row[0].strip()]
         kb = "\n\n".join(entries)
         logger.info(f"Загружено {len(entries)} записей из таблицы")
         return kb
@@ -163,7 +153,6 @@ async def update_vector_db_safe():
     logger.info("=== Обновление векторной базы ===")
     kb = get_knowledge_base()
     if not kb:
-        logger.warning("База знаний пуста")
         collection = None
         return
 
@@ -175,8 +164,7 @@ async def update_vector_db_safe():
             continue
         problem = lines[0].replace("Проблема:", "", 1).strip()
         solution = "\n".join(lines[1:]).replace("Решение:", "", 1).strip()
-        full_text = f"Проблема: {problem}\nРешение: {solution}"
-        docs.append(full_text)
+        docs.append(f"Проблема: {problem}\nРешение: {solution}")
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
 
@@ -185,10 +173,7 @@ async def update_vector_db_safe():
     except:
         pass
 
-    collection = chroma_client.get_or_create_collection(
-        "support_kb", metadata={"hnsw:space": "cosine"}
-    )
-
+    collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
     batch_size = 100
     for i in range(0, len(docs), batch_size):
         collection.add(
@@ -196,7 +181,6 @@ async def update_vector_db_safe():
             ids=ids[i:i + batch_size],
             metadatas=metadatas[i:i + batch_size]
         )
-
     logger.info(f"Векторная база обновлена: {len(docs)} документов ✅")
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
@@ -208,7 +192,7 @@ def preprocess_text(text: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-# ============================ НОВАЯ ОСНОВНАЯ ФУНКЦИЯ ============================
+# ============================ ОСНОВНОЙ ХЕНДЛЕР ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -234,19 +218,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     relevant = []
     source_type = "no_match"
 
-    # 1. Поиск в векторной базе
-    if collection is not None and cache_key not in query_cache:
+    if collection and cache_key not in query_cache:
         try:
             emb = get_embedder().encode(text).tolist()
-            results = collection.query(
-                query_embeddings=[emb],
-                n_results=15,
-                include=["metadatas", "distances"]
-            )
-
-            hard_threshold = 0.45   # чуть мягче — больше точных попаданий
+            results = collection.query(query_embeddings=[emb], n_results=15, include=["metadatas", "distances"])
+            hard_threshold = 0.45
             soft_threshold = 0.78
-
             candidates = list(zip(results["distances"][0], results["metadatas"][0]))
             candidates.sort(key=lambda x: x[0])
 
@@ -261,105 +238,101 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 source_type = "hard_match" if any(d <= hard_threshold for d, _ in candidates) else "soft_match"
 
             query_cache[cache_key] = relevant
-            logger.info(f"Chroma: найдено {len(relevant)} релевантных записей")
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}")
     else:
         relevant = query_cache.get(cache_key, [])
 
-    # 2. Fallback — если ничего не нашлось
     if not relevant and collection and collection.count() > 0:
         try:
-            fallback_emb = get_embedder().encode("общие вопросы поддержка помощь").tolist()
-            fallback = collection.query(query_embeddings=[fallback_emb], n_results=6, include=["metadatas"])
-            relevant = [m for m in fallback["metadatas"][0]]
+            fallback_emb = get_embedder().encode("помощь поддержка вопрос проблема").tolist()
+            fb = collection.query(query_embeddings=[fallback_emb], n_results=6, include=["metadatas"])
+            relevant = [m for m in fb["metadatas"][0]]
             source_type = "fallback"
-            logger.info("Используем fallback-контекст")
-        except Exception as e:
-            logger.error(f"Fallback ошибка: {e}")
+        except:
+            pass
 
-    # 3. Формируем контекст для ИИ
     if relevant:
         context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
     else:
-        kb_full = get_knowledge_base()
-        if kb_full and len(kb_full) < 35000:
-            context_str = kb_full
-            source_type = "full_kb"
-        else:
-            context_str = "База знаний временно недоступна или слишком большая."
+        kb = get_knowledge_base()
+        context_str = kb if kb and len(kb) < 35000 else "База знаний временно недоступна."
 
-    # 4. Умный промпт — теперь пользователь ВСЕГДА получает нормальный ответ
     prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
-Отвечай ТОЛЬКО на основе базы знаний ниже. Не придумывай ничего нового.
-Если в базе есть точное или очень похожее решение — используй его максимально близко к оригиналу.
-Если решение частичное — дополни логично, но без выдумок.
-Если по вопросу вообще ничего нет — честно скажи: «К сожалению, по этому вопросу у нас пока нет готового решения. Я передал ваш запрос специалисту, ответим в ближайшее время.»
+Отвечай ТОЛЬКО по базе знаний ниже. Ничего не придумывай.
+Если есть точное или похожее — используй максимально близко к оригиналу.
+Если информации нет — честно скажи: «К сожалению, по этому вопросу у нас пока нет готового решения. Я передал ваш запрос специалисту, ответим в ближайшее время.»
 
 База знаний:
 {context_str}
 
-Вопрос пользователя: {raw_text}
+Вопрос: {raw_text}
 
-Ответ (дружелюбно, кратко, по делу):"""
+Ответ (дружелюбно, кратко):"""
 
-    # 5. Запрос к Groq
+    reply = None
     async with GROQ_SEMAPHORE:
         stats["groq_calls"] = stats.get("groq_calls", 0) + 1
         save_stats(stats)
         try:
-            response = await groq_client.chat.completions.create(
-                model="llama-3.1-70b-versatile",
-                messages=[{"role": "system", "content": prompt}],
-                max_tokens=700,
-                temperature=0.12,
-                timeout=30,
+            response = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",  # ← АКТУАЛЬНАЯ РАБОЧАЯ МОДЕЛЬ 2025+
+                    messages=[{"role": "system", "content": prompt}],
+                    max_tokens=700,
+                    temperature=0.12,
+                ),
+                timeout=28
             )
             reply = response.choices[0].message.content.strip()
             reply = re.sub(r'^Ответ\s*[:\-]?\s*', '', reply, flags=re.IGNORECASE).strip()
         except Exception as e:
-            logger.error(f"Groq ошибка: {e}")
-            reply = "Извините, сейчас сервис временно недоступен. Попробуйте чуть позже."
+            logger.warning(f"Groq не ответил (возможно модель устарела или лимит): {e}")
+            stats["groq_fallback"] = stats.get("groq_fallback", 0) + 1
+            save_stats(stats)
+
+    if not reply or len(reply) < 10:
+        if relevant:
+            best = relevant[0]
+            reply = f"{best['solution']}\n\nЕсли это не совсем то — уточните, пожалуйста, помогу точнее!"
+        else:
+            reply = "Извините, сейчас я не могу связаться с ИИ-сервисом.\nВаш вопрос уже зафиксирован — специалист ответит вам лично в ближайшее время (обычно 5–30 минут).\nСпасибо за обращение!"
 
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
-    logger.info(f"Ответ отправлен | Источник: {source_type} | Записей в контексте: {len(relevant)}")
+    logger.info(f"Ответ отправлен | Источник: {source_type} | Groq: {'ок' if 'groq_fallback' not in locals() else 'fallback'}")
 
-# ============================ АДМИНКИ (без изменений) ============================
+# ============================ АДМИНКИ ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
+        keyboard = [[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]]
         await update.message.reply_text("Личные сообщения только для админов.", reply_markup=keyboard)
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
+    if update.effective_user.id not in ADMIN_IDS: return
     get_knowledge_base.cache_clear()
     await update_vector_db_safe()
     await update.message.reply_text("База знаний обновлена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
+    if update.effective_user.id not in ADMIN_IDS: return
     set_paused(True)
     await update.message.reply_text("Бот на паузе")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
+    if update.effective_user.id not in ADMIN_IDS: return
     set_paused(False)
     await update.message.reply_text("Бот работает")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
+    if update.effective_user.id not in ADMIN_IDS: return
     s = stats
     paused = "На паузе" if is_paused() else "Работает"
     coll_count = collection.count() if collection else 0
     await update.message.reply_text(
         f"Статус: {paused}\n"
-        f"Записей в базе: {coll_count}\n"
-        f"Запросов: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)}"
+        f"Записей: {coll_count}\n"
+        f"Всего: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)} | Fallback: {s.get('groq_fallback',0)}"
     )
 
 # ============================ ЗАПУСК ============================
@@ -370,6 +343,7 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
@@ -381,5 +355,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — ФИНАЛЬНАЯ ВЕРСИЯ С ГАРАНТИЕЙ ОТВЕТА НА ЛЮБОЙ ВОПРОС")
+    logger.info("Бот запущен — АКТУАЛЬНАЯ ВЕРСИЯ НОЯБРЬ 2025 (llama-3.3-70b + полный fallback)")
     app.run_polling(drop_pending_updates=True)
