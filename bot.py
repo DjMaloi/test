@@ -5,10 +5,8 @@ import asyncio
 from functools import lru_cache
 from hashlib import md5
 from cachetools import TTLCache
-
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -18,15 +16,12 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
-
 from groq import AsyncGroq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-
 # ============================ КОНФИГ ============================
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -51,7 +46,6 @@ else:
         logger.info(f"Админы: {ADMIN_IDS}")
     except ValueError:
         errors.append("ADMIN_ID — некорректный формат")
-
 if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
@@ -112,17 +106,28 @@ except Exception as e:
     logger.error(f"Google Sheets ошибка: {e}")
     exit(1)
 
-# ============================ CHROMA (с volume) ============================
+# ============================ CHROMA + ЭМБЕДДЕР ============================
 chroma_client = chromadb.PersistentClient(path="/app/chroma")
-embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+embedder = None  # ленивая загрузка
 collection = None
+
+def get_embedder():
+    global embedder
+    if embedder is None:
+        logger.info("Загружаем модель эмбеддингов (один раз)...")
+        embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        logger.info("Модель эмбеддингов загружена")
+    return embedder
 
 @lru_cache(maxsize=1)
 def get_knowledge_base() -> str:
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
-        rows = values[1:] if values and "проблема" in str(values[0][0]).lower() else values
+        if not values:
+            logger.warning("Таблица пуста")
+            return ""
+        rows = values[1:] if len(values) > 1 and "проблема" in str(values[0][0]).lower() else values
         entries = []
         for row in rows:
             if len(row) >= 2 and row[0].strip():
@@ -134,10 +139,13 @@ def get_knowledge_base() -> str:
         logger.error(f"Ошибка чтения таблицы: {e}")
         return ""
 
-async def update_vector_db():
+async def update_vector_db_safe():
     global collection
+    logger.info("=== Начало обновления векторной базы ===")
     kb = get_knowledge_base()
     if not kb:
+        logger.warning("База знаний пуста — пропускаем")
+        collection = None
         return
 
     blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
@@ -149,7 +157,8 @@ async def update_vector_db():
             continue
         problem = lines[0].replace("Проблема:", "", 1).strip()
         solution = "\n".join(lines[1:]).replace("Решение:", "", 1).strip()
-        docs.append(f"Проблема: {problem}\nРешение: {solution}")
+        full_text = f"Проблема: {problem}\nРешение: {solution}"
+        docs.append(full_text)
         ids.append(f"kb_{i}")
         metadatas.append({"problem": problem, "solution": solution})
 
@@ -159,8 +168,14 @@ async def update_vector_db():
         pass
 
     collection = chroma_client.get_or_create_collection("support_kb")
-    collection.add(documents=docs, ids=ids, metadatas=metadatas)
-    logger.info(f"Векторная база обновлена: {len(docs)} документов")
+    batch_size = 100
+    for i in range(0, len(docs), batch_size):
+        collection.add(
+            documents=docs[i:i + batch_size],
+            ids=ids[i:i + batch_size],
+            metadatas=metadatas[i:i + batch_size]
+        )
+    logger.info(f"Векторная база успешно обновлена: {len(docs)} документов ✅")
 
 # ============================ GROQ ============================
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
@@ -181,87 +196,82 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cache_key = md5(text.lower().encode()).hexdigest()
 
-if cache_key in response_cache:
+    if cache_key in response_cache:
         stats["cached"] = stats.get("cached", 0) + 1
         save_stats(stats)
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=response_cache[cache_key],
-                read_timeout=20,
-                write_timeout=20,
-                connect_timeout=20,
-                pool_timeout=20
-            )
-        except telegram.error.TimedOut:
-            logger.warning("Таймаут при отправке кэшированного ответа — пропускаем")
+        await context.bot.send_message(chat_id=chat_id, text=response_cache[cache_key])
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    try:
-        if cache_key not in query_cache and collection is not None:
-            emb = embedder.encode(text).tolist()
+    # === ВЕКТОРНЫЙ ПОИСК (финальная версия) ===
+    relevant = []
+    if collection is not None and cache_key not in query_cache:
+        try:
+            emb = get_embedder().encode(text).tolist()
             results = collection.query(
                 query_embeddings=[emb],
                 n_results=10,
                 include=["metadatas", "distances"]
             )
-            relevant = []
-relevant = []
-for meta, dist in zip(results["metadatas"][0], results["distances"][0]):
-    if dist < 0.55:  # было 0.38 → стало 0.55
-        relevant.append(meta)
-    if len(relevant) >= 4:
-        break
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
 
-# Если ничего хорошего не нашлось — берём хотя бы топ-2 самых близких
-if not relevant and results["distances"][0]:
-    top_distances = sorted(results["distances"][0][:2])
-    for dist in top_distances:
-        idx = results["distances"][0].index(dist)
-        relevant.append(results["metadatas"][0][idx])
+            # Основной порог — 0.60 (оптимально для MiniLM)
+            for meta, dist in zip(metadatas, distances):
+                if dist < 0.60:
+                    relevant.append(meta)
+                if len(relevant) >= 4:
+                    break
+
+            # Если ничего не нашли — берём топ-3 ближайших в любом случае
+            if not relevant:
+                for i in range(min(3, len(metadatas))):
+                    relevant.append(metadatas[i])
+
             query_cache[cache_key] = relevant
-        else:
-            relevant = query_cache.get(cache_key, [])
+            logger.info(f"Найдено релевантных: {len(relevant)} для запроса «{text}»")
+        except Exception as e:
+            logger.error(f"Ошибка поиска в Chroma: {e}")
+            relevant = []
+    else:
+        relevant = query_cache.get(cache_key, [])
 
-        if not relevant:
-            reply = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
-            response_cache[cache_key] = reply
-            await context.bot.send_message(chat_id=chat_id, text=reply)
-            return
+    if not relevant:
+        reply = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
+        response_cache[cache_key] = reply
+        await context.bot.send_message(chat_id=chat_id, text=reply)
+        return
 
-        context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
+    context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
 
-        prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
+    prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
 Отвечай ТОЛЬКО по базе знаний ниже. Ничего не придумывай.
+
 База знаний:
 {context_str}
 
 Вопрос: {text}
 Ответ:"""
 
-        async with GROQ_SEMAPHORE:
-            stats["groq_calls"] = stats.get("groq_calls", 0) + 1
-            save_stats(stats)
+    async with GROQ_SEMAPHORE:
+        stats["groq_calls"] = stats.get("groq_calls", 0) + 1
+        save_stats(stats)
+        try:
             response = await groq_client.chat.completions.create(
                 model="llama-3.1-70b-versatile",
                 messages=[{"role": "system", "content": prompt}],
                 max_tokens=500,
                 temperature=0.1,
-                timeout=15,
+                timeout=20,
             )
-        reply = response.choices[0].message.content.strip()
+            reply = response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Groq ошибка: {e}")
+            reply = "Сервис временно недоступен, попробуйте позже."
 
-        if any(w in reply.lower() for w in ["не знаю", "не уверен", "не могу найти"]):
-            reply = "Точного решения пока нет в базе знаний.\nПередам ваш запрос специалисту."
-
-        response_cache[cache_key] = reply
-        await context.bot.send_message(chat_id=chat_id, text=reply)
-
-    except Exception as e:
-        logger.error(f"Ошибка обработки: {e}", exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text="Сервис временно недоступен.")
+    response_cache[cache_key] = reply
+    await context.bot.send_message(chat_id=chat_id, text=reply)
 
 # ============================ АДМИН КОМАНДЫ ============================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,26 +280,33 @@ async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Личные сообщения только для админов.", reply_markup=keyboard)
 
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     get_knowledge_base.cache_clear()
-    await update_vector_db()
+    await update_vector_db_safe()
     await update.message.reply_text("База знаний обновлена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     set_paused(True)
     await update.message.reply_text("Бот на паузе")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     set_paused(False)
     await update.message.reply_text("Бот работает")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     s = stats
+    paused = "На паузе" if is_paused() else "Работает"
+    coll_count = collection.count() if collection else 0
     await update.message.reply_text(
-        f"Статус: {'На паузе' if is_paused() else 'Работает'}\n"
+        f"Статус: {paused}\n"
+        f"Записей в базе: {coll_count}\n"
         f"Запросов: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)}"
     )
 
@@ -298,13 +315,11 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================ ЗАПУСК ============================
 if __name__ == "__main__":
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .request(HTTPXRequest(connection_pool_size=100))
-        .concurrent_updates(False)
+    app = Application.builder()\
+        .token(TELEGRAM_TOKEN)\
+        .request(HTTPXRequest(connection_pool_size=100))\
+        .concurrent_updates(False)\
         .build()
-    )
 
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private))
     app.add_handler(CommandHandler("reload", reload_kb))
@@ -315,8 +330,9 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
 
-    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=2)
-    app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
+    # При старте и каждые 10 минут обновляем базу
+    app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=5)
+    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — финальная версия")
+    logger.info("Бот запущен — финальная стабильная версия")
     app.run_polling(drop_pending_updates=True)
