@@ -14,4 +14,6 @@ pydantic==2.9.2
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 hnswlib==0.8.0
+
 posthog>=2.4.0,<6.0.0  # ← Дополнительный фикс для PostHog
+# FORCE REBUILD 2025-11-20 17:22
