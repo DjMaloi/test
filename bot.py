@@ -22,14 +22,14 @@ from groq import AsyncGroq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# ====================== ФИКС SSL ДЛЯ КОНТЕЙНЕРОВ ======================
+# ====================== SSL ФИКС ======================
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
 # ====================== ЛОГИ ======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# ====================== ПЕРЕМЕННЫЕ ======================
+# ====================== КОНФИГ ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
@@ -65,16 +65,13 @@ def is_paused() -> bool:
 def set_paused(state: bool):
     if state:
         open(PAUSE_FILE, "w").close()
-        logger.info("Бот на паузе")
+        logger.info("БОТ НА ПАУЗЕ — отвечает только админам")
     else:
         try:
             os.remove(PAUSE_FILE)
         except:
             pass
         logger.info("Пауза снята")
-
-if os.getenv("BOT_PAUSED", "").lower() == "true":
-    set_paused(True)
 
 stats = {"total": 0, "cached": 0, "groq": 0, "vector": 0, "keyword": 0}
 if os.path.exists(STATS_FILE):
@@ -112,17 +109,17 @@ def get_embedder():
         embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
     return embedder
 
-# ====================== ЗАГРУЗКА БАЗЫ ======================
+# ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
 async def update_vector_db():
     global collection
-    logger.info("=== Обновление базы знаний ===")
+    logger.info("=== Загрузка базы знаний ===")
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         logger.info(f"Получено строк: {len(values)}")
 
         if len(values) < 2:
-            logger.warning("Таблица пустая или только заголовок")
+            logger.warning("Таблица пуста")
             collection = None
             return
 
@@ -132,9 +129,9 @@ async def update_vector_db():
             q = row[0].strip()
             a = row[1].strip()
             if q and a:
-                docs.append(q)
+                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
                 ids.append(f"kb_{i}")
-                metadatas.append({"question": q, "answer": a})
+                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
 
         try:
             chroma_client.delete_collection("support_kb")
@@ -146,7 +143,7 @@ async def update_vector_db():
         logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки таблицы: {e}", exc_info=True)
+        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
         collection = None
 
 # ====================== GROQ ======================
@@ -164,6 +161,7 @@ async def safe_typing(bot, chat_id):
 
 # ====================== ОБРАБОТКА СООБЩЕНИЙ ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ПАУЗА — САМАЯ ПЕРВАЯ ПРОВЕРКА
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
@@ -199,7 +197,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
-                    logger.info(f"Векторный хит (dist={dist:.3f}): {meta['question'][:70]}")
                     break
 
             # Ключевой поиск
@@ -211,22 +208,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         best_answer = meta["answer"]
                         source = "keyword"
                         stats["keyword"] += 1
-                        logger.info(f"Ключевой хит: {meta['question'][:70]}")
                         break
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}")
 
     if not best_answer:
-        best_answer = "Точного решения пока нет в базе знаний.\nОпишите проблему подробнее — передам специалисту."
+        best_answer = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
 
     reply = best_answer
     if source != "fallback" and len(best_answer) < 1000:
         prompt = f"""Перефразируй коротко и дружелюбно. Сохрани весь смысл.
-Оригинальный ответ:
+Оригинал:
 {best_answer}
 
 Вопрос: {raw_text}
-Короткий ответ:"""
+Ответ:"""
 
         async with GROQ_SEM:
             stats["groq"] += 1
@@ -252,6 +248,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== БЛОКИРОВКА ЛИЧКИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Пауза тоже работает здесь
+    if is_paused() and update.effective_user.id not in ADMIN_IDS:
+        return
+
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
         await update.message.reply_text(
@@ -268,12 +268,12 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     set_paused(True)
-    await update.message.reply_text("Бот на паузе")
+    await update.message.reply_text("Бот на паузе — обычные пользователи не получают ответы")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     set_paused(False)
-    await update.message.reply_text("Бот работает")
+    await update.message.reply_text("Бот снова работает")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -281,7 +281,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = collection.count() if collection else 0
     await update.message.reply_text(
         f"Статус: {paused}\n"
-        f"Записей в базе: {count}\n"
+        f"Записей: {count}\n"
         f"Запросов: {stats['total']} (кэш: {stats['cached']})\n"
         f"Вектор: {stats['vector']} | Ключи: {stats['keyword']} | Groq: {stats['groq']}"
     )
@@ -297,17 +297,15 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
-    # ВАЖНО: правильный порядок!
+    # ПРАВИЛЬНЫЙ ПОРЯДОК ХЕНДЛЕРОВ
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
 
-    # Блокировка лички только для НЕ-админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
 
-    # Команды
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
@@ -315,9 +313,8 @@ if __name__ == "__main__":
 
     app.add_error_handler(error_handler)
 
-    # Автозагрузка базы
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=5)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
-    logger.info("Бот запущен — теперь всё работает идеально, включая личку админов!")
+    logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
     app.run_polling(drop_pending_updates=True)
