@@ -5,7 +5,7 @@ import asyncio
 from functools import lru_cache
 from hashlib import md5
 from cachetools import TTLCache
-import re  # <-- новое
+import re
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -35,7 +35,6 @@ SHEET_ID = os.getenv("SHEET_ID")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
 ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
 
-# (проверка переменных — без изменений)
 errors = []
 for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_KEY"), (SHEET_ID, "SHEET_ID")]:
     if not var or not var.strip():
@@ -47,6 +46,7 @@ if not ADMIN_ID_STR.strip():
 else:
     try:
         ADMIN_IDS = [int(i.strip()) for i in ADMIN_ID_STR.split(",") if i.strip()]
+        logger.info(f"Админы: {ADMIN_IDS}")
     except ValueError:
         errors.append("ADMIN_ID — некорректный формат")
 if errors:
@@ -56,44 +56,158 @@ if errors:
 PAUSE_FILE = "/app/paused.flag"
 STATS_FILE = "/app/stats.json"
 
-def is_paused(): return os.path.exists(PAUSE_FILE)
+def is_paused() -> bool:
+    return os.path.exists(PAUSE_FILE)
+
 def set_paused(state: bool):
-    if state: open(PAUSE_FILE, "w").close()
+    if state:
+        open(PAUSE_FILE, "w").close()
+        logger.info("Бот поставлен на паузу")
     else:
-        try: os.remove(PAUSE_FILE)
-        except FileNotFoundError: pass
+        try:
+            os.remove(PAUSE_FILE)
+        except FileNotFoundError:
+            pass
+        logger.info("Пауза снята")
 
 if os.getenv("BOT_PAUSED", "").lower() == "true":
     set_paused(True)
 
-# статистика и кэши (без изменений)
 def load_stats():
     if os.path.exists(STATS_FILE):
         try:
-            with open(STATS_FILE) as f: return json.load(f)
-        except: return {"total": 0, "cached": 0, "groq_calls": 0}
+            with open(STATS_FILE) as f:
+                return json.load(f)
+        except:
+            return {"total": 0, "cached": 0, "groq_calls": 0}
     return {"total": 0, "cached": 0, "groq_calls": 0}
 
 def save_stats(s):
     try:
-        with open(STATS_FILE, "w") as f: json.dump(s, f)
-    except: pass
+        with open(STATS_FILE, "w") as f:
+            json.dump(s, f)
+    except:
+        pass
 
 stats = load_stats()
+
 query_cache = TTLCache(maxsize=5000, ttl=3600)
 response_cache = TTLCache(maxsize=3000, ttl=86400)
 
-# Google Sheets, Chroma, модель — без изменений
-# (тот же код, что и в последней версии)
+# Google Sheets
+try:
+    creds = Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_PATH,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    )
+    service = build("sheets", "v4", credentials=creds)
+    sheet = service.spreadsheets()
+    logger.info("Google Sheets подключён")
+except Exception as e:
+    logger.error(f"Google Sheets ошибка: {e}")
+    exit(1)
 
-# <<< НОВАЯ ФУНКЦИЯ ПРЕПРОЦЕССИНГА >>>
+# Chroma + модель
+chroma_client = chromadb.PersistentClient(path="/app/chroma")
+collection = None
+embedder = None
+MODEL_CACHE_DIR = "/app/model_cache"
+
+def get_embedder():
+    global embedder
+    if embedder is None:
+        logger.info("Грузим модель эмбеддингов...")
+        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+        try:
+            embedder = SentenceTransformer(
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                cache_folder=MODEL_CACHE_DIR,
+                device="cpu"
+            )
+            logger.info("Модель загружена из локального кэша")
+        except Exception:
+            logger.warning("Кэша нет — скачиваем модель один раз...")
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            os.environ.pop("TRANSFORMERS_OFFLINE", None)
+            embedder = SentenceTransformer(
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                cache_folder=MODEL_CACHE_DIR
+            )
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            logger.info("Модель скачана и закэширована")
+    return embedder
+
+@lru_cache(maxsize=1)
+def get_knowledge_base() -> str:
+    try:
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
+        values = result.get("values", [])
+        if not values:
+            logger.warning("Таблица пуста")
+            return ""
+        rows = values[1:] if len(values) > 1 and "проблема" in str(values[0][0]).lower() else values
+        entries = []
+        for row in rows:
+            if len(row) >= 2 and row[0].strip():
+                entries.append(f"Проблема: {row[0].strip()}\nРешение: {row[1].strip()}")
+        kb = "\n\n".join(entries)
+        logger.info(f"Загружено {len(entries)} записей из таблицы")
+        return kb
+    except Exception as e:
+        logger.error(f"Ошибка чтения таблицы: {e}")
+        return ""
+
+async def update_vector_db_safe():
+    global collection
+    logger.info("=== Обновление векторной базы ===")
+    kb = get_knowledge_base()
+    if not kb:
+        logger.warning("База знаний пуста")
+        collection = None
+        return
+
+    blocks = [b.strip() for b in kb.split("\n\n") if b.strip()]
+    docs, ids, metadatas = [], [], []
+    for i, block in enumerate(blocks):
+        lines = [l.strip() for l in block.split("\n")]
+        if len(lines) < 2:
+            continue
+        problem = lines[0].replace("Проблема:", "", 1).strip()
+        solution = "\n".join(lines[1:]).replace("Решение:", "", 1).strip()
+        full_text = f"Проблема: {problem}\nРешение: {solution}"
+        docs.append(full_text)
+        ids.append(f"kb_{i}")
+        metadatas.append({"problem": problem, "solution": solution})
+
+    try:
+        chroma_client.delete_collection("support_kb")
+    except:
+        pass
+
+    collection = chroma_client.get_or_create_collection(
+        "support_kb", metadata={"hnsw:space": "cosine"}
+    )
+    batch_size = 100
+    for i in range(0, len(docs), batch_size):
+        collection.add(
+            documents=docs[i:i + batch_size],
+            ids=ids[i:i + batch_size],
+            metadatas=metadatas[i:i + batch_size]
+        )
+    logger.info(f"Векторная база обновлена: {len(docs)} документов ✅")
+
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+GROQ_SEMAPHORE = asyncio.Semaphore(6)
+
+# Предобработка текста (чтобы короткие запросы лучше попадали)
 def preprocess_text(text: str) -> str:
     text = text.lower()
     text = re.sub(r'[^а-яa-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-# <<< ОСНОВНОЙ ХЕНДЛЕР С УЛУЧШЕННЫМ ПОИСКОМ >>>
+# ============================ ОСНОВНОЙ ХЕНДЛЕР ============================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -101,7 +215,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
 
-    text = preprocess_text(raw_text)  # <-- новая предобработка
+    text = preprocess_text(raw_text)
 
     chat_id = update.effective_chat.id
     stats["total"] = stats.get("total", 0) + 1
@@ -117,7 +231,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     relevant = []
-    if collection and cache_key not in query_cache:
+    if collection is not None and cache_key not in query_cache:
         try:
             emb = get_embedder().encode(text).tolist()
             results = collection.query(
@@ -126,8 +240,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 include=["metadatas", "distances"]
             )
 
-            hard_threshold = 0.48   # ← понижен для коротких запросов
-            soft_threshold = 0.78   # ← сильно повышен
+            hard_threshold = 0.48
+            soft_threshold = 0.78
 
             candidates = list(zip(results["distances"][0], results["metadatas"][0]))
             candidates.sort(key=lambda x: x[0])
@@ -136,22 +250,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if dist <= hard_threshold:
                     relevant.append(meta)
                     logger.info(f"✓ ТОП (dist={dist:.4f}): {meta['problem'][:90]}")
-                elif dist <= soft_threshold and len(relevant) < 3:  # до 3 мягких если мало топовых
+                elif dist <= soft_threshold and len(relevant) < 3:
                     relevant.append(meta)
                     logger.info(f"↗ Мягкое (dist={dist:.4f}): {meta['problem'][:90]}")
 
             if relevant:
-                relevant = relevant[:6]  # максимум 6 чанков
+                relevant = relevant[:6]
 
             query_cache[cache_key] = relevant
+            logger.info(f"Найдено релевантных записей: {len(relevant)}")
 
         except Exception as e:
-            logger.error(f"Chroma ошибка: {e}")
+            logger.error(f"Ошибка Chroma: {e}")
 
     else:
         relevant = query_cache.get(cache_key, [])
 
     if not relevant:
+        logger.info("Нет релевантных записей — стандартный ответ")
         reply = "Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту."
         response_cache[cache_key] = reply
         await context.bot.send_message(chat_id=chat_id, text=reply)
@@ -160,12 +276,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
 
     prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
-Отвечай ТОЛЬКО по базе знаний ниже. Используй решение из базы, адаптируй под вопрос пользователя, но ничего не придумывай.
+Отвечай ТОЛЬКО по базе знаний ниже, ничего не придумывай.
 
 База знаний:
 {context_str}
 
-Вопрос: {raw_text}
+Вопрос пользователя: {raw_text}
 
 Ответ:"""
 
@@ -177,7 +293,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model="llama-3.1-70b-versatile",
                 messages=[{"role": "system", "content": prompt}],
                 max_tokens=600,
-                temperature=0.05,   # ещё меньше креатива
+                temperature=0.05,
                 timeout=25,
             )
             reply = response.choices[0].message.content.strip()
@@ -188,10 +304,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=chat_id, text=reply)
 
-# Остальной код (админки, запуск) — полностью из последней версии
+# ============================ АДМИНКИ ============================
+async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
+        await update.message.reply_text("Личные сообщения только для админов.", reply_markup=keyboard)
 
+async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    get_knowledge_base.cache_clear()
+    await update_vector_db_safe()
+    await update.message.reply_text("База знаний обновлена!")
+
+async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    set_paused(True)
+    await update.message.reply_text("Бот на паузе")
+
+async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    set_paused(False)
+    await update.message.reply_text("Бот работает")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    s = stats
+    paused = "На паузе" if is_paused() else "Работает"
+    coll_count = collection.count() if collection else 0
+    await update.message.reply_text(
+        f"Статус: {paused}\n"
+        f"Записей в базе: {coll_count}\n"
+        f"Запросов: {s.get('total',0)} | Кэш: {s.get('cached',0)} | Groq: {s.get('groq_calls',0)}"
+    )
+
+# ============================ ЗАПУСК ============================
 if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).concurrent_updates(False).build()
+    app = Application.builder()\
+        .token(TELEGRAM_TOKEN)\
+        .request(HTTPXRequest(connection_pool_size=100))\
+        .concurrent_updates(False)\
+        .build()
+
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_private))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
@@ -203,5 +360,5 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db_safe()), when=10)
     app.job_queue.run_repeating(lambda ctx: asyncio.create_task(update_vector_db_safe()), interval=600, first=600)
 
-    logger.info("Бот запущен — УЛУЧШЕННАЯ ВЕРСИЯ ДЛЯ ТВОЕЙ БАЗЫ (ноябрь 2025)")
+    logger.info("Бот запущен — ФИНАЛЬНАЯ ВЕРСИЯ БЕЗ ВЫРЕЗАННОГО")
     app.run_polling(drop_pending_updates=True)
