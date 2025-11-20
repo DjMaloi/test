@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12
 ARG CACHEBUST=2025-11-20-19-00
 WORKDIR /app
 COPY requirements.txt .
