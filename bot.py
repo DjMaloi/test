@@ -23,7 +23,7 @@ from groq import Groq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# Отключаем назойливую телеметрию ChromaDB
+# Отключаем телеметрию ChromaDB
 os.environ["CHROMA_TELEMETRY_ENABLED"] = "false"
 
 # ============================ ЛОГИРОВАНИЕ ============================
@@ -54,14 +54,13 @@ if not ADMIN_ID_STR.strip():
 else:
     try:
         ADMIN_IDS = [int(uid.strip()) for uid in ADMIN_ID_STR.split(",") if uid.strip()]
+        logger.info(f"Админы: {ADMIN_IDS}")
     except ValueError:
         errors.append("ADMIN_ID — некорректный формат")
 
 if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
-
-logger.info("Все переменные загружены успешно")
 
 # ============================ GOOGLE SHEETS ============================
 try:
@@ -110,7 +109,7 @@ def get_knowledge_base() -> str:
         logger.error(f"Ошибка чтения таблицы: {e}")
         return ""
 
-# ============================ ОБНОВЛЕНИЕ ВЕКТОРНОЙ БАЗЫ ============================
+# ============================ ОБНОВЛЕ, ВЕКТОРНОЙ БАЗЫ ============================
 async def update_vector_db():
     kb_text = get_knowledge_base()
     if not kb_text:
@@ -132,9 +131,8 @@ async def update_vector_db():
 
     try:
         chroma_client.delete_collection("support_kb")
-        logger.info("Старая коллекция удалена")
     except Exception:
-        logger.info("Коллекция не существовала (нормально при первом запуске)")
+        pass
 
     if docs:
         collection = chroma_client.get_or_create_collection(name="support_kb")
@@ -163,15 +161,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         collection = chroma_client.get_collection(name="support_kb")
         query_emb = embedder.encode(text).tolist()
         results = collection.query(query_embeddings=[query_emb], n_results=6, include=["metadatas"])
-
         relevant = results["metadatas"][0] if results["metadatas"] else []
+
         if not relevant:
             await orig_context.bot.send_message(chat_id=chat_id,
                 text="Точного решения пока нет в базе знаний.\nОпишите подробнее — передам специалисту.")
             return
 
-        context_blocks = [f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant]
-        context_str = "\n\n".join(context_blocks)
+        context_str = "\n\n".join([f"Проблема: {m['problem']}\nРешение: {m['solution']}" for m in relevant])
 
         prompt = f"""Ты — опытный русскоязычный специалист техподдержки.
 Отвечай ТОЛЬКО на основе информации ниже. Ничего не придумывай.
@@ -187,7 +184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Ответ:"""
 
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.3-70b-卒業",
             messages=[{"role": "system", "content": prompt}],
             max_tokens=600,
             temperature=0.3,
@@ -214,8 +211,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await orig_context.bot.send_message(chat_id=chat_id,
                 text="Сервис временно недоступен. Попробуйте через пару минут.")
-        except BadRequest as te:
-            logger.error(f"Telegram BadRequest в чате {chat_id}: {te}")
         except Exception as te:
             logger.error(f"Не удалось отправить fallback: {te}")
 
@@ -224,9 +219,8 @@ async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id in ADMIN_IDS:
-        return  # ← админы могут писать в личку
+        return  # админы могут писать
 
-    # Остальные получают только кнопку
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
     await update.message.reply_text(
         "Писать боту в личку могут только администраторы.\nНужна помощь — нажми кнопку ниже:",
@@ -235,36 +229,55 @@ async def block_non_admin_private(update: Update, context: ContextTypes.DEFAULT_
 
 # ============================ АДМИН-КОМАНДЫ ============================
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private" or update.effective_user.id not in ADMIN_IDS:
+    if update.effective_user.id not in ADMIN_IDS:
         return
     get_knowledge_base.cache_clear()
     await update_vector_db()
     await update.message.reply_text("База знаний перезагружена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     global PAUSED
     PAUSED = True
     await update.message.reply_text("Бот на паузе")
+    return
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     global PAUSED
     PAUSED = False
     await update.message.reply_text("Бот снова работает")
+    return
 
-# ============================ ЗАПУСК ============================
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    await update.message.reply_text("Пауза" if PAUSED else "Работает")
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("OK" if not PAUSED else "PAUSED")
+
+# ============================ ЗАПУСК (ПРАВИЛЬНЫЙ ПОРЯДОК!) ============================
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connection_pool_size=100)).build()
 
-    # Порядок важен!
+    # 1. Блокировка лички для не-админов
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, block_non_admin_private))
-    app.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
 
+    # 2. Все команды — ДО общего текста!
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
 
+    # 3. Общий обработчик текста (без команд)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
+
+    # 4. Обновление базы
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
     app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
