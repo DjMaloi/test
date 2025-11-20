@@ -181,10 +181,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cache_key = md5(text.lower().encode()).hexdigest()
 
-    if cache_key in response_cache:
+if cache_key in response_cache:
         stats["cached"] = stats.get("cached", 0) + 1
         save_stats(stats)
-        await context.bot.send_message(chat_id=chat_id, text=response_cache[cache_key])
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=response_cache[cache_key],
+                read_timeout=20,
+                write_timeout=20,
+                connect_timeout=20,
+                pool_timeout=20
+            )
+        except telegram.error.TimedOut:
+            logger.warning("Таймаут при отправке кэшированного ответа — пропускаем")
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
