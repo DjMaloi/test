@@ -299,12 +299,29 @@ if __name__ == "__main__":
         .build()
 
     # ПРАВИЛЬНЫЙ ПОРЯДОК ХЕНДЛЕРОВ
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
+   # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+   # app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
 
+   # app.add_handler(MessageHandler(
+   #     filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
+   #     block_private
+   # ))
+
+    # Блокировка лички для всех, кроме админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
+    ))
+    # Основная обработка — только группы + админы в личке
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & 
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        handle_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.CAPTION & ~filters.COMMAND & 
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        handle_message
     ))
 
     app.add_handler(CommandHandler("reload", reload_kb))
@@ -320,6 +337,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
