@@ -113,9 +113,9 @@ def get_embedder():
 # ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
 async def update_vector_db():
     global collection
-    logger.info("=== Загрузка базы знаний ===")
+    logger.info("=== Перезагрузка базы знаний (фикс размерности) ===")
     try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
+        result = sheet.tables().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         logger.info(f"Получено строк: {len(values)}")
 
@@ -125,26 +125,37 @@ async def update_vector_db():
             return
 
         docs, ids, metadatas = [], [], []
+
         for i, row in enumerate(values[1:], start=1):
             if len(row) < 2: continue
-            q = row[0].strip()
-            a = row[1].strip()
-            if q and a:
-                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
-                ids.append(f"kb_{i}")
-                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
+            raw_q = row[0].strip()
+            raw_a = row[1].strip()
+            if not raw_q or not raw_a: continue
 
+            clean_q = preprocess(raw_q)
+            docs.append(clean_q)
+            ids.append(f"kb_{i}")
+            metadatas.append({
+                "question": raw_q.split("\n")[0][:200],
+                "answer": raw_a
+            })
+
+        # ←←←← ГЛАВНОЕ: УДАЛЯЕМ СТАРУЮ КОЛЛЕКЦИЮ ОБЯЗАТЕЛЬНО!
         try:
             chroma_client.delete_collection("support_kb")
+            logger.info("Старая коллекция удалена — несовместимая размерность векторов")
         except:
-            pass
+            pass  # если нет — ок
 
-        collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
+        collection = chroma_client.get_or_create_collection(
+            "support_kb",
+            metadata={"hnsw:space": "cosine"}
+        )
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
+        logger.info(f"БАЗА ПЕРЕЗАГРУЖЕНА УСПЕШНО ✅ | записей: {len(docs)} | размерность векторов: {len(get_embedder().encode('тест')[0])}")
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
+        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
         collection = None
 
 # ====================== GROQ ======================
@@ -373,6 +384,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
