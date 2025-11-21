@@ -168,7 +168,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = (update.message.text or update.message.caption or "").strip()
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
-
+    logger.info(f"НОВЫЙ ЗАПРОС | user={update.effective_user.id} (@{update.effective_user.username or ''}) | текст=\"{raw_text[:120]}\"")
+    
     stats["total"] += 1
     save_stats()
 
@@ -189,15 +190,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if collection and collection.count() > 0:
         try:
             emb = get_embedder().encode(clean_text).tolist()
-            results = collection.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
 
-            # Векторный поиск
-            for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
-                if dist < 0.42:
+                        results = collection.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
+
+            # Логируем ТОП-5 ближайших совпадений (очень полезно для отладки порога)
+            user_id = update.effective_user.id
+            username = update.effective_user.username or "no_username"
+            first_name = update.effective_user.first_name or ""
+
+            log_entries = []
+            for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
+                q_preview = meta["question"].split("\n")[0][:70] + ("..." if len(meta["question"]) > 70 else "")
+                log_entries.append(f"#{i} dist={dist:.4f} → \"{q_preview}\"")
+                if dist < 0.42 and best_answer is None:  # берём первый подходящий
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
+                    # Подсвечиваем в логе именно тот, который сработал
+                    logger.info(f"ВЫБРАН ВЕКТОРНЫЙ ОТВЕТ | user={user_id} (@{username} {first_name}) | "
+                                f"distance={dist:.4f} | запрос=\"{raw_text[:100]}\" | ответ=\"{q_preview}\"")
                     break
+
+            # Если ничего не нашлось под порогом — логируем топ-результаты (полезно для настройки порога 0.42)
+            if best_answer is None:
+                top_dist = distances[0] if distances else 1.0
+                top_q = metadatas[0]["question"].split("\n")[0][:70] if metadatas else "—"
+                logger.info(f"ВЕКТОР НЕ СРАБОТАЛ (порог 0.42) | user={user_id} (@{username}) | "
+                            f"лучший distance={top_dist:.4f} → \"{top_q}\" | запрос=\"{raw_text[:100]}\" | "
+                            f"топ-5: {' | '.join(log_entries[:5])}")
+            else:
+                # Если сработал — всё равно покажем топ-3 для контекста (необязательно, но удобно)
+                logger.debug(f"Топ совпадений: {' | '.join(log_entries[:3])}")
+            #results = collection.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
+
+            # Векторный поиск
+            #for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
+            #    if dist < 0.42:
+            #        best_answer = meta["answer"]
+            #        source = "vector"
+            #        stats["vector"] += 1
+             #       break
 
             # Ключевой поиск
             if not best_answer:
@@ -337,6 +371,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
