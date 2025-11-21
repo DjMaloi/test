@@ -1,17 +1,29 @@
-# Stage 1: builder (тяжёлый, но кэшируется навсегда)
-FROM python:3.12-slim AS builder
-RUN apt-get update && apt-get install -y build-essential gcc g++ && rm -rf /var/lib/apt/lists/*
-WORKDIR /app
-COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --user -r requirements.txt
-
-# Stage 2: лёгкий финальный образ (~300–400 МБ вместо 1.5+ ГБ)
+# syntax=docker/dockerfile:1.7
 FROM python:3.12-slim
+
+# Отключаем telemetry ChromaDB (чтобы не ставить posthog вообще)
+ENV ANONYMIZED_TELEMETRY=False
+ENV POSTHOG_API_KEY=
+ENV POSTHOG_HOST=
+
 WORKDIR /app
-# Копируем только установленные пакеты из builder'а
-COPY --from=builder /root/.local /root/.local
+
+# Копируем только зависимости
+COPY requirements.txt .
+
+# Максимальный кэш pip + torch
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/torch \
+    pip install --no-cache-dir -r requirements.txt
+
+# Копируем код (только после установки зависимостей!)
 COPY . .
-ENV PATH=/root/.local/bin:$PATH \
-    PYTHONUNBUFFERED=1
+
+# Папка для ChromaDB (чтобы не терялась база при перезапуске контейнера)
+# В Coolify сделай volume на /app/chroma
+VOLUME /app/chroma
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
 CMD ["python", "bot.py"]
