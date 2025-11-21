@@ -106,7 +106,7 @@ embedder = None
 def get_embedder():
     global embedder
     if embedder is None:
-        embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
+        embedder = SentenceTransformer("DeepPavlov/rubert-base-cased", device="cpu")
     return embedder
 
 # ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
@@ -266,7 +266,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 resp = await asyncio.wait_for(
                     groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model="ru-gpt-3.3-70b",
                         messages=[{"role": "system", "content": prompt}],
                         max_tokens=500,
                         temperature=0.2,
@@ -372,5 +372,6 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
