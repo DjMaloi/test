@@ -115,7 +115,7 @@ async def update_vector_db():
     global collection
     logger.info("=== Перезагрузка базы знаний (фикс размерности) ===")
     try:
-        result = sheet.tables().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         logger.info(f"Получено строк: {len(values)}")
 
@@ -384,6 +384,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
