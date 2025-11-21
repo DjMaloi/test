@@ -5,7 +5,7 @@ import asyncio
 import re
 import ssl
 import certifi
-import shutil
+import time
 from hashlib import md5
 from cachetools import TTLCache
 from google.oauth2.service_account import Credentials
@@ -21,6 +21,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from groq import AsyncGroq
 import chromadb
+from sentence_transformers import SentenceTransformer
 
 # ====================== SSL ФИКС ======================
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
@@ -98,53 +99,39 @@ creds = Credentials.from_service_account_file(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-# ====================== CHROMA + EMBEDDER ======================
+# ====================== CHROMA ======================
 CHROMA_PATH = "/app/chroma"
-COLLECTION_NAME = "support_kb"
-EMBED_DIM = 1024  # для модели sbert_large_mt_nlu_ru
-
-chroma_client = None
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = None
-embedder = None
 
+embedder = None
 def get_embedder():
     global embedder
     if embedder is None:
-        from sentence_transformers import SentenceTransformer
-        MODEL_CACHE_DIR = "/app/models_cache"
-        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
-        embedder = SentenceTransformer(
-            "ai-forever/sbert_large_mt_nlu_ru",
-            cache_folder=MODEL_CACHE_DIR,
-            device="cpu"
-        )
-        logger.info("Модель ai-forever/sbert_large_mt_nlu_ru загружена ✅")
+        embedder = SentenceTransformer("ai-forever/sbert_large_mt_nlu_ru", device="cpu")
     return embedder
 
 def init_chroma():
-    """Инициализация коллекции с нужной размерностью и очистка старой базы"""
-    global chroma_client, collection
-
-    if os.path.exists(CHROMA_PATH):
-        shutil.rmtree(CHROMA_PATH)
-        logger.info("Старая база Chroma удалена")
-
-    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-
-    collection = chroma_client.get_or_create_collection(
-        COLLECTION_NAME,
-        metadata={
-            "hnsw:space": "cosine",
-            "embedding_dimension": EMBED_DIM
-        }
-    )
-    logger.info(f"Новая коллекция '{COLLECTION_NAME}' создана с размерностью {EMBED_DIM}")
+    """Создаём уникальную коллекцию для каждой загрузки, не удаляя старую."""
+    global collection
+    timestamp = int(time.time())
+    collection_name = f"support_kb_{timestamp}"
+    try:
+        collection = chroma_client.get_or_create_collection(
+            collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+        logger.info(f"Создана коллекция: {collection_name}")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации Chroma: {e}")
+        collection = None
 
 # ====================== ЗАГРУЗКА БАЗЫ ======================
 async def update_vector_db():
     global collection
     logger.info("=== Загрузка базы знаний ===")
     try:
+        init_chroma()
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         logger.info(f"Получено строк: {len(values)}")
@@ -164,8 +151,6 @@ async def update_vector_db():
                 ids.append(f"kb_{i}")
                 metadatas.append({"question": q.split("\n")[0], "answer": a})
 
-        # Инициализация коллекции с нужной размерностью
-        init_chroma()
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
         logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
 
@@ -255,7 +240,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
                             f"топ-5: {' | '.join(top_log[:5])}")
 
-            # Ключевой поиск, если вектор не нашёл
+            # Ключевой поиск
             if not best_answer:
                 words = [w for w in clean_text.split() if len(w) > 3]
                 all_meta = collection.get(include=["metadatas"])["metadatas"]
@@ -355,11 +340,12 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
-    # Основная обработка
+    # Блокировка лички для всех, кроме админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
+    # Основная обработка — группы + админы в личке
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
@@ -378,7 +364,6 @@ if __name__ == "__main__":
 
     app.add_error_handler(error_handler)
 
-    # Инициализация базы при старте
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
