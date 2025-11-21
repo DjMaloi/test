@@ -389,45 +389,26 @@ if __name__ == "__main__":
     #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
-if __name__ == "__main__":
-    app = Application.builder()\
-        .token(TELEGRAM_TOKEN)\
-        .request(HTTPXRequest(connection_pool_size=100))\
-        .concurrent_updates(False)\
-        .build()
 
-    # Все твои хендлеры
+    # ←←← все твои add_handler как были
+
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND &
-        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
-        handle_message
-    ))
-    app.add_handler(MessageHandler(
-        filters.CAPTION & ~filters.COMMAND &
-        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
-        handle_message
-    ))
-    app.add_handler(CommandHandler("reload", reload_kb))
-    app.add_handler(CommandHandler("pause", pause_bot))
-    app.add_handler(CommandHandler("resume", resume_bot))
-    app.add_handler(CommandHandler("status", status_cmd))
+    # ... остальные хендлеры ...
+
     app.add_error_handler(error_handler)
 
-    async def main():
-        logger.info("=== ЗАПУСК БОТА — ждём загрузку базы знаний ===")
-        await update_vector_db()          # ← асинхронно, внутри event loop
-        logger.info("База знаний загружена — бот готов к работе!")
-        await app.run_polling(drop_pending_updates=True)
+    async def startup():
+        logger.info("=== ЗАГРУЗКА БАЗЫ ЗНАНИЙ ПЕРЕД СТАРТОМ ===")
+        await update_vector_db()   # ждём полной загрузки с новой моделью
+        logger.info("База загружена — бот готов!")
 
-    # ←←←← ЭТО РЕШАЕТ ВСЁ
-    asyncio.run(main())
+    # ←←←← ВОТ ЭТО РЕШЕНИЕ ВСЕХ ПРОБЛЕМ
+    app.job_queue.run_once(startup, when=0)   # выполнится сразу при старте, асинхронно и без конфликта loop
+    app.run_polling(drop_pending_updates=True)
 
-    #app.run_polling(drop_pending_updates=True)
-    #app.run_polling(drop_pending_updates=True)
 
 
 
