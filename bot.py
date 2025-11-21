@@ -106,44 +106,65 @@ embedder = None
 def get_embedder():
     global embedder
     if embedder is None:
-        embedder = SentenceTransformer("ai-forever/sbert_large_mt_nlu_ru", device="cpu")
+        logger.info("Загружаем мощную русскую модель эмбеддингов (1024 dim)...")
+        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+        embedder = SentenceTransformer(
+            "intfloat/multilingual-e5-large",   # ← ЭТО ГЛАВНОЕ ИЗМЕНЕНИЕ
+            cache_folder=MODEL_CACHE_DIR,
+            device="cpu"
+        )
+        logger.info("Модель multilingual-e5-large загружена (1024 dim)")
     return embedder
 
 # ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
 async def update_vector_db():
-    global collection
-    logger.info("=== Загрузка базы знаний ===")
+    global collection, chroma_client
+    logger.info("=== Полная перезагрузка векторной базы (1024 dim + preprocess) ===")
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
-        logger.info(f"Получено строк: {len(values)}")
-
-        if len(values) < 2:
+        if not values or len(values) < 2:
             logger.warning("Таблица пуста")
             collection = None
             return
 
         docs, ids, metadatas = [], [], []
-        for i, row in enumerate(values[1:], start=1):
-            if len(row) < 2: continue
-            q = row[0].strip()
-            a = row[1].strip()
-            if q and a:
-                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
-                ids.append(f"kb_{i}")
-                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
 
+        for i, row in enumerate(values[1:], start=1):  # пропускаем заголовок
+            if len(row) < 2: continue
+            raw_question = row[0].strip()
+            answer = row[1].strip()
+            if not raw_question or not answer: continue
+
+            # ← КЛЮЧЕВОЕ: очищаем вопрос так же, как и входящие запросы
+            clean_question = preprocess_text(raw_question)
+
+            docs.append(clean_question)
+            ids.append(f"kb_{i}")
+            metadatas.append({
+                "question": raw_question.split("\n")[0][:100],  # для логов
+                "answer": answer
+            })
+
+        # Полный сброс Chroma — убиваем всё старое
         try:
             chroma_client.delete_collection("support_kb")
+            logger.info("Старая коллекция удалена")
         except:
             pass
 
-        collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
+        # Пересоздаём клиент (на всякий случай)
+        chroma_client = chromadb.PersistentClient(path="/app/chroma")
+
+        collection = chroma_client.get_or_create_collection(
+            "support_kb",
+            metadata={"hnsw:space": "cosine"}
+        )
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
+        logger.info(f"БАЗА УСПЕШНО ПЕРЕЗАГРУЖЕНА ✅ | записей: {len(docs)} | модель: multilingual-e5-large (1024 dim)")
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
+        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
         collection = None
 
 # ====================== GROQ ======================
@@ -366,9 +387,11 @@ if __name__ == "__main__":
 
     app.add_error_handler(error_handler)
 
-    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
+    #app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
+    app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db()), when=3)
     #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
