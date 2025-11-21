@@ -158,11 +158,15 @@ async def update_vector_db():
 
         # Пересоздаём клиент (на всякий случай)
         chroma_client = chromadb.PersistentClient(path="/app/chroma")
-
         collection = chroma_client.get_or_create_collection(
             "support_kb",
-            metadata={"hnsw:space": "cosine"}
+            metadata={
+                "hnsw:space": "cosine",
+                "embedding_dimension": 1024   # ← вот это исправляет ошибку
+            }
         )
+
+        
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
         logger.info(f"БАЗА УСПЕШНО ПЕРЕЗАГРУЖЕНА ✅ | записей: {len(docs)} | модель: multilingual-e5-large (1024 dim)")
 
@@ -418,6 +422,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
