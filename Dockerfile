@@ -1,10 +1,13 @@
-FROM python:3.12-slim
-ARG CACHEBUST=2025-11-20-19-00
+FROM python:3.12-slim AS base
+
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . /app
-ENV PYTHONUNBUFFERED=1
-USER root
 
+# Используем кэш pip для ещё большей скорости
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
 CMD ["python", "bot.py"]
