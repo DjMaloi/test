@@ -106,7 +106,7 @@ embedder = None
 def get_embedder():
     global embedder
     if embedder is None:
-        embedder = SentenceTransformer("DeepPavlov/rubert-base-cased", device="cpu")
+        embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
     return embedder
 
 # ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
@@ -380,6 +380,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
