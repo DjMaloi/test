@@ -30,6 +30,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ====================== КОНФИГ ======================
+MODEL_CACHE_DIR = "/app/models_cache"          # ← ОБЯЗАТЕЛЬНО добавь это!
+#os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
@@ -43,7 +46,7 @@ for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_K
 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
     errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
 if not ADMIN_ID_STR.strip():
-    errors.append("ADMIN_ID не задан")
+    errors.end("ADMIN_ID не задан")
 else:
     try:
         ADMIN_IDS = [int(i.strip()) for i in ADMIN_ID_STR.split(",") if i.strip()]
@@ -109,7 +112,7 @@ def get_embedder():
         logger.info("Загружаем мощную русскую модель эмбеддингов (1024 dim)...")
         os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
         embedder = SentenceTransformer(
-            "intfloat/multilingual-e5-large",   # ← ЭТО ГЛАВНОЕ ИЗМЕНЕНИЕ
+            "ai-forever/sbert_large_nlu_ru",   # ← ЭТО ГЛАВНОЕ ИЗМЕНЕНИЕ
             cache_folder=MODEL_CACHE_DIR,
             device="cpu"
         )
@@ -171,8 +174,18 @@ async def update_vector_db():
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEM = asyncio.Semaphore(8)
 
-def preprocess(text: str) -> str:
-    return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
+#def preprocess(text: str) -> str:
+#    return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
+# Единая функция предобработки (используем везде одинаково)
+def preprocess_text(text: str) -> str:
+    """Одинаковая очистка текста и для запросов, и для базы"""
+    if not text:
+        return ""
+    # Приводим к нижнему регистру, оставляем только буквы, цифры и пробелы
+    text = re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())
+    # Схлопываем пробелы
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 async def safe_typing(bot, chat_id):
     try:
@@ -200,7 +213,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats["total"] += 1
     save_stats()
 
-    clean_text = preprocess(raw_text)
+    clean_text = preprocess_text(raw_text)
     cache_key = md5(clean_text.encode()).hexdigest()
 
     if cache_key in response_cache:
@@ -256,7 +269,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 words = [w for w in clean_text.split() if len(w) > 3]
                 all_meta = collection.get(include=["metadatas"])["metadatas"]
                 for meta in all_meta:
-                    if any(w in preprocess(meta["question"]) for w in words):
+                    if any(w in preprocess_text(meta["question"]) for w in words):
                         best_answer = meta["answer"]
                         source = "keyword"
                         stats["keyword"] += 1
@@ -394,4 +407,5 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
