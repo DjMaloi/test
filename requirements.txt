@@ -8,3 +8,4 @@ sentence-transformers==3.1.1
 torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
 cachetools==5.5.0                             # ты используешь TTLCache
 certifi==2024.8.30                            # ты импортируешь certifi
+transformers
