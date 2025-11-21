@@ -226,7 +226,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 best_dist = distances[0] if distances else 1.0
                 best_q = metadatas[0]["question"].split("\n")[0][:80] if metadatas else "—"
-                logger.info(f"ВЕКТОР ✗ (порог >0.42) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
+                logger.info(f"ВЕКТОР ✗ (порог >0.5) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
                             f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
                             f"топ-5: {' | '.join(top_log[:5])}")
 
@@ -372,4 +372,5 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
