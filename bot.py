@@ -5,7 +5,6 @@ import asyncio
 import re
 import ssl
 import certifi
-import time
 from hashlib import md5
 from cachetools import TTLCache
 from google.oauth2.service_account import Credentials
@@ -100,38 +99,21 @@ service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
 # ====================== CHROMA ======================
-CHROMA_PATH = "/app/chroma"
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+chroma_client = chromadb.PersistentClient(path="/app/chroma")
 collection = None
-
 embedder = None
+
 def get_embedder():
     global embedder
     if embedder is None:
-        embedder = SentenceTransformer("ai-forever/sbert_large_mt_nlu_ru", device="cpu")
+        embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
     return embedder
 
-def init_chroma():
-    """Создаём уникальную коллекцию для каждой загрузки, не удаляя старую."""
-    global collection
-    timestamp = int(time.time())
-    collection_name = f"support_kb_{timestamp}"
-    try:
-        collection = chroma_client.get_or_create_collection(
-            collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-        logger.info(f"Создана коллекция: {collection_name}")
-    except Exception as e:
-        logger.error(f"Ошибка инициализации Chroma: {e}")
-        collection = None
-
-# ====================== ЗАГРУЗКА БАЗЫ ======================
+# ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
 async def update_vector_db():
     global collection
     logger.info("=== Загрузка базы знаний ===")
     try:
-        init_chroma()
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
         logger.info(f"Получено строк: {len(values)}")
@@ -147,10 +129,16 @@ async def update_vector_db():
             q = row[0].strip()
             a = row[1].strip()
             if q and a:
-                docs.append(q)
+                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
                 ids.append(f"kb_{i}")
-                metadatas.append({"question": q.split("\n")[0], "answer": a})
+                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
 
+        try:
+            chroma_client.delete_collection("support_kb")
+        except:
+            pass
+
+        collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
         logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
 
@@ -173,6 +161,7 @@ async def safe_typing(bot, chat_id):
 
 # ====================== ОБРАБОТКА СООБЩЕНИЙ ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ПАУЗА — САМАЯ ПЕРВАЯ ПРОВЕРКА
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
@@ -180,6 +169,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
 
+    # === ЛОГИРУЕМ КАЖДЫЙ ВХОДЯЩИЙ ЗАПРОС ===
     user = update.effective_user
     username = f"@{user.username}" if user.username else ""
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -240,7 +230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
                             f"топ-5: {' | '.join(top_log[:5])}")
 
-            # Ключевой поиск
+            # Ключевой поиск, если вектор не нашёл
             if not best_answer:
                 words = [w for w in clean_text.split() if len(w) > 3]
                 all_meta = collection.get(include=["metadatas"])["metadatas"]
@@ -257,11 +247,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
+    # Если вообще ничего не нашли — молча выходим
     if not best_answer:
         return
 
     reply = best_answer
 
+    # Улучшаем через Groq, если ответ короткий
     if source != "fallback" and len(best_answer) < 1000:
         prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть локаничным и дружелюбным. Сохрани весь смысл.
 Оригинал:
@@ -292,6 +284,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== БЛОКИРОВКА ЛИЧКИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Пауза тоже работает здесь
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
@@ -340,19 +333,28 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
+    # ПРАВИЛЬНЫЙ ПОРЯДОК ХЕНДЛЕРОВ
+   # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+   # app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
+
+   # app.add_handler(MessageHandler(
+   #     filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
+   #     block_private
+   # ))
+
     # Блокировка лички для всех, кроме админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
-    # Основная обработка — группы + админы в личке
+    # Основная обработка — только группы + админы в личке
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND &
+        filters.TEXT & ~filters.COMMAND & 
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
     app.add_handler(MessageHandler(
-        filters.CAPTION & ~filters.COMMAND &
+        filters.CAPTION & ~filters.COMMAND & 
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
@@ -365,6 +367,7 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
 
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
+    #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
