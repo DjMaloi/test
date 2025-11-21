@@ -179,13 +179,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats["total"] += 1
     save_stats()
 
-    clean_text = preprocess(raw_text)  # Очистка текста
-
-    # Получаем эмбеддинг текста с помощью модели для русского языка
-    embedder = get_embedder()  # Используем модель, оптимизированную для русского языка
-    emb = embedder.encode(clean_text).tolist()  # Получаем векторное представление запроса
-
-    # Кэшируем запрос
+    clean_text = preprocess(raw_text)
     cache_key = md5(clean_text.encode()).hexdigest()
 
     if cache_key in response_cache:
@@ -199,9 +193,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best_answer = None
     source = "fallback"
 
-    # Поиск в Chroma с новым вектором
     if collection and collection.count() > 0:
         try:
+            emb = get_embedder().encode(clean_text).tolist()
             results = collection.query(
                 query_embeddings=[emb],
                 n_results=10,
@@ -218,7 +212,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
                 top_log.append(f"#{i} dist={dist:.4f} \"{q_preview}\"")
 
-                if dist < 0.42 and best_answer is None:
+                if dist < 0.5 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
@@ -236,7 +230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
                             f"топ-5: {' | '.join(top_log[:5])}")
 
-            # Ключевой поиск, если вектор не нашел
+            # Ключевой поиск, если вектор не нашёл
             if not best_answer:
                 words = [w for w in clean_text.split() if len(w) > 3]
                 all_meta = collection.get(include=["metadatas"])["metadatas"]
@@ -260,19 +254,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = best_answer
 
     # Улучшаем через Groq, если ответ короткий
-    if source != "fallback" and len(best_answer) < 1000:
+    if source != "fallback" and len(best_answer) < 1200:
         prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть локаничным и дружелюбным. Сохрани весь смысл.
-        Оригинал:
-        {best_answer}
-        Вопрос: {raw_text}
-        Ответ:"""
+Оригинал:
+{best_answer}
+Вопрос: {raw_text}
+Ответ:"""
         async with GROQ_SEM:
             stats["groq"] += 1
             save_stats()
             try:
                 resp = await asyncio.wait_for(
                     groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",  # Или используйте модель для русского языка, если хотите
+                        model="llama-3.3-70b-versatile",
                         messages=[{"role": "system", "content": prompt}],
                         max_tokens=500,
                         temperature=0.2,
@@ -285,10 +279,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Groq упал: {e}")
 
-    # Кэшируем и отправляем ответ
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-
 
 # ====================== БЛОКИРОВКА ЛИЧКИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -380,9 +372,3 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
-
-
-
-
-
-
