@@ -1,29 +1,16 @@
 # syntax=docker/dockerfile:1.7
-FROM python:3.12-slim
-
-# Отключаем telemetry ChromaDB (чтобы не ставить posthog вообще)
-ENV ANONYMIZED_TELEMETRY=False
-ENV POSTHOG_API_KEY=
-ENV POSTHOG_HOST=
-
+FROM python:3.12-slim AS builder
 WORKDIR /app
-
-# Копируем только зависимости
 COPY requirements.txt .
-
-# Максимальный кэш pip + torch
-RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/root/.cache/torch \
+# Этот трюк заставляет Coolify использовать внешний кэш даже в старых версиях
+RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
+    --mount=type=cache,id=torch-cache,target=/root/.cache/torch \
     pip install --no-cache-dir -r requirements.txt
 
-# Копируем код (только после установки зависимостей!)
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 COPY . .
-
-# Папка для ChromaDB (чтобы не терялась база при перезапуске контейнера)
-# В Coolify сделай volume на /app/chroma
 VOLUME /app/chroma
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
-
 CMD ["python", "bot.py"]
