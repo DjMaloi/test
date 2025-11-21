@@ -106,65 +106,46 @@ embedder = None
 def get_embedder():
     global embedder
     if embedder is None:
-       # embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
-        embedder = SentenceTransformer("intfloat/multilingual-e5-large", device="cpu")
+        embedder = SentenceTransformer("ai-forever/sbert_large_mt_nlu_ru", device="cpu")
     return embedder
 
 # ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
 async def update_vector_db():
     global collection
-    logger.info("=== Перезагрузка базы знаний (абсолютно рабочая версия) ===")
+    logger.info("=== Загрузка базы знаний ===")
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
-        logger.info(f"Получено строк из таблицы: {len(values)}")
+        logger.info(f"Получено строк: {len(values)}")
 
         if len(values) < 2:
-            logger.warning("Таблица пуста или только заголовок")
+            logger.warning("Таблица пуста")
             collection = None
             return
 
         docs, ids, metadatas = [], [], []
-
         for i, row in enumerate(values[1:], start=1):
-            if len(row) < 2:
-                continue
-            raw_q = row[0].strip()
-            raw_a = row[1].strip()
-            if not raw_q or not raw_a:
-                continue
+            if len(row) < 2: continue
+            q = row[0].strip()
+            a = row[1].strip()
+            if q and a:
+                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
+                ids.append(f"kb_{i}")
+                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
 
-            clean_q = preprocess(raw_q)                # очищаем так же, как запросы
-            docs.append(clean_q)
-            ids.append(f"kb_{i}")
-            metadatas.append({
-                "question": raw_q.split("\n")[0][:200],
-                "answer": raw_a
-            })
-
-        # Удаляем старую коллекцию (фикс 384 ≠ 1024)
         try:
             chroma_client.delete_collection("support_kb")
-            logger.info("Старая коллекция удалена — фиксим несовместимость размерности")
         except:
             pass
 
-        collection = chroma_client.get_or_create_collection(
-            "support_kb",
-            metadata={"hnsw:space": "cosine"}
-        )
+        collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
-
-        # ←←←← ПРАВИЛЬНОЕ ОПРЕДЕЛЕНИЕ РАЗМЕРНОСТИ
-        test_embedding = get_embedder().encode("тест")
-        embedding_dim = test_embedding.shape[0] if hasattr(test_embedding, "shape") else len(test_embedding)
-
-        logger.info(f"БАЗА УСПЕШНО ПЕРЕЗАГРУЖЕНА ✅ | записей: {len(docs)} | "
-                    f"размерность эмбеддингов: {embedding_dim}")
+        logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
+        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
         collection = None
+
 # ====================== GROQ ======================
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEM = asyncio.Semaphore(8)
@@ -385,39 +366,9 @@ if __name__ == "__main__":
 
     app.add_error_handler(error_handler)
 
-    #app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
+    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
     #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
-    # ←←← все твои add_handler как были
-
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
-        block_private
-    ))
-    # ... остальные хендлеры ...
-
-    app.add_error_handler(error_handler)
-
-    async def startup():
-        logger.info("=== ЗАГРУЗКА БАЗЫ ЗНАНИЙ ПЕРЕД СТАРТОМ ===")
-        await update_vector_db()   # ждём полной загрузки с новой моделью
-        logger.info("База загружена — бот готов!")
-
-    # ←←←← ВОТ ЭТО РЕШЕНИЕ ВСЕХ ПРОБЛЕМ
-    app.job_queue.run_once(startup, when=0)   # выполнится сразу при старте, асинхронно и без конфликта loop
     app.run_polling(drop_pending_updates=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
