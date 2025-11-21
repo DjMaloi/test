@@ -5,6 +5,7 @@ import asyncio
 import re
 import ssl
 import certifi
+import shutil
 from hashlib import md5
 from cachetools import TTLCache
 from google.oauth2.service_account import Credentials
@@ -20,7 +21,6 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from groq import AsyncGroq
 import chromadb
-from sentence_transformers import SentenceTransformer
 
 # ====================== SSL ФИКС ======================
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
@@ -30,9 +30,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ====================== КОНФИГ ======================
-MODEL_CACHE_DIR = "/app/models_cache"          # ← ОБЯЗАТЕЛЬНО добавь это!
-#os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
@@ -46,7 +43,7 @@ for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_K
 if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
     errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
 if not ADMIN_ID_STR.strip():
-    errors.end("ADMIN_ID не задан")
+    errors.append("ADMIN_ID не задан")
 else:
     try:
         ADMIN_IDS = [int(i.strip()) for i in ADMIN_ID_STR.split(",") if i.strip()]
@@ -101,95 +98,87 @@ creds = Credentials.from_service_account_file(
 service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
-# ====================== CHROMA ======================
-chroma_client = chromadb.PersistentClient(path="/app/chroma")
+# ====================== CHROMA + EMBEDDER ======================
+CHROMA_PATH = "/app/chroma"
+COLLECTION_NAME = "support_kb"
+EMBED_DIM = 1024  # для модели sbert_large_mt_nlu_ru
+
+chroma_client = None
 collection = None
 embedder = None
 
 def get_embedder():
     global embedder
     if embedder is None:
-        logger.info("Загружаем мощную русскую модель эмбеддингов (1024 dim)...")
+        from sentence_transformers import SentenceTransformer
+        MODEL_CACHE_DIR = "/app/models_cache"
         os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
         embedder = SentenceTransformer(
-            "ai-forever/sbert_large_nlu_ru",   # ← ЭТО ГЛАВНОЕ ИЗМЕНЕНИЕ
+            "ai-forever/sbert_large_mt_nlu_ru",
             cache_folder=MODEL_CACHE_DIR,
             device="cpu"
         )
-        logger.info("Модель multilingual-e5-large загружена (1024 dim)")
+        logger.info("Модель ai-forever/sbert_large_mt_nlu_ru загружена ✅")
     return embedder
 
-# ====================== ЗАГРУЗКА БАЗЫ (поддерживает Alt+Enter) ======================
+def init_chroma():
+    """Инициализация коллекции с нужной размерностью и очистка старой базы"""
+    global chroma_client, collection
+
+    if os.path.exists(CHROMA_PATH):
+        shutil.rmtree(CHROMA_PATH)
+        logger.info("Старая база Chroma удалена")
+
+    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+
+    collection = chroma_client.get_or_create_collection(
+        COLLECTION_NAME,
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_dimension": EMBED_DIM
+        }
+    )
+    logger.info(f"Новая коллекция '{COLLECTION_NAME}' создана с размерностью {EMBED_DIM}")
+
+# ====================== ЗАГРУЗКА БАЗЫ ======================
 async def update_vector_db():
-    global collection, chroma_client
-    logger.info("=== Полная перезагрузка векторной базы (1024 dim + preprocess) ===")
+    global collection
+    logger.info("=== Загрузка базы знаний ===")
     try:
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
         values = result.get("values", [])
-        if not values or len(values) < 2:
+        logger.info(f"Получено строк: {len(values)}")
+
+        if len(values) < 2:
             logger.warning("Таблица пуста")
             collection = None
             return
 
         docs, ids, metadatas = [], [], []
-
-        for i, row in enumerate(values[1:], start=1):  # пропускаем заголовок
+        for i, row in enumerate(values[1:], start=1):
             if len(row) < 2: continue
-            raw_question = row[0].strip()
-            answer = row[1].strip()
-            if not raw_question or not answer: continue
+            q = row[0].strip()
+            a = row[1].strip()
+            if q and a:
+                docs.append(q)
+                ids.append(f"kb_{i}")
+                metadatas.append({"question": q.split("\n")[0], "answer": a})
 
-            # ← КЛЮЧЕВОЕ: очищаем вопрос так же, как и входящие запросы
-            clean_question = preprocess_text(raw_question)
-
-            docs.append(clean_question)
-            ids.append(f"kb_{i}")
-            metadatas.append({
-                "question": raw_question.split("\n")[0][:100],  # для логов
-                "answer": answer
-            })
-
-        # Полный сброс Chroma — убиваем всё старое
-        try:
-            chroma_client.delete_collection("support_kb")
-            logger.info("Старая коллекция удалена")
-        except:
-            pass
-
-        # Пересоздаём клиент (на всякий случай)
-        chroma_client = chromadb.PersistentClient(path="/app/chroma")
-        collection = chroma_client.get_or_create_collection(
-            "support_kb",
-            metadata={
-                "hnsw:space": "cosine",
-                "embedding_dimension": 1024   # ← вот это исправляет ошибку
-            }
-        )
-
-        
+        # Инициализация коллекции с нужной размерностью
+        init_chroma()
         collection.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"БАЗА УСПЕШНО ПЕРЕЗАГРУЖЕНА ✅ | записей: {len(docs)} | модель: multilingual-e5-large (1024 dim)")
+        logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
+        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
         collection = None
 
 # ====================== GROQ ======================
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEM = asyncio.Semaphore(8)
 
-#def preprocess(text: str) -> str:
-#    return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
-# Единая функция предобработки (используем везде одинаково)
-def preprocess_text(text: str) -> str:
-    """Одинаковая очистка текста и для запросов, и для базы"""
-    if not text:
-        return ""
-    # Приводим к нижнему регистру, оставляем только буквы, цифры и пробелы
-    text = re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())
-    # Схлопываем пробелы
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def preprocess(text: str) -> str:
+    return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
 
 async def safe_typing(bot, chat_id):
     try:
@@ -199,7 +188,6 @@ async def safe_typing(bot, chat_id):
 
 # ====================== ОБРАБОТКА СООБЩЕНИЙ ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ПАУЗА — САМАЯ ПЕРВАЯ ПРОВЕРКА
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
@@ -207,7 +195,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
 
-    # === ЛОГИРУЕМ КАЖДЫЙ ВХОДЯЩИЙ ЗАПРОС ===
     user = update.effective_user
     username = f"@{user.username}" if user.username else ""
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -217,7 +204,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats["total"] += 1
     save_stats()
 
-    clean_text = preprocess_text(raw_text)
+    clean_text = preprocess(raw_text)
     cache_key = md5(clean_text.encode()).hexdigest()
 
     if cache_key in response_cache:
@@ -273,7 +260,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 words = [w for w in clean_text.split() if len(w) > 3]
                 all_meta = collection.get(include=["metadatas"])["metadatas"]
                 for meta in all_meta:
-                    if any(w in preprocess_text(meta["question"]) for w in words):
+                    if any(w in preprocess(meta["question"]) for w in words):
                         best_answer = meta["answer"]
                         source = "keyword"
                         stats["keyword"] += 1
@@ -285,13 +272,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
-    # Если вообще ничего не нашли — молча выходим
     if not best_answer:
         return
 
     reply = best_answer
 
-    # Улучшаем через Groq, если ответ короткий
     if source != "fallback" and len(best_answer) < 1000:
         prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть локаничным и дружелюбным. Сохрани весь смысл.
 Оригинал:
@@ -322,7 +307,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ====================== БЛОКИРОВКА ЛИЧКИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Пауза тоже работает здесь
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
@@ -343,16 +327,6 @@ async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     set_paused(True)
     await update.message.reply_text("Бот на паузе — обычные пользователи не получают ответы")
-
-async def nuke_chroma(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    import shutil
-    if os.path.exists("/app/chroma"):
-        shutil.rmtree("/app/chroma")
-    await update.message.reply_text("Chroma база полностью удалена. Перезапустите бота или выполните /reload")
-    
-
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
@@ -381,28 +355,18 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
-    # ПРАВИЛЬНЫЙ ПОРЯДОК ХЕНДЛЕРОВ
-   # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-   # app.add_handler(MessageHandler(filters.CAPTION & ~filters.COMMAND, handle_message))
-
-   # app.add_handler(MessageHandler(
-   #     filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
-   #     block_private
-   # ))
-
-    # Блокировка лички для всех, кроме админов
+    # Основная обработка
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
-    # Основная обработка — только группы + админы в личке
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & 
+        filters.TEXT & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
     app.add_handler(MessageHandler(
-        filters.CAPTION & ~filters.COMMAND & 
+        filters.CAPTION & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
@@ -411,18 +375,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("nuke_chroma", nuke_chroma))
 
     app.add_error_handler(error_handler)
 
-    #app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=3)
-    app.job_queue.run_once(lambda ctx: asyncio.create_task(update_vector_db()), when=3)
-    #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
+    # Инициализация базы при старте
+    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
-
-
-
-
