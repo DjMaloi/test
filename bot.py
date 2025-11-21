@@ -340,6 +340,16 @@ async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_paused(True)
     await update.message.reply_text("Бот на паузе — обычные пользователи не получают ответы")
 
+async def nuke_chroma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    import shutil
+    if os.path.exists("/app/chroma"):
+        shutil.rmtree("/app/chroma")
+    await update.message.reply_text("Chroma база полностью удалена. Перезапустите бота или выполните /reload")
+    
+
+
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS: return
     set_paused(False)
@@ -397,6 +407,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("nuke_chroma", nuke_chroma))
 
     app.add_error_handler(error_handler)
 
@@ -407,5 +418,6 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
