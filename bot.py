@@ -389,16 +389,46 @@ if __name__ == "__main__":
     #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
-    if __name__ == "__main__":
-        # ... твой текущий код создания app ...
+if __name__ == "__main__":
+    app = Application.builder()\
+        .token(TELEGRAM_TOKEN)\
+        .request(HTTPXRequest(connection_pool_size=100))\
+        .concurrent_updates(False)\
+        .build()
 
-        # ←←←← ЭТО ГЛАВНОЕ ИСПРАВЛЕНИЕ ↓↓↓↓
-        logger.info("Запуск бота — ждём полной загрузки базы знаний...")
-        asyncio.run(update_vector_db())  # СИНХРОННО загружаем базу ПЕРЕД стартом polling
-        logger.info("База загружена — запускаем бота!")
+    # Все твои хендлеры
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
+        block_private
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND &
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        handle_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.CAPTION & ~filters.COMMAND &
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        handle_message
+    ))
+    app.add_handler(CommandHandler("reload", reload_kb))
+    app.add_handler(CommandHandler("pause", pause_bot))
+    app.add_handler(CommandHandler("resume", resume_bot))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_error_handler(error_handler)
 
-    app.run_polling(drop_pending_updates=True)
-    app.run_polling(drop_pending_updates=True)
+    async def main():
+        logger.info("=== ЗАПУСК БОТА — ждём загрузку базы знаний ===")
+        await update_vector_db()          # ← асинхронно, внутри event loop
+        logger.info("База знаний загружена — бот готов к работе!")
+        await app.run_polling(drop_pending_updates=True)
+
+    # ←←←← ЭТО РЕШАЕТ ВСЁ
+    asyncio.run(main())
+
+    #app.run_polling(drop_pending_updates=True)
+    #app.run_polling(drop_pending_updates=True)
+
 
 
 
