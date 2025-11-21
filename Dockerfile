@@ -1,16 +1,25 @@
-# syntax=docker/dockerfile:1.7
+# Этап 1: устанавливаем все зависимости (тяжёлый, но кэшируется автоматически в Docker на сервере)
 FROM python:3.12-slim AS builder
 WORKDIR /app
 COPY requirements.txt .
-# Этот трюк заставляет Coolify использовать внешний кэш даже в старых версиях
-RUN --mount=type=cache,id=pip-cache,target=/root/.cache/pip \
-    --mount=type=cache,id=torch-cache,target=/root/.cache/torch \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --user --no-cache-dir -r requirements.txt
 
+# Этап 2: финальный лёгкий образ (~500–700 МБ вместо 1.5+ ГБ)
 FROM python:3.12-slim
 WORKDIR /app
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Копируем только установленные пакеты из builder'а
+COPY --from=builder /root/.local /root/.local
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Копируем код бота
 COPY . .
+
+# Отать Chroma от пересоздания
 VOLUME /app/chroma
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    ANONYMIZED_TELEMETRY=False
+
 CMD ["python", "bot.py"]
