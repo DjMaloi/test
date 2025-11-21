@@ -212,7 +212,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
                 top_log.append(f"#{i} dist={dist:.4f} \"{q_preview}\"")
 
-                if dist < 0.42 and best_answer is None:
+                if dist < 0.5 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
@@ -254,7 +254,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = best_answer
 
     # Улучшаем через Groq, если ответ короткий
-    if source != "fallback" and len(best_answer) < 1000:
+    if source != "fallback" and len(best_answer) < 1200:
         prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть локаничным и дружелюбным. Сохрани весь смысл.
 Оригинал:
 {best_answer}
@@ -372,3 +372,4 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
