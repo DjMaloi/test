@@ -218,7 +218,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     reply = best_answer
     if source != "fallback" and len(best_answer) < 1000:
-        prompt = f"""Перефразируй коротко и дружелюбно. Сохрани весь смысл.
+        prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть локаничным и дружелюбным. Сохрани весь смысл.
 Оригинал:
 {best_answer}
 
@@ -318,4 +318,5 @@ if __name__ == "__main__":
     #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
+
     app.run_polling(drop_pending_updates=True)
