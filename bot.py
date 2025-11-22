@@ -89,7 +89,7 @@ async def safe_typing(bot, chat_id):
     except:
         pass
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
-async def update_vector_db():
+async def update_vector_db(context: ContextTypes.DEFAULT_TYPE):
     global collection_general, collection_technical
     try:
         logger.info("Обновление базы знаний из Google Sheets...")
@@ -97,10 +97,16 @@ async def update_vector_db():
         # читаем данные из таблицы
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:B").execute()
         general_rows = result.get("values", [])
-
+        logger.info(f"General rows загружено: {len(general_rows)}")
+        if general_rows:
+            logger.info(f"Пример General: {general_rows[0]}")
+        
         result = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:B").execute()
         technical_rows = result.get("values", [])
-
+        logger.info(f"Technical rows загружено: {len(technical_rows)}")
+        if technical_rows:
+            logger.info(f"Пример Technical: {technical_rows[0]}")
+        
         # пересоздаём коллекции
         try:
             chroma_client.delete_collection("general_kb")
@@ -311,6 +317,7 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.0 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.1 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
