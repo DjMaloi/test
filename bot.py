@@ -181,12 +181,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === Google Sheets поиск ===
     try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="A:B").execute()
-        values = result.get("values", [])
+        values = []
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:B").execute()
+        values += result.get("values", [])
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:B").execute()
+        values += result.get("values", [])
+
         for row in values:
             if len(row) >= 2:
                 keyword, answer = row[0].strip().lower(), row[1].strip()
-                if keyword in clean_text:
+                if keyword in clean_text or clean_text in keyword:
                     best_answer = answer
                     source = "keyword"
                     stats["keyword"] += 1
@@ -204,7 +208,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 include=["metadatas", "distances"]
             )
             for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
-                if dist < 0.4 and best_answer is None:
+                if dist < 0.7 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
@@ -221,15 +225,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 include=["metadatas", "distances"]
             )
             for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
-                if dist < 0.4 and best_answer is None:
+                if dist < 0.7 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
-    # === Отправка ответа ===
-      
     # === Fallback через Groq ===
     if not best_answer:
         try:
@@ -246,10 +248,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Groq ошибка: {e}", exc_info=True)
             best_answer = "Извините, я не смог найти ответ."
 
-    if best_answer:
-        response_cache[cache_key] = best_answer
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=best_answer)
+    # === Улучшаем через Groq, если ответ короткий ===
+    reply = best_answer
+    if source != "fallback" and best_answer and len(best_answer) < 1200:
+        prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть лаконичным и дружелюбным. Сохрани весь смысл.
+Оригинал:
+{best_answer}
+Вопрос: {raw_text}
+Ответ:"""
+        async with GROQ_SEM:
+            stats["groq"] += 1
+            save_stats()
+            try:
+                resp = await asyncio.wait_for(
+                    groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "system", "content": prompt}],
+                        max_tokens=500,
+                        temperature=0.2,
+                    ),
+                    timeout=20
+                )
+                new = resp.choices[0].message.content.strip()
+                if 15 < len(new) < len(best_answer) * 2:
+                    reply = new
+            except Exception as e:
+                logger.warning(f"Groq упал: {e}")
 
+    # === Финальная отправка ответа ===
+    if reply:
+        response_cache[cache_key] = reply
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
         
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -336,8 +365,9 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.2 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.3 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
