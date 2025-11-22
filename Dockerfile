@@ -2,7 +2,7 @@
 FROM python:3.12-slim AS builder
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt  # Без флага --user
 
 # Этап 2: финальный лёгкий образ (~500–700 МБ вместо 1.5+ ГБ)
 FROM python:3.12-slim
