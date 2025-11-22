@@ -293,18 +293,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Chroma ошибка (technical): {e}", exc_info=True)
 
-       # === Fallback через Groq (с промтом) ===
+    # === Fallback через Groq (с промтом, молчание при отсутствии данных) ===
     if not best_answer:
         try:
             system_prompt = (
                 "Ты помощник службы поддержки. Отвечай коротко, по делу и только по фактам.\n\n"
                 "Правила:\n"
-                "1) Не придумывай. Если недостаточно данных — ответ: \"Не знаю\".\n"
+                "1) Не придумывай. Если недостаточно данных — не отвечай.\n"
                 "2) Сохраняй все ссылки и технические обозначения как есть.\n"
                 "3) Не добавляй предположений, историй, аналогий и лишних пояснений.\n"
                 "4) Формат: либо до 3 кратких предложений, либо до 5 маркеров.\n"
-                "5) Длина: не длиннее исходного ответа и не более 800 символов.\n"
-                "6) Если вопрос не относится к базе — \"Не знаю\"."
+                "5) Длина: не длиннее исходного ответа и не более 800 символов."
             )
 
             user_prompt = f"Вопрос: {raw_text}\n\nОтвет:"
@@ -321,15 +320,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 temperature=0.0,
                 top_p=0.1,
             )
-            best_answer = completion.choices[0].message.content.strip()
-            source = "groq"
-            logger.info(
-                f"Groq fallback ✓ | user={user.id} ({display_name}) | "
-                f"ответ={len(best_answer)} симв."
-            )
+            candidate = completion.choices[0].message.content.strip()
+
+            # Если модель вернула пусто или "не знаю" → молчим
+            if not candidate or candidate.lower().startswith("не знаю"):
+                best_answer = None
+                logger.info(
+                    f"Groq fallback ✗ | user={user.id} ({display_name}) | модель промолчала"
+                )
+            else:
+                best_answer = candidate
+                source = "groq"
+                logger.info(
+                    f"Groq fallback ✓ | user={user.id} ({display_name}) | "
+                    f"ответ={len(best_answer)} симв."
+                )
         except Exception as e:
             logger.error(f"Groq ошибка: {e}", exc_info=True)
-            best_answer = "Извините, я не смог найти ответ."
+            best_answer = None
+
 
     # === Улучшаем через Groq, если ответ короткий ===
     reply = best_answer
@@ -476,9 +485,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.7 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.8 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
