@@ -1,11 +1,10 @@
-python-telegram-bot[job-queue]==21.6          # webhooks не нужны
+python-telegram-bot[job-queue]==21.6
 groq==0.11.0
-httpx==0.27.0                                 # нужен для HTTPXRequest
+httpx==0.27.0
 google-auth==2.35.0
 google-api-python-client==2.149.0
 chromadb==1.0.15
 sentence-transformers==3.1.1
-torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
-cachetools==5.5.0                             # ты используешь TTLCache
-certifi==2024.8.30                            # ты импортируешь certifi
-transformers
+torch==2.4.1+cpu --index-url https://download.pytorch.org/whl/cpu
+cachetools==5.5.0
+certifi==2024.8.30
