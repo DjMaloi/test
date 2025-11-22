@@ -46,7 +46,8 @@ collection_general = chroma_client.get_or_create_collection("general_kb")
 collection_technical = chroma_client.get_or_create_collection("technical_kb")
 
 # ====================== EMBEDDERS ======================
-embedder_general = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+#embedder_general = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+embedder_general = SentenceTransformer("ai-forever/sbert_large_nlu_ru")
 embedder_technical = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 # ====================== GROQ ======================
@@ -485,6 +486,6 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.9 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.10 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
