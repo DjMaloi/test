@@ -96,41 +96,46 @@ async def safe_typing(bot, chat_id):
     except:
         pass
 
-# ====================== UPDATE VECTOR DB ======================
+# ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
 async def update_vector_db():
+    global collection_general, collection_technical
     try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="A:B").execute()
-        values = result.get("values", [])
-        if not values:
-            logger.warning("Google Sheets пустой")
-            return
+        logger.info("Обновление базы знаний из Google Sheets...")
 
-        # пересоздаём коллекции вместо delete(where={})
-        client.delete_collection("general_kb")
-        client.delete_collection("technical_kb")
-        global collection_general, collection_technical
-        collection_general = client.create_collection("general_kb")
-        collection_technical = client.create_collection("technical_kb")
+        # читаем данные из таблицы
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:A").execute()
+        general_rows = [row[0] for row in result.get("values", []) if row]
 
-        for row in values:
-            if len(row) >= 2:
-                keyword, answer = row[0].strip(), row[1].strip()
-                emb_general = embedder_general.encode(keyword).tolist()
-                emb_technical = embedder_technical.encode(keyword).tolist()
-                collection_general.add(
-                    documents=[keyword],
-                    metadatas=[{"question": keyword, "answer": answer}],
-                    embeddings=[emb_general]
-                )
-                collection_technical.add(
-                    documents=[keyword],
-                    metadatas=[{"question": keyword, "answer": answer}],
-                    embeddings=[emb_technical]
-                )
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:A").execute()
+        technical_rows = [row[0] for row in result.get("values", []) if row]
 
-        logger.info(f"Загружено {len(values)} записей из Google Sheets в ChromaDB")
+        # пересоздаём коллекции
+        chroma_client.delete_collection("general")
+        chroma_client.delete_collection("technical")
+
+        collection_general = chroma_client.create_collection("general")
+        collection_technical = chroma_client.create_collection("technical")
+
+        # добавляем данные с обязательными ids
+        if general_rows:
+            collection_general.add(
+                ids=[f"general_{i}" for i in range(len(general_rows))],
+                documents=general_rows,
+                embeddings=model.encode(general_rows).tolist()
+            )
+
+        if technical_rows:
+            collection_technical.add(
+                ids=[f"technical_{i}" for i in range(len(technical_rows))],
+                documents=technical_rows,
+                embeddings=model.encode(technical_rows).tolist()
+            )
+
+        logger.info(f"База обновлена: общая={len(general_rows)}, тех={len(technical_rows)}")
+
     except Exception as e:
-        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
+        logger.error(f"Ошибка загрузки базы: {e}")
+
 
 # ====================== MESSAGE HANDLER ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -291,9 +296,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.12 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("2.12.1 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
