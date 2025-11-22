@@ -86,6 +86,11 @@ def save_stats():
 from cachetools import TTLCache
 response_cache = TTLCache(maxsize=1000, ttl=3600)
 
+# ====================== CHROMA CLIENT ======================
+chroma_client = chromadb.Client(Settings(
+    persist_directory="/app/chroma_db",   # папка для хранения базы
+    chroma_db_impl="duckdb+parquet"
+))
 
 def preprocess(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
@@ -299,6 +304,7 @@ if __name__ == "__main__":
     logger.info("2.12.1 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
