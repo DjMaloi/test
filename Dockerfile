@@ -1,20 +1,23 @@
-# Этап 1: устанавливаем все зависимости (тяжёлый, но кэшируется автоматически в Docker на сервере)
+# Этап 1: устанавливаем все зависимости
 FROM python:3.12-slim AS builder
 WORKDIR /app
 
-# Копируем только requirements.txt, чтобы использовать кэширование зависимостей
+# Копируем requirements.txt
 COPY requirements.txt .
 
-# Обновляем pip и устанавливаем зависимости с кэшированием
-RUN pip install --upgrade pip && \
-    pip install --cache-dir=/tmp/pip-cache -r requirements.txt
+# Обновляем pip и устанавливаем зависимости
+RUN pip install --upgrade pip
+RUN pip install --cache-dir=/tmp/pip-cache -r requirements.txt
 
-# Этап 2: финальный лёгкий образ (~500–700 МБ вместо 1.5+ ГБ)
+# Добавляем отладочную команду, чтобы увидеть структуру директорий
+RUN echo "Проверка содержимого /usr/local:" && ls -la /usr/local
+
+# Этап 2: финальный образ
 FROM python:3.12-slim
 WORKDIR /app
 
 # Копируем установленные пакеты и исполнимые файлы из builder'а
-COPY --from=builder /usr/local /usr/local  # Копируем системные пакеты и исполнимые файлы
+COPY --from=builder /usr/local /usr/local
 
 # Копируем код бота
 COPY . .
