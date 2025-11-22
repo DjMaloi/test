@@ -253,11 +253,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === Улучшаем через Groq, если ответ короткий ===
     reply = best_answer
     if source != "fallback" and best_answer and len(best_answer) < 1200:
-        prompt = f"""Используй текст полностью не сокращая и не удаляя ссылки в сообщении, текст должен быть лаконичным и дружелюбным. Сохрани весь смысл.
-Оригинал:
-{best_answer}
-Вопрос: {raw_text}
-Ответ:"""
+        system_prompt = (
+            "Ты помощник службы поддержки. Отвечай коротко, по делу и только по фактам.\n\n"
+            "Правила:\n"
+            "1) Не придумывай. Если недостаточно данных — ответ: \"Не знаю\".\n"
+            "2) Сохраняй все ссылки и технические обозначения как есть.\n"
+            "3) Не добавляй предположений, историй, аналогий и лишних пояснений.\n"
+            "4) Формат: либо до 3 кратких предложений, либо до 5 маркеров.\n"
+            "5) Длина: не длиннее исходного ответа и не более 800 символов.\n"
+            "6) Если вопрос не относится к базе — \"Не знаю\".\n\n"
+            "Твоя задача: переформулировать исходный ответ, сделав его короче и точнее без потери смысла."
+        )
+
+        prompt_user = f"Оригинал:\n{best_answer}\n\nВопрос: {raw_text}\n\nОтвет:"
+
         async with GROQ_SEM:
             stats["groq"] += 1
             save_stats()
@@ -265,23 +274,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 resp = await asyncio.wait_for(
                     groq_client.chat.completions.create(
                         model="llama-3.3-70b-versatile",
-                        messages=[{"role": "system", "content": prompt}],
-                        max_tokens=500,
-                        temperature=0.2,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt_user},
+                        ],
+                        max_tokens=400,
+                        temperature=0.0,
+                        top_p=0.1,
                     ),
                     timeout=20
                 )
                 new = resp.choices[0].message.content.strip()
-                if 15 < len(new) < len(best_answer) * 2:
+                if 30 < len(new) <= 800 and len(new) <= len(best_answer):
                     reply = new
+                    logger.info(
+                        f"Groq улучшил ответ | user={user.id} ({display_name}) | "
+                        f"старый={len(best_answer)} симв. → новый={len(new)} симв."
+                    )
             except Exception as e:
                 logger.warning(f"Groq упал: {e}")
 
-# === Финальная отправка ответа ===
+    # === Финальная отправка ответа ===
     reply = reply or best_answer or "Извините, я не смог найти ответ."
     response_cache[cache_key] = reply
-    logger.info(f"ОТПРАВКА → {reply[:100]}")
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+    logger.info(f"ОТПРАВКА → user={user.id} ({display_name}) | {reply[:100]}{'...' if len(reply)>100 else ''}")
+    try:
+        MAX_LEN = 4000
+        for i in range(0, len(reply), MAX_LEN):
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=reply[i:i+MAX_LEN])
+    except telegram.error.TimedOut:
+        logger.warning("Отправка превысила таймаут, пробуем ещё раз...")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply[:4000])
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}", exc_info=True)
+
         
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -368,9 +394,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.4 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.5 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
