@@ -275,10 +275,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Groq упал: {e}")
 
-    # === Финальная отправка ответа ===
-    if reply:
-        response_cache[cache_key] = reply
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+# === Финальная отправка ответа ===
+    reply = reply or best_answer or "Извините, я не смог найти ответ."
+    response_cache[cache_key] = reply
+    logger.info(f"ОТПРАВКА → {reply[:100]}")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
         
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,9 +366,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.3 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.4 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
