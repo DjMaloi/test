@@ -3,6 +3,8 @@ import re
 import json
 import logging
 import asyncio
+# Ограничитель параллельных запросов к Groq
+GROQ_SEM = asyncio.Semaphore(2)
 from hashlib import md5
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -369,6 +371,7 @@ if __name__ == "__main__":
     logger.info("3.4 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
