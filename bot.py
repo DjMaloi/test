@@ -23,6 +23,9 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 # ====================== SSL ФИКС ======================
+
+# Устанавливаем актуальные сертификаты SSL
+#ssl._create_default_https_context = ssl.create_default_context(cafile=certifi.where())
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
 # ====================== ЛОГИ ======================
@@ -212,11 +215,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected_dist = None
             selected_preview = None
 
+            # Векторный поиск
             for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
                 q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
                 top_log.append(f"#{i} dist={dist:.4f} \"{q_preview}\"")
 
-                if dist < 0.5 and best_answer is None:
+                if dist < 0.5 and best_answer is None:  # Если найден хороший результат по вектору
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
@@ -228,25 +232,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
                             f"→ \"{selected_preview}\" | топ-3: {' | '.join(top_log[:3])}")
             else:
+                # Если по вектору не найдено подходящего ответа
                 best_dist = distances[0] if distances else 1.0
                 best_q = metadatas[0]["question"].split("\n")[0][:80] if metadatas else "—"
                 logger.info(f"ВЕКТОР ✗ (порог >0.42) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
                             f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
                             f"топ-5: {' | '.join(top_log[:5])}")
 
-            # Ключевой поиск, если вектор не нашёл
-            if not best_answer:
-                words = [w for w in clean_text.split() if len(w) > 3]
-                all_meta = collection.get(include=["metadatas"])["metadatas"]
-                for meta in all_meta:
-                    if any(w in preprocess(meta["question"]) for w in words):
-                        best_answer = meta["answer"]
-                        source = "keyword"
-                        stats["keyword"] += 1
-                        keyword_q = meta["question"].split("\n")[0][:80]
-                        logger.info(f"КЛЮЧЕВОЙ ПОИСК ✓ | user={user.id} ({display_name}) | "
-                                    f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | → \"{keyword_q}\"")
-                        break
+                # Ключевой поиск, если вектор не нашёл
+                if not best_answer:
+                    words = [w for w in clean_text.split() if len(w) > 3]
+                    all_meta = collection.get(include=["metadatas"])["metadatas"]
+                    for meta in all_meta:
+                        # Ищем совпадения по ключевым словам
+                        if any(w in preprocess(meta["question"]) for w in words):
+                            best_answer = meta["answer"]
+                            source = "keyword"
+                            stats["keyword"] += 1
+                            keyword_q = meta["question"].split("\n")[0][:80]
+                            logger.info(f"КЛЮЧЕВОЙ ПОИСК ✓ | user={user.id} ({display_name}) | "
+                                        f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | → \"{keyword_q}\"")
+                            break
 
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
@@ -283,8 +289,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.warning(f"Groq упал: {e}")
 
+    # Кэшируем ответ и отправляем
     response_cache[cache_key] = reply
     await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+
 
 # ====================== БЛОКИРОВКА ЛИЧКИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,4 +384,5 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
