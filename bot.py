@@ -5,7 +5,7 @@ import asyncio
 from hashlib import md5
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.ext._httpxrequest import HTTPXRequest
+#from telegram.ext._httpxrequest import HTTPXRequest
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 from cachetools import TTLCache
@@ -282,4 +282,5 @@ if __name__ == "__main__":
     logger.info("2.11 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
