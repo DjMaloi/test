@@ -228,7 +228,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     source = "vector"
                     stats["vector"] += 1
                     selected_dist = d
-                    selected_preview = (best_answer or "").replace("\n", " ")[:80]
+                    selected_preview = (best_answer or "").replace("\n", " ")[:280]
 
             if best_answer:
                 logger.info(
@@ -238,7 +238,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 best_dist = distances[0] if distances else 1.0
-                best_q = (metadatas[0].get('answer') or '—').split("\n")[0][:80] if metadatas else "—"
+                best_q = (metadatas[0].get('answer') or '—').split("\n")[0][:280] if metadatas else "—"
                 logger.info(
                     f"ВЕКТОР ✗ (порог >0.7) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
                     f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
@@ -274,7 +274,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     source = "vector"
                     stats["vector"] += 1
                     selected_dist = d
-                    selected_preview = (best_answer or "").replace("\n", " ")[:80]
+                    selected_preview = (best_answer or "").replace("\n", " ")[:280]
 
             if best_answer:
                 logger.info(
@@ -284,7 +284,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 best_dist = distances[0] if distances else 1.0
-                best_q = (metadatas[0].get('answer') or '—').split("\n")[0][:80] if metadatas else "—"
+                best_q = (metadatas[0].get('answer') or '—').split("\n")[0][:280] if metadatas else "—"
                 logger.info(
                     f"ВЕКТОР (TECH) ✗ (порог >0.7) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
                     f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
@@ -488,14 +488,3 @@ if __name__ == "__main__":
     logger.info("3.9 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
-
-
-
-
-
-
-
-
-
-
-
