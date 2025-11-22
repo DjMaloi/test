@@ -55,8 +55,30 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# ====================== STATS ======================
+
+# ====================== PAUSE & STATS ======================
+PAUSE_FILE = "/app/paused.flag"
+STATS_FILE = "/app/stats.json"
+
+def is_paused() -> bool:
+    """Проверяет, находится ли бот на паузе"""
+    return os.path.exists(PAUSE_FILE)
+
+def set_paused(state: bool):
+    """Включает или снимает паузу"""
+    if state:
+        open(PAUSE_FILE, "w").close()
+        logger.info("БОТ НА ПАУЗЕ — отвечает только админам")
+    else:
+        try:
+            os.remove(PAUSE_FILE)
+        except FileNotFoundError:
+            pass
+        logger.info("Пауза снята")
+
 stats = {"total": 0, "cached": 0, "groq": 0, "vector": 0, "keyword": 0}
+
+
 response_cache = TTLCache(maxsize=5000, ttl=86400)
 
 # ====================== GOOGLE SHEETS ======================
@@ -102,9 +124,9 @@ async def update_vector_db():
             logger.warning("Google Sheets пустой")
             return
 
-        # очищаем коллекции
-        collection_general.delete()
-        collection_technical.delete()
+        # очищаем коллекции корректно
+        collection_general.delete(where={})
+        collection_technical.delete(where={})
 
         for row in values:
             if len(row) >= 2:
@@ -246,6 +268,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Вектор: {stats['vector']} | Ключи: {stats['keyword']} | Groq: {stats['groq']}"
     )
 
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Глобальная ошибка: {context.error}", exc_info=True)
 
@@ -286,6 +309,7 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.8 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("2.9 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
