@@ -19,6 +19,12 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+# Отключаем лишние логи от telegram
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext._updater").setLevel(logging.WARNING)
+logging.getLogger("telegram.bot").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 # ====================== CONFIG ======================
@@ -75,6 +81,12 @@ def save_stats():
             json.dump(stats, f)
     except Exception as e:
         logger.error(f"Ошибка сохранения статистики: {e}")
+
+# ====================== CACHE ======================
+from cachetools import TTLCache
+response_cache = TTLCache(maxsize=1000, ttl=3600)
+
+
 def preprocess(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
 
@@ -279,9 +291,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.11 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("2.12 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
