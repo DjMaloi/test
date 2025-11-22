@@ -22,20 +22,14 @@ from groq import AsyncGroq
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-# ====================== SSL ФИКС ======================
+# ====================== SSL FIX ======================
 ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
-# ====================== ЛОГИ ======================
+# ====================== LOGGING ======================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-telegram_logger = logging.getLogger("telegram")
-telegram_logger.setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("requests").setLevel(logging.WARNING)
-logging.getLogger("telegram.bot").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# ====================== КОНФИГ ======================
+# ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
@@ -61,39 +55,8 @@ if errors:
     logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
     exit(1)
 
-# ====================== ПАУЗА И СТАТИСТИКА ======================
-PAUSE_FILE = "/app/paused.flag"
-STATS_FILE = "/app/stats.json"
-
-def is_paused() -> bool:
-    return os.path.exists(PAUSE_FILE)
-
-def set_paused(state: bool):
-    if state:
-        open(PAUSE_FILE, "w").close()
-        logger.info("БОТ НА ПАУЗЕ — отвечает только админам")
-    else:
-        try:
-            os.remove(PAUSE_FILE)
-        except:
-            pass
-        logger.info("Пауза снята")
-
+# ====================== STATS ======================
 stats = {"total": 0, "cached": 0, "groq": 0, "vector": 0, "keyword": 0}
-if os.path.exists(STATS_FILE):
-    try:
-        with open(STATS_FILE, "r", encoding="utf-8") as f:
-            stats = json.load(f)
-    except:
-        pass
-
-def save_stats():
-    try:
-        with open(STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(stats, f, ensure_ascii=False)
-    except:
-        pass
-
 response_cache = TTLCache(maxsize=5000, ttl=86400)
 
 # ====================== GOOGLE SHEETS ======================
@@ -118,6 +81,9 @@ collection_technical = chroma_client_technical.get_or_create_collection("technic
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 GROQ_SEM = asyncio.Semaphore(8)
 
+# ====================== EMBEDDERS ======================
+embedder_general = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
+embedder_technical = SentenceTransformer("all-mpnet-base-v2", device="cpu")
 def preprocess(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
 
@@ -127,7 +93,40 @@ async def safe_typing(bot, chat_id):
     except:
         pass
 
-# ====================== ОБРАБОТКА СООБЩЕНИЙ ======================
+# ====================== UPDATE VECTOR DB ======================
+async def update_vector_db():
+    try:
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="A:B").execute()
+        values = result.get("values", [])
+        if not values:
+            logger.warning("Google Sheets пустой")
+            return
+
+        # очищаем коллекции
+        collection_general.delete()
+        collection_technical.delete()
+
+        for row in values:
+            if len(row) >= 2:
+                keyword, answer = row[0].strip(), row[1].strip()
+                emb_general = embedder_general.encode(keyword).tolist()
+                emb_technical = embedder_technical.encode(keyword).tolist()
+                collection_general.add(
+                    documents=[keyword],
+                    metadatas=[{"question": keyword, "answer": answer}],
+                    embeddings=[emb_general]
+                )
+                collection_technical.add(
+                    documents=[keyword],
+                    metadatas=[{"question": keyword, "answer": answer}],
+                    embeddings=[emb_technical]
+                )
+
+        logger.info(f"Загружено {len(values)} записей из Google Sheets в ChromaDB")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
+
+# ====================== MESSAGE HANDLER ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -136,7 +135,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
 
-    # === ЛОГИРУЕМ КАЖДЫЙ ВХОДЯЩИЙ ЗАПРОС ===
     user = update.effective_user
     username = f"@{user.username}" if user.username else ""
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -147,30 +145,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_stats()
 
     clean_text = preprocess(raw_text)
-    # Сохраняем историю запросов
-    user_id = update.effective_user.id
-    user_history = get_user_context(user_id)
-    user_history.append(raw_text)
-    set_user_context(user_id, user_history[-5:])  # Храним только последние 5 запросов
-    
-    previous_queries = get_user_context(user_id)
-    if previous_queries:
-        additional_terms = " ".join(previous_queries)
-        clean_text += " " + additional_terms  # Добавляем к запросу
-
-    # Проверяем, является ли запрос техническим
-    is_technical = match_technical_problem(raw_text)
-
-    # Выбираем модель в зависимости от типа запроса
-    def get_embedder(is_technical: bool = False):
-        if is_technical:
-            return SentenceTransformer("all-mpnet-base-v2", device="cpu")
-        return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
-
-    embedder = get_embedder(is_technical)
 
     cache_key = md5(clean_text.encode()).hexdigest()
-
     if cache_key in response_cache:
         stats["cached"] += 1
         save_stats()
@@ -182,129 +158,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best_answer = None
     source = "fallback"
 
-    if collection_general and collection_general.count() > 0:
-        try:
-            emb = embedder.encode(clean_text).tolist()
-            results = collection_general.query(
-                query_embeddings=[emb],
-                n_results=10,
-                include=["metadatas", "distances"]
-            )
-            distances = results["distances"][0]
-            metadatas = results["metadatas"][0]
+    # === Google Sheets поиск ===
+    try:
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="A:B").execute()
+        values = result.get("values", [])
+        for row in values:
+            if len(row) >= 2:
+                keyword, answer = row[0].strip().lower(), row[1].strip()
+                if keyword in clean_text:
+                    best_answer = answer
+                    source = "keyword"
+                    stats["keyword"] += 1
+                    break
+    except Exception as e:
+        logger.error(f"Ошибка Google Sheets: {e}", exc_info=True)
 
-            # Векторный поиск для общего хранилища
-            for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
-                q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
+    # === Векторный поиск ===
+    if not best_answer and collection_general and collection_general.count() > 0:
+        try:
+            emb = embedder_general.encode(clean_text).tolist()
+            results = collection_general.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
+            for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
                 if dist < 0.4 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
-
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
     if not best_answer and collection_technical and collection_technical.count() > 0:
         try:
-            emb = embedder.encode(clean_text).tolist()
-            results = collection_technical.query(
-                query_embeddings=[emb],
-                n_results=10,
-                include=["metadatas", "distances"]
-            )
-            distances = results["distances"][0]
-            metadatas = results["metadatas"][0]
-
-            # Векторный поиск для технического хранилища
-            for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
-                q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
+            emb = embedder_technical.encode(clean_text).tolist()
+            results = collection_technical.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
+            for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
                 if dist < 0.4 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
-
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
-    # Кэшируем ответ и отправляем
+    # === Отправка ответа ===
     if best_answer:
         response_cache[cache_key] = best_answer
         await context.bot.send_message(chat_id=update.effective_chat.id, text=best_answer)
 
-# ====================== ЗАГРУЗКА БАЗЫ (обновление данных) ======================
-async def update_vector_db():
-    global collection_general, collection_technical
-    logger.info("=== Загрузка базы знаний ===")
-
-    # Загрузка данных для общей базы
-    try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="GeneralSupport!A:B").execute()
-        values = result.get("values", [])
-        logger.info(f"Общее хранилище: Получено строк: {len(values)}")
-
-        if len(values) < 2:
-            logger.warning("Таблица общего хранилища пуста")
-            collection_general = None
-            return
-
-        docs, ids, metadatas = [], [], []
-        for i, row in enumerate(values[1:], start=1):
-            if len(row) < 2: continue
-            q = row[0].strip()
-            a = row[1].strip()
-            if q and a:
-                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
-                ids.append(f"general_kb_{i}")
-                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
-
-        try:
-            chroma_client_general.delete_collection("general_kb")
-        except Exception as e:
-            logger.warning(f"Не удалось удалить старую коллекцию general_kb: {e}")
-
-        collection_general = chroma_client_general.get_or_create_collection("general_kb", metadata={"hnsw:space": "cosine"})
-        collection_general.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"БАЗА ОБЩЕГО ХРАНИЛИЩА ЗАГРУЖЕНА: {len(docs)} записей ✅")
-
-    except Exception as e:
-        logger.error(f"Ошибка загрузки общего хранилища: {e}", exc_info=True)
-        collection_general = None
-
-    # Загрузка данных для технической базы
-    try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="TechnicalSupport!A:B").execute()
-        values = result.get("values", [])
-        logger.info(f"Техническое хранилище: Получено строк: {len(values)}")
-
-        if len(values) < 2:
-            logger.warning("Таблица технического хранилища пуста")
-            collection_technical = None
-            return
-
-        docs, ids, metadatas = [], [], []
-        for i, row in enumerate(values[1:], start=1):
-            if len(row) < 2: continue
-            q = row[0].strip()
-            a = row[1].strip()
-            if q and a:
-                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
-                ids.append(f"technical_kb_{i}")
-                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
-
-        try:
-            chroma_client_technical.delete_collection("technical_kb")
-        except Exception as e:
-            logger.warning(f"Не удалось удалить старую коллекцию technical_kb: {e}")
-
-        collection_technical = chroma_client_technical.get_or_create_collection("technical_kb", metadata={"hnsw:space": "cosine"})
-        collection_technical.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"БАЗА ТЕХНИЧЕСКОГО ХРАНИЛИЩА ЗАГРУЖЕНА: {len(docs)} записей ✅")
-
-    except Exception as e:
-        logger.error(f"Ошибка загрузки технического хранилища: {e}", exc_info=True)
-        collection_technical = None
-
-# ====================== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ======================
+# ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -315,30 +214,34 @@ async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
             reply_markup=keyboard
         )
-
-# ====================== АДМИНКИ ======================
+# ====================== АДМИН-КОМАНДЫ ======================
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     await update_vector_db()
     await update.message.reply_text("База перезагружена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     set_paused(True)
     await update.message.reply_text("Бот на паузе — обычные пользователи не получают ответы")
 
 async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     set_paused(False)
     await update.message.reply_text("Бот снова работает")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS: return
+    if update.effective_user.id not in ADMIN_IDS:
+        return
     paused = "Пауза" if is_paused() else "Работает"
-    count = collection.count() if collection else 0
+    count_general = collection_general.count() if collection_general else 0
+    count_technical = collection_technical.count() if collection_technical else 0
     await update.message.reply_text(
         f"Статус: {paused}\n"
-        f"Записей: {count}\n"
+        f"Записей: общая={count_general}, тех={count_technical}\n"
         f"Запросов: {stats['total']} (кэш: {stats['cached']})\n"
         f"Вектор: {stats['vector']} | Ключи: {stats['keyword']} | Groq: {stats['groq']}"
     )
@@ -354,22 +257,25 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
+    # блокируем личные чаты для не-админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
 
+    # обработка сообщений в группах и от админов
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & 
+        filters.TEXT & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
     app.add_handler(MessageHandler(
-        filters.CAPTION & ~filters.COMMAND & 
+        filters.CAPTION & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
 
+    # команды админов
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
@@ -377,8 +283,9 @@ if __name__ == "__main__":
 
     app.add_error_handler(error_handler)
 
+    # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.7 Бот запущен — новая логика, 2 языковые базы")
+    logger.info("2.8 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
