@@ -15,11 +15,17 @@ ENV PATH="/root/.local/bin:${PATH}"
 # Копируем код бота
 COPY . .
 
-# Отать Chroma от пересоздания
+# Указываем переменные окружения для хранилищ
+ENV GENERAL_KB_PATH="/app/chroma/general_kb"
+ENV TECHNICAL_KB_PATH="/app/chroma/technical_kb"
+
+# Отать Chroma от пересоздания, создаём том для хранилищ
 VOLUME /app/chroma
 
+# Установить переменные окружения для работы Python
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     ANONYMIZED_TELEMETRY=False
 
+# Запуск бота
 CMD ["python", "bot.py"]
