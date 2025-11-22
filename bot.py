@@ -14,7 +14,6 @@ from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
-    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -106,46 +105,14 @@ service = build("sheets", "v4", credentials=creds)
 sheet = service.spreadsheets()
 
 # ====================== CHROMA ======================
-chroma_client = chromadb.PersistentClient(path="/app/chroma")
-collection = None
-embedder = None
+general_kb_path = os.getenv("GENERAL_KB_PATH", "/app/chroma/general_kb")
+technical_kb_path = os.getenv("TECHNICAL_KB_PATH", "/app/chroma/technical_kb")
 
-# ====================== ЗАГРУЗКА БАЗЫ ======================
-async def update_vector_db():
-    global collection
-    logger.info("=== Загрузка базы знаний ===")
-    try:
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Support!A:B").execute()
-        values = result.get("values", [])
-        logger.info(f"Получено строк: {len(values)}")
+chroma_client_general = chromadb.PersistentClient(path=general_kb_path)
+chroma_client_technical = chromadb.PersistentClient(path=technical_kb_path)
 
-        if len(values) < 2:
-            logger.warning("Таблица пуста")
-            collection = None
-            return
-
-        docs, ids, metadatas = [], [], []
-        for i, row in enumerate(values[1:], start=1):
-            if len(row) < 2: continue
-            q = row[0].strip()
-            a = row[1].strip()
-            if q and a:
-                docs.append(q)
-                ids.append(f"kb_{i}")
-                metadatas.append({"question": q.split("\n")[0], "answer": a})
-
-        try:
-            chroma_client.delete_collection("support_kb")
-        except:
-            pass
-
-        collection = chroma_client.get_or_create_collection("support_kb", metadata={"hnsw:space": "cosine"})
-        collection.add(documents=docs, ids=ids, metadatas=metadatas)
-        logger.info(f"БАЗА ЗАГРУЖЕНА: {len(docs)} записей ✅")
-
-    except Exception as e:
-        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
-        collection = None
+collection_general = chroma_client_general.get_or_create_collection("general_kb", metadata={"hnsw:space": "cosine"})
+collection_technical = chroma_client_technical.get_or_create_collection("technical_kb", metadata={"hnsw:space": "cosine"})
 
 # ====================== GROQ ======================
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
@@ -160,41 +127,7 @@ async def safe_typing(bot, chat_id):
     except:
         pass
 
-# ====================== ПРОВЕРКА ТЕХНИЧЕСКИХ ПРОБЛЕМ ======================
-def match_technical_problem(text: str) -> bool:
-    patterns = [
-        r"(пк|компьютер|биос|экран|перезагрузка|ошибка|запуск)",
-        r"(не работает|плохо работает|синий экран|зависает)",
-    ]
-    return any(re.search(pattern, text.lower()) for pattern in patterns)
-
-# ====================== ХРАНЕНИЕ КОНТЕКСТА ПОЛЬЗОВАТЕЛЯ =====================
-user_context = {}
-
-def get_user_context(user_id: int):
-    return user_context.get(user_id, [])
-
-def set_user_context(user_id: int, context: list):
-    user_context[user_id] = context
-
-# ====================== ОПРОС ДЛЯ УТОЧНЕНИЯ ВОПРОСА ======================
-async def ask_for_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Да, это техническая проблема", callback_data="tech")],
-        [InlineKeyboardButton("Нет", callback_data="non_tech")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Вы хотите сообщить о технической проблеме?", reply_markup=reply_markup)
-
-async def handle_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    choice = query.data
-    if choice == "tech":
-        await handle_technical_query(update, context)
-    else:
-        await handle_non_technical_query(update, context)
-
-# ====================== ОБРАБОТКА СОобщЕНИЙ ======================
+# ====================== ОБРАБОТКА СООБЩЕНИЙ ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -203,6 +136,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
 
+    # === ЛОГИРУЕМ КАЖДЫЙ ВХОДЯЩИЙ ЗАПРОС ===
     user = update.effective_user
     username = f"@{user.username}" if user.username else ""
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -213,25 +147,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_stats()
 
     clean_text = preprocess(raw_text)
+    # Сохраняем историю запросов
     user_id = update.effective_user.id
     user_history = get_user_context(user_id)
     user_history.append(raw_text)
     set_user_context(user_id, user_history[-5:])  # Храним только последние 5 запросов
-
+    
     previous_queries = get_user_context(user_id)
     if previous_queries:
         additional_terms = " ".join(previous_queries)
-        clean_text += " " + additional_terms
+        clean_text += " " + additional_terms  # Добавляем к запросу
 
     # Проверяем, является ли запрос техническим
     is_technical = match_technical_problem(raw_text)
 
-    # Загружаем соответствующую модель
-    embedder_default = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
-    embedder_technical = SentenceTransformer("all-mpnet-base-v2", device="cpu")
-
+    # Выбираем модель в зависимости от типа запроса
     def get_embedder(is_technical: bool = False):
-        return embedder_technical if is_technical else embedder_default
+        if is_technical:
+            return SentenceTransformer("all-mpnet-base-v2", device="cpu")
+        return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
+
+    embedder = get_embedder(is_technical)
 
     cache_key = md5(clean_text.encode()).hexdigest()
 
@@ -246,10 +182,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     best_answer = None
     source = "fallback"
 
-    if collection and collection.count() > 0:
+    if collection_general and collection_general.count() > 0:
         try:
-            emb = get_embedder(is_technical).encode(clean_text).tolist()
-            results = collection.query(
+            emb = embedder.encode(clean_text).tolist()
+            results = collection_general.query(
                 query_embeddings=[emb],
                 n_results=10,
                 include=["metadatas", "distances"]
@@ -257,90 +193,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             distances = results["distances"][0]
             metadatas = results["metadatas"][0]
 
-            top_log = []
-            selected_dist = None
-            selected_preview = None
-
-            # Векторный поиск
+            # Векторный поиск для общего хранилища
             for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
                 q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
-                top_log.append(f"#{i} dist={dist:.4f} \"{q_preview}\"")
-
                 if dist < 0.4 and best_answer is None:
                     best_answer = meta["answer"]
                     source = "vector"
                     stats["vector"] += 1
-                    selected_dist = dist
-                    selected_preview = q_preview
-
-            if best_answer:
-                logger.info(f"ВЕКТОР ✓ | distance={selected_dist:.4f} | user={user.id} ({display_name}) | "
-                            f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
-                            f"→ \"{selected_preview}\" | топ-3: {' | '.join(top_log[:3])}")
-            else:
-                best_dist = distances[0] if distances else 1.0
-                best_q = metadatas[0]["question"].split("\n")[0][:80] if metadatas else "—"
-                logger.info(f"ВЕКТОР ✗ (порог >0.4) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
-                            f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
-                            f"топ-5: {' | '.join(top_log[:5])}")
-
-                # Ключевой поиск, если вектор не нашёл
-                if not best_answer:
-                    words = [w for w in clean_text.split() if len(w) > 3]
-                    all_meta = collection.get(include=["metadatas"])["metadatas"]
-                    for meta in all_meta:
-                        # Ищем совпадения по ключевым словам
-                        if any(w in preprocess(meta["question"]) for w in words):
-                            best_answer = meta["answer"]
-                            source = "keyword"
-                            stats["keyword"] += 1
-                            keyword_q = meta["question"].split("\n")[0][:80]
-                            logger.info(f"КЛЮЧЕВОЙ ПОИСК ✓ | user={user.id} ({display_name}) | "
-                                        f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | → \"{keyword_q}\"")
-                            break
 
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
-    if not best_answer:
-        return
+    if not best_answer and collection_technical and collection_technical.count() > 0:
+        try:
+            emb = embedder.encode(clean_text).tolist()
+            results = collection_technical.query(
+                query_embeddings=[emb],
+                n_results=10,
+                include=["metadatas", "distances"]
+            )
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
 
-    reply = best_answer
+            # Векторный поиск для технического хранилища
+            for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
+                q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
+                if dist < 0.4 and best_answer is None:
+                    best_answer = meta["answer"]
+                    source = "vector"
+                    stats["vector"] += 1
 
-    # Улучшаем через Groq, если ответ короткий
-    if source != "fallback" and len(best_answer) < 1200:
-        prompt = f"""
-        Используй текст полностью, не сокращая и не удаляя ссылки в сообщении. Сделай ответ лаконичным и точным, не изменяя смысл.
-        Оригинал:
-        {best_answer}
-        Вопрос: {raw_text}
-        Ответ:
-        """
-        async with GROQ_SEM:
-            stats["groq"] += 1
-            save_stats()
-            try:
-                resp = await asyncio.wait_for(
-                    groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
-                        messages=[{"role": "system", "content": prompt}],
-                        max_tokens=500,
-                        temperature=0.2,
-                    ),
-                    timeout=20
-                )
-                new = resp.choices[0].message.content.strip()
-                if 15 < len(new) < len(best_answer) * 2:
-                    reply = new
-            except Exception as e:
-                logger.warning(f"Groq упал: {e}")
+        except Exception as e:
+            logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
     # Кэшируем ответ и отправляем
-    response_cache[cache_key] = reply
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+    if best_answer:
+        response_cache[cache_key] = best_answer
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=best_answer)
 
-
-# ====================== БЛОКИРОВКА ЛИЧКИ ======================
+# ====================== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -351,7 +242,6 @@ async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
             reply_markup=keyboard
         )
-
 
 # ====================== АДМИНКИ ======================
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,25 +281,22 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
-    # Блокировка лички для всех, кроме админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
         block_private
     ))
 
-    # Основная обработка — только группы + админы в личке
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & 
+        filters.TEXT & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
     app.add_handler(MessageHandler(
-        filters.CAPTION & ~filters.COMMAND & 
+        filters.CAPTION & ~filters.COMMAND &
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
 
-    # Админ команды
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
@@ -419,6 +306,6 @@ if __name__ == "__main__":
 
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("Бот 2.5 запущен — пауза работает, Alt+Enter поддерживается, всё идеально! Новая логика с кнопками")
+    logger.info("2.6 Бот запущен — новая логика, 2 языковые базы")
 
     app.run_polling(drop_pending_updates=True)
