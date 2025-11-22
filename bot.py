@@ -345,7 +345,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = best_answer
     if source != "fallback" and best_answer and len(best_answer) < 1200:
         system_prompt = (
-            "Ты помощник службы поддержки. Отвечай точно как в базе сильно не сокращая,но по делу и только по фактам.\n\n"
+            "Ты помощник службы поддержки. Отвечай точно как в базе сильно не сокращая и не удаляя ссылки,но по делу и только по фактам.\n\n"
             "Правила:\n"
             "1) Не придумывай. Если недостаточно данных — ответ: \"Не знаю\".\n"
             "2) Сохраняй все ссылки и технические обозначения как есть.\n"
@@ -517,4 +517,5 @@ if __name__ == "__main__":
     logger.info("3.11 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
