@@ -8,9 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt  # Без флага --user
 FROM python:3.12-slim
 WORKDIR /app
 
-# Копируем только установленные пакеты из builder'а
-COPY --from=builder /root/.local /root/.local
-ENV PATH="/root/.local/bin:${PATH}"
+# Копируем установленные пакеты и исполнимые файлы из builder'а
+COPY --from=builder /usr/local /usr/local  # Это копирует системные пакеты и исполнимые файлы
 
 # Копируем код бота
 COPY . .
