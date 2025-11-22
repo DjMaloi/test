@@ -14,9 +14,9 @@ from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
-    CallbackQueryHandler
 )
 from telegram.request import HTTPXRequest
 from groq import AsyncGroq
@@ -160,8 +160,7 @@ async def safe_typing(bot, chat_id):
     except:
         pass
 
-#=================Добавляем функцию для проверки, является ли запрос техническим=======
-
+# ====================== ПРОВЕРКА ТЕХНИЧЕСКИХ ПРОБЛЕМ ======================
 def match_technical_problem(text: str) -> bool:
     patterns = [
         r"(пк|компьютер|биос|экран|перезагрузка|ошибка|запуск)",
@@ -170,7 +169,6 @@ def match_technical_problem(text: str) -> bool:
     return any(re.search(pattern, text.lower()) for pattern in patterns)
 
 # ====================== ХРАНЕНИЕ КОНТЕКСТА ПОЛЬЗОВАТЕЛЯ =====================
-
 user_context = {}
 
 def get_user_context(user_id: int):
@@ -192,14 +190,11 @@ async def handle_clarification(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     choice = query.data
     if choice == "tech":
-        # Проводим поиск с учетом, что это техническая проблема
         await handle_technical_query(update, context)
     else:
-        # Проводим обычный поиск
         await handle_non_technical_query(update, context)
 
 # ====================== ОБРАБОТКА СОобщЕНИЙ ======================
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
@@ -231,18 +226,162 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем, является ли запрос техническим
     is_technical = match_technical_problem(raw_text)
 
-    if is_technical:
-        await ask_for_clarification(update, context)
+    # Загружаем соответствующую модель
+    embedder_default = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
+    embedder_technical = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+
+    def get_embedder(is_technical: bool = False):
+        return embedder_technical if is_technical else embedder_default
+
+    cache_key = md5(clean_text.encode()).hexdigest()
+
+    if cache_key in response_cache:
+        stats["cached"] += 1
+        save_stats()
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=response_cache[cache_key])
         return
 
-    # Выбор модели для поиска
-    def get_embedder(is_technical: bool = False):
-        return SentenceTransformer("all-mpnet-base-v2" if is_technical else "paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
+    await safe_typing(context.bot, update.effective_chat.id)
 
-    embedder = get_embedder(is_technical)
-    emb = embedder.encode(clean_text).tolist()
+    best_answer = None
+    source = "fallback"
 
-    # Ваш код для поиска в базе данных...
+    if collection and collection.count() > 0:
+        try:
+            emb = get_embedder(is_technical).encode(clean_text).tolist()
+            results = collection.query(
+                query_embeddings=[emb],
+                n_results=10,
+                include=["metadatas", "distances"]
+            )
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
+
+            top_log = []
+            selected_dist = None
+            selected_preview = None
+
+            # Векторный поиск
+            for i, (dist, meta) in enumerate(zip(distances, metadatas), 1):
+                q_preview = meta["question"].split("\n")[0][:80].replace("\n", " ")
+                top_log.append(f"#{i} dist={dist:.4f} \"{q_preview}\"")
+
+                if dist < 0.4 and best_answer is None:
+                    best_answer = meta["answer"]
+                    source = "vector"
+                    stats["vector"] += 1
+                    selected_dist = dist
+                    selected_preview = q_preview
+
+            if best_answer:
+                logger.info(f"ВЕКТОР ✓ | distance={selected_dist:.4f} | user={user.id} ({display_name}) | "
+                            f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
+                            f"→ \"{selected_preview}\" | топ-3: {' | '.join(top_log[:3])}")
+            else:
+                best_dist = distances[0] if distances else 1.0
+                best_q = metadatas[0]["question"].split("\n")[0][:80] if metadatas else "—"
+                logger.info(f"ВЕКТОР ✗ (порог >0.4) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
+                            f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
+                            f"топ-5: {' | '.join(top_log[:5])}")
+
+                # Ключевой поиск, если вектор не нашёл
+                if not best_answer:
+                    words = [w for w in clean_text.split() if len(w) > 3]
+                    all_meta = collection.get(include=["metadatas"])["metadatas"]
+                    for meta in all_meta:
+                        # Ищем совпадения по ключевым словам
+                        if any(w in preprocess(meta["question"]) for w in words):
+                            best_answer = meta["answer"]
+                            source = "keyword"
+                            stats["keyword"] += 1
+                            keyword_q = meta["question"].split("\n")[0][:80]
+                            logger.info(f"КЛЮЧЕВОЙ ПОИСК ✓ | user={user.id} ({display_name}) | "
+                                        f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | → \"{keyword_q}\"")
+                            break
+
+        except Exception as e:
+            logger.error(f"Chroma ошибка: {e}", exc_info=True)
+
+    if not best_answer:
+        return
+
+    reply = best_answer
+
+    # Улучшаем через Groq, если ответ короткий
+    if source != "fallback" and len(best_answer) < 1200:
+        prompt = f"""
+        Используй текст полностью, не сокращая и не удаляя ссылки в сообщении. Сделай ответ лаконичным и точным, не изменяя смысл.
+        Оригинал:
+        {best_answer}
+        Вопрос: {raw_text}
+        Ответ:
+        """
+        async with GROQ_SEM:
+            stats["groq"] += 1
+            save_stats()
+            try:
+                resp = await asyncio.wait_for(
+                    groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "system", "content": prompt}],
+                        max_tokens=500,
+                        temperature=0.2,
+                    ),
+                    timeout=20
+                )
+                new = resp.choices[0].message.content.strip()
+                if 15 < len(new) < len(best_answer) * 2:
+                    reply = new
+            except Exception as e:
+                logger.warning(f"Groq упал: {e}")
+
+    # Кэшируем ответ и отправляем
+    response_cache[cache_key] = reply
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+
+
+# ====================== БЛОКИРОВКА ЛИЧКИ ======================
+async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_paused() and update.effective_user.id not in ADMIN_IDS:
+        return
+
+    if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
+        await update.message.reply_text(
+            "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
+            reply_markup=keyboard
+        )
+
+
+# ====================== АДМИНКИ ======================
+async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    await update_vector_db()
+    await update.message.reply_text("База перезагружена!")
+
+async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    set_paused(True)
+    await update.message.reply_text("Бот на паузе — обычные пользователи не получают ответы")
+
+async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    set_paused(False)
+    await update.message.reply_text("Бот снова работает")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS: return
+    paused = "Пауза" if is_paused() else "Работает"
+    count = collection.count() if collection else 0
+    await update.message.reply_text(
+        f"Статус: {paused}\n"
+        f"Записей: {count}\n"
+        f"Запросов: {stats['total']} (кэш: {stats['cached']})\n"
+        f"Вектор: {stats['vector']} | Ключи: {stats['keyword']} | Groq: {stats['groq']}"
+    )
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Глобальная ошибка: {context.error}", exc_info=True)
 
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
@@ -252,8 +391,34 @@ if __name__ == "__main__":
         .concurrent_updates(False)\
         .build()
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_clarification))
+    # Блокировка лички для всех, кроме админов
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.User(user_id=ADMIN_IDS),
+        block_private
+    ))
 
-    logger.info("Бот 2.4 запущен — пауза работает, Alt+Enter поддерживается, всё идеально! Новая логика")
+    # Основная обработка — только группы + админы в личке
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & 
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        handle_message
+    ))
+    app.add_handler(MessageHandler(
+        filters.CAPTION & ~filters.COMMAND & 
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        handle_message
+    ))
+
+    # Админ команды
+    app.add_handler(CommandHandler("reload", reload_kb))
+    app.add_handler(CommandHandler("pause", pause_bot))
+    app.add_handler(CommandHandler("resume", resume_bot))
+    app.add_handler(CommandHandler("status", status_cmd))
+
+    app.add_error_handler(error_handler)
+
+    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
+
+    logger.info("Бот 2.5 запущен — пауза работает, Alt+Enter поддерживается, всё идеально! Новая логика с кнопками")
+
     app.run_polling(drop_pending_updates=True)
