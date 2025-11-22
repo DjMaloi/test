@@ -337,7 +337,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Groq fallback ✓ | user={user.id} ({display_name}) | "
                     f"ответ={len(best_answer)} симв."
                 )
-except Exception as e:
+        except Exception as e:
     logger.error(f"Groq ошибка: {e}", exc_info=True)
     # резервный ответ — ближайший из базы (даже если выше порога)
     if 'distances' in locals() and 'metadatas' in locals() and metadatas:
@@ -529,3 +529,4 @@ if __name__ == "__main__":
     logger.info("3.12 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
