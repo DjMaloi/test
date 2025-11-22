@@ -246,10 +246,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
     app = Application.builder()\
-        .token(TELEGRAM_TOKEN)\
-        .request(HTTPXRequest(connection_pool_size=100))\
-        .concurrent_updates(False)\
-        .build()
+    .token(TELEGRAM_TOKEN)\
+    .concurrent_updates(False)\
+    .build()
 
     # блокируем личные чаты для не-админов
     app.add_handler(MessageHandler(
@@ -280,6 +279,7 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.10 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("2.11 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
