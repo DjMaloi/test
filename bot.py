@@ -293,18 +293,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Chroma ошибка (technical): {e}", exc_info=True)
 
-    # === Fallback через Groq ===
+       # === Fallback через Groq (с промтом) ===
     if not best_answer:
         try:
+            system_prompt = (
+                "Ты помощник службы поддержки. Отвечай коротко, по делу и только по фактам.\n\n"
+                "Правила:\n"
+                "1) Не придумывай. Если недостаточно данных — ответ: \"Не знаю\".\n"
+                "2) Сохраняй все ссылки и технические обозначения как есть.\n"
+                "3) Не добавляй предположений, историй, аналогий и лишних пояснений.\n"
+                "4) Формат: либо до 3 кратких предложений, либо до 5 маркеров.\n"
+                "5) Длина: не длиннее исходного ответа и не более 800 символов.\n"
+                "6) Если вопрос не относится к базе — \"Не знаю\"."
+            )
+
+            user_prompt = f"Вопрос: {raw_text}\n\nОтвет:"
+
             stats["groq"] += 1
             save_stats()
             completion = await groq_client.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": raw_text}]
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=400,
+                temperature=0.0,
+                top_p=0.1,
             )
-            best_answer = completion.choices[0].message.content
+            best_answer = completion.choices[0].message.content.strip()
             source = "groq"
-            logger.info("Ответ получен через Groq")
+            logger.info(
+                f"Groq fallback ✓ | user={user.id} ({display_name}) | "
+                f"ответ={len(best_answer)} симв."
+            )
         except Exception as e:
             logger.error(f"Groq ошибка: {e}", exc_info=True)
             best_answer = "Извините, я не смог найти ответ."
@@ -366,6 +388,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=update.effective_chat.id, text=reply[:4000])
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}", exc_info=True)
+
 
         
 # ====================== BLOCK PRIVATE ======================
@@ -453,9 +476,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.6 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.7 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
