@@ -5,12 +5,14 @@ WORKDIR /app
 # Копируем requirements.txt
 COPY requirements.txt .
 
-# Обновляем pip и устанавливаем зависимости
+# Обновляем pip
 RUN pip install --upgrade pip
-RUN pip install --cache-dir=/tmp/pip-cache -r requirements.txt
 
-# Добавляем отладочную команду, чтобы увидеть структуру директорий
-RUN echo "Проверка содержимого /usr/local:" && ls -la /usr/local
+# Ставим torch CPU отдельно, чтобы не тянулся CUDA
+RUN pip install --no-cache-dir torch==2.4.1+cpu --index-url https://download.pytorch.org/whl/cpu
+
+# Ставим остальные зависимости
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Этап 2: финальный образ
 FROM python:3.12-slim
@@ -26,7 +28,7 @@ COPY . .
 ENV GENERAL_KB_PATH="/app/chroma/general_kb"
 ENV TECHNICAL_KB_PATH="/app/chroma/technical_kb"
 
-# Отать Chroma от пересоздания, создаём том для хранилищ
+# Отдать Chroma от пересоздания, создаём том для хранилищ
 VOLUME /app/chroma
 
 # Установить переменные окружения для работы Python
