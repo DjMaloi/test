@@ -14,6 +14,12 @@ import chromadb
 from chromadb.config import Settings
 from groq import AsyncGroq
 
+# Используем уже существующую папку /app/chroma
+CHROMA_DIR = "/app/chroma"
+
+# Новый клиент ChromaDB (сохранение данных в указанной папке)
+chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+
 # ====================== LOGGING ======================
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -304,6 +310,7 @@ if __name__ == "__main__":
     logger.info("2.12.1 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
