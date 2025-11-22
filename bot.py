@@ -1,60 +1,50 @@
 import os
-import json
+import re
 import logging
 import asyncio
-import re
-import ssl
-import certifi
 from hashlib import md5
-from cachetools import TTLCache
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    CommandHandler,
-    filters,
-    ContextTypes,
-)
-from telegram.request import HTTPXRequest
-from groq import AsyncGroq
-import chromadb
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext._httpxrequest import HTTPXRequest
+from googleapiclient.discovery import build
+from google.oauth2.service_account import Credentials
+from cachetools import TTLCache
 from sentence_transformers import SentenceTransformer
-
-# ====================== SSL FIX ======================
-ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+import chromadb
+from chromadb.config import Settings
+from groq import AsyncGroq
 
 # ====================== LOGGING ======================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
-GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", "service_account.json")
-ADMIN_ID_STR = os.getenv("ADMIN_ID", "")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x]
 
-errors = []
-for var, name in [(TELEGRAM_TOKEN, "TELEGRAM_TOKEN"), (GROQ_API_KEY, "GROQ_API_KEY"), (SHEET_ID, "SHEET_ID")]:
-    if not var or not var.strip():
-        errors.append(f"{name} не задан")
-if not os.path.exists(GOOGLE_CREDENTIALS_PATH):
-    errors.append(f"Файл credentials не найден: {GOOGLE_CREDENTIALS_PATH}")
-if not ADMIN_ID_STR.strip():
-    errors.append("ADMIN_ID не задан")
-else:
-    try:
-        ADMIN_IDS = [int(i.strip()) for i in ADMIN_ID_STR.split(",") if i.strip()]
-        logger.info(f"Админы: {ADMIN_IDS}")
-    except ValueError:
-        errors.append("ADMIN_ID — некорректный формат")
+# ====================== GOOGLE SHEETS ======================
+creds = Credentials.from_service_account_file(
+    os.getenv("GOOGLE_CREDENTIALS_PATH"),
+    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+)
+sheet = build("sheets", "v4", credentials=creds).spreadsheets()
 
-if errors:
-    logger.error("ОШИБКИ ЗАПУСКА:\n" + "\n".join(f"→ {e}" for e in errors))
-    exit(1)
+# ====================== CHROMA ======================
+client = chromadb.PersistentClient(path="/app/chroma")
+collection_general = client.get_or_create_collection("general_kb")
+collection_technical = client.get_or_create_collection("technical_kb")
 
+# ====================== EMBEDDERS ======================
+embedder_general = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+embedder_technical = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+# ====================== GROQ ======================
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # ====================== PAUSE & STATS ======================
 PAUSE_FILE = "/app/paused.flag"
@@ -78,34 +68,13 @@ def set_paused(state: bool):
 
 stats = {"total": 0, "cached": 0, "groq": 0, "vector": 0, "keyword": 0}
 
-
-response_cache = TTLCache(maxsize=5000, ttl=86400)
-
-# ====================== GOOGLE SHEETS ======================
-creds = Credentials.from_service_account_file(
-    GOOGLE_CREDENTIALS_PATH,
-    scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
-)
-service = build("sheets", "v4", credentials=creds)
-sheet = service.spreadsheets()
-
-# ====================== CHROMA ======================
-general_kb_path = os.getenv("GENERAL_KB_PATH", "/app/chroma/general_kb")
-technical_kb_path = os.getenv("TECHNICAL_KB_PATH", "/app/chroma/technical_kb")
-
-chroma_client_general = chromadb.PersistentClient(path=general_kb_path)
-chroma_client_technical = chromadb.PersistentClient(path=technical_kb_path)
-
-collection_general = chroma_client_general.get_or_create_collection("general_kb", metadata={"hnsw:space": "cosine"})
-collection_technical = chroma_client_technical.get_or_create_collection("technical_kb", metadata={"hnsw:space": "cosine"})
-
-# ====================== GROQ ======================
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
-GROQ_SEM = asyncio.Semaphore(8)
-
-# ====================== EMBEDDERS ======================
-embedder_general = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2", device="cpu")
-embedder_technical = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+def save_stats():
+    try:
+        import json
+        with open(STATS_FILE, "w") as f:
+            json.dump(stats, f)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения статистики: {e}")
 def preprocess(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
 
@@ -124,9 +93,12 @@ async def update_vector_db():
             logger.warning("Google Sheets пустой")
             return
 
-        # очищаем коллекции корректно
-        collection_general.delete(where={})
-        collection_technical.delete(where={})
+        # пересоздаём коллекции вместо delete(where={})
+        client.delete_collection("general_kb")
+        client.delete_collection("technical_kb")
+        global collection_general, collection_technical
+        collection_general = client.create_collection("general_kb")
+        collection_technical = client.create_collection("technical_kb")
 
         for row in values:
             if len(row) >= 2:
@@ -268,7 +240,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Вектор: {stats['vector']} | Ключи: {stats['keyword']} | Groq: {stats['groq']}"
     )
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Глобальная ошибка: {context.error}", exc_info=True)
 
@@ -309,7 +280,6 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.9 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("2.10 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
-
