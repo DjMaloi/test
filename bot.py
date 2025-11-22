@@ -201,6 +201,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка Google Sheets: {e}", exc_info=True)
 
     # === Векторный поиск (general) ===
+    # === Векторный поиск (general) ===
     if not best_answer and collection_general and collection_general.count() > 0:
         try:
             emb = embedder_general.encode(clean_text).tolist()
@@ -209,11 +210,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n_results=10,
                 include=["metadatas", "distances"]
             )
-            for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
-                if dist < 0.7 and best_answer is None:
-                    best_answer = meta["answer"]
+
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
+
+            top_log = []
+            for d, m in zip(distances, metadatas):
+                preview = (m.get("answer") or "").replace("\n", " ")[:60]
+                top_log.append(f"{d:.3f}→{preview}")
+
+            selected_dist = None
+            selected_preview = None
+
+            for d, m in zip(distances, metadatas):
+                if d < 0.7 and best_answer is None:
+                    best_answer = m.get("answer")
                     source = "vector"
                     stats["vector"] += 1
+                    selected_dist = d
+                    selected_preview = (best_answer or "").replace("\n", " ")[:80]
+
+            if best_answer:
+                logger.info(
+                    f"ВЕКТОР ✓ | distance={selected_dist:.4f} | user={user.id} ({display_name}) | "
+                    f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
+                    f"→ \"{selected_preview}\" | топ-3: {' | '.join(top_log[:3])}"
+                )
+            else:
+                best_dist = distances[0] if distances else 1.0
+                best_q = (metadatas[0].get('answer') or '—').split("\n")[0][:80] if metadatas else "—"
+                logger.info(
+                    f"ВЕКТОР ✗ (порог >0.7) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
+                    f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
+                    f"топ-5: {' | '.join(top_log[:5])}"
+                )
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
@@ -226,13 +256,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n_results=10,
                 include=["metadatas", "distances"]
             )
-            for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
-                if dist < 0.7 and best_answer is None:
-                    best_answer = meta["answer"]
+
+            distances = results["distances"][0]
+            metadatas = results["metadatas"][0]
+
+            top_log = []
+            for d, m in zip(distances, metadatas):
+                preview = (m.get("answer") or "").replace("\n", " ")[:60]
+                top_log.append(f"{d:.3f}→{preview}")
+
+            selected_dist = None
+            selected_preview = None
+
+            for d, m in zip(distances, metadatas):
+                if d < 0.7 and best_answer is None:
+                    best_answer = m.get("answer")
                     source = "vector"
                     stats["vector"] += 1
+                    selected_dist = d
+                    selected_preview = (best_answer or "").replace("\n", " ")[:80]
+
+            if best_answer:
+                logger.info(
+                    f"ВЕКТОР (TECH) ✓ | distance={selected_dist:.4f} | user={user.id} ({display_name}) | "
+                    f"запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
+                    f"→ \"{selected_preview}\" | топ-3: {' | '.join(top_log[:3])}"
+                )
+            else:
+                best_dist = distances[0] if distances else 1.0
+                best_q = (metadatas[0].get('answer') or '—').split("\n")[0][:80] if metadatas else "—"
+                logger.info(
+                    f"ВЕКТОР (TECH) ✗ (порог >0.7) | лучший distance={best_dist:.4f} → \"{best_q}\" | "
+                    f"user={user.id} ({display_name}) | запрос=\"{raw_text[:100]}{'...' if len(raw_text)>100 else ''}\" | "
+                    f"топ-5: {' | '.join(top_log[:5])}"
+                )
         except Exception as e:
-            logger.error(f"Chroma ошибка: {e}", exc_info=True)
+            logger.error(f"Chroma ошибка (technical): {e}", exc_info=True)
 
     # === Fallback через Groq ===
     if not best_answer:
@@ -394,9 +453,10 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.5 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.6 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
