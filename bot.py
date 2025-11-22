@@ -450,6 +450,31 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Глобальная ошибка: {context.error}", exc_info=True)
 
+async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    response_cache.clear()
+    stats["cached"] = 0  # можно обнулить счётчик кэша
+    save_stats()
+    await update.message.reply_text("Кэш очищен!")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    commands_text = (
+        "📌 Доступные команды для админов:\n\n"
+        "/reload – перезагрузить базу\n"
+        "/pause – поставить бота на паузу\n"
+        "/resume – возобновить работу бота\n"
+        "/status – показать статус и статистику\n"
+        "/clearcache – очистить кэш ответов\n"
+        "/clearstats – обнулить статистику\n"
+        "/help – показать это меню\n"
+    )
+    await update.message.reply_text(commands_text)
+
+
+
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
     app = Application.builder()\
@@ -480,12 +505,16 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("clearcache", clear_cache))
+    app.add_handler(CommandHandler("help", help_cmd))
+
 
     app.add_error_handler(error_handler)
 
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.10 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.11 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
