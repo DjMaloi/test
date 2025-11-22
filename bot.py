@@ -338,22 +338,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"ответ={len(best_answer)} симв."
                 )
         except Exception as e:
-    logger.error(f"Groq ошибка: {e}", exc_info=True)
-    # резервный ответ — ближайший из базы (даже если выше порога)
-    if 'distances' in locals() and 'metadatas' in locals() and metadatas:
-        best_answer = metadatas[0].get("answer")
-        reply = f"⚠️ Groq недоступен. Похожий ответ из базы:\n\n{best_answer}"
-        source = "vector-fallback"
-        logger.info(
-            f"Groq недоступен → используем vector-fallback | user={user.id} ({display_name}) | "
-            f"ответ={len(best_answer)} симв."
-        )
-    else:
-        best_answer = None
-        reply = "Извините, я сейчас не могу найти ответ. Попробуйте переформулировать вопрос или обратитесь в поддержку."
-        source = "none"
-
-
+            logger.error(f"Groq ошибка: {e}", exc_info=True)
+            # резервный ответ — ближайший из базы (даже если выше порога)
+            if 'metadatas' in locals() and metadatas:
+                best_answer = metadatas[0].get("answer")
+                reply = f"⚠️ Groq недоступен. Похожий ответ из базы:\n\n{best_answer}"
+                source = "vector-fallback"
+                logger.info(
+                    f"Groq недоступен → используем vector-fallback | user={user.id} ({display_name}) | "
+                    f"ответ={len(best_answer)} симв."
+                )
+            else:
+                best_answer = None
+                reply = "Извините, я сейчас не могу найти ответ. Попробуйте переформулировать вопрос или обратитесь в поддержку."
+                source = "none"
 
     # === Улучшаем через Groq, если ответ короткий ===
     reply = best_answer
@@ -529,4 +527,5 @@ if __name__ == "__main__":
     logger.info("3.12 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
