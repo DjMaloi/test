@@ -35,7 +35,10 @@ logger = logging.getLogger(__name__)
 # Устанавливаем более высокий уровень логирования для telegram
 telegram_logger = logging.getLogger("telegram")
 telegram_logger.setLevel(logging.WARNING)  # Устанавливаем уровень WARNING или выше, чтобы убрать INFO логи
-
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("requests").setLevel(logging.WARNING)
+logging.getLogger("telegram.bot").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 # ====================== КОНФИГ ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -381,9 +384,10 @@ if __name__ == "__main__":
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
     #app.job_queue.run_repeating(lambda _: asyncio.create_task(update_vector_db()), interval=600, first=600)
 
-    logger.info("Бот 2.1 запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
+    logger.info("Бот 2.2 запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
