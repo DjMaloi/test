@@ -1,37 +1,27 @@
 import os
 import re
+import json
 import logging
 import asyncio
 from hashlib import md5
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-#from telegram.ext._httpxrequest import HTTPXRequest
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
 from cachetools import TTLCache
 from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.config import Settings
 from groq import AsyncGroq
-
-# Используем уже существующую папку /app/chroma
-CHROMA_DIR = "/app/chroma"
-
-# Новый клиент ChromaDB (сохранение данных в указанной папке)
-chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 
 # ====================== LOGGING ======================
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-# Отключаем лишние логи от telegram
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext._application").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext._updater").setLevel(logging.WARNING)
-logging.getLogger("telegram.bot").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -47,9 +37,11 @@ creds = Credentials.from_service_account_file(
 sheet = build("sheets", "v4", credentials=creds).spreadsheets()
 
 # ====================== CHROMA ======================
-client = chromadb.PersistentClient(path="/app/chroma")
-collection_general = client.get_or_create_collection("general_kb")
-collection_technical = client.get_or_create_collection("technical_kb")
+CHROMA_DIR = "/app/chroma"
+chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+
+collection_general = chroma_client.get_or_create_collection("general_kb")
+collection_technical = chroma_client.get_or_create_collection("technical_kb")
 
 # ====================== EMBEDDERS ======================
 embedder_general = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
@@ -63,11 +55,9 @@ PAUSE_FILE = "/app/paused.flag"
 STATS_FILE = "/app/stats.json"
 
 def is_paused() -> bool:
-    """Проверяет, находится ли бот на паузе"""
     return os.path.exists(PAUSE_FILE)
 
 def set_paused(state: bool):
-    """Включает или снимает паузу"""
     if state:
         open(PAUSE_FILE, "w").close()
         logger.info("БОТ НА ПАУЗЕ — отвечает только админам")
@@ -82,21 +72,13 @@ stats = {"total": 0, "cached": 0, "groq": 0, "vector": 0, "keyword": 0}
 
 def save_stats():
     try:
-        import json
         with open(STATS_FILE, "w") as f:
             json.dump(stats, f)
     except Exception as e:
         logger.error(f"Ошибка сохранения статистики: {e}")
 
 # ====================== CACHE ======================
-from cachetools import TTLCache
 response_cache = TTLCache(maxsize=1000, ttl=3600)
-
-# ====================== CHROMA CLIENT ======================
-chroma_client = chromadb.Client(Settings(
-    persist_directory="/app/chroma_db",   # папка для хранения базы
-    chroma_db_impl="duckdb+parquet"
-))
 
 def preprocess(text: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^а-яa-z0-9\s]', ' ', text.lower())).strip()
@@ -106,7 +88,6 @@ async def safe_typing(bot, chat_id):
         await bot.send_chat_action(chat_id=chat_id, action="typing")
     except:
         pass
-
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
 async def update_vector_db():
     global collection_general, collection_technical
@@ -114,38 +95,50 @@ async def update_vector_db():
         logger.info("Обновление базы знаний из Google Sheets...")
 
         # читаем данные из таблицы
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:A").execute()
-        general_rows = [row[0] for row in result.get("values", []) if row]
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:B").execute()
+        general_rows = result.get("values", [])
 
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:A").execute()
-        technical_rows = [row[0] for row in result.get("values", []) if row]
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:B").execute()
+        technical_rows = result.get("values", [])
 
         # пересоздаём коллекции
-        chroma_client.delete_collection("general")
-        chroma_client.delete_collection("technical")
+        try:
+            chroma_client.delete_collection("general_kb")
+        except:
+            pass
+        try:
+            chroma_client.delete_collection("technical_kb")
+        except:
+            pass
 
-        collection_general = chroma_client.create_collection("general")
-        collection_technical = chroma_client.create_collection("technical")
+        collection_general = chroma_client.create_collection("general_kb")
+        collection_technical = chroma_client.create_collection("technical_kb")
 
-        # добавляем данные с обязательными ids
+        # добавляем данные с ключами и ответами
         if general_rows:
+            keys = [row[0] for row in general_rows if len(row) > 0]
+            answers = [row[1] for row in general_rows if len(row) > 1]
             collection_general.add(
-                ids=[f"general_{i}" for i in range(len(general_rows))],
-                documents=general_rows,
-                embeddings=model.encode(general_rows).tolist()
+                ids=[f"general_{i}" for i in range(len(keys))],
+                documents=keys,
+                metadatas=[{"answer": ans} for ans in answers],
+                embeddings=embedder_general.encode(keys).tolist()
             )
 
         if technical_rows:
+            keys = [row[0] for row in technical_rows if len(row) > 0]
+            answers = [row[1] for row in technical_rows if len(row) > 1]
             collection_technical.add(
-                ids=[f"technical_{i}" for i in range(len(technical_rows))],
-                documents=technical_rows,
-                embeddings=model.encode(technical_rows).tolist()
+                ids=[f"technical_{i}" for i in range(len(keys))],
+                documents=keys,
+                metadatas=[{"answer": ans} for ans in answers],
+                embeddings=embedder_technical.encode(keys).tolist()
             )
 
         logger.info(f"База обновлена: общая={len(general_rows)}, тех={len(technical_rows)}")
 
     except Exception as e:
-        logger.error(f"Ошибка загрузки базы: {e}")
+        logger.error(f"Ошибка загрузки базы: {e}", exc_info=True)
 
 
 # ====================== MESSAGE HANDLER ======================
@@ -195,11 +188,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка Google Sheets: {e}", exc_info=True)
 
-    # === Векторный поиск ===
+    # === Векторный поиск (general) ===
     if not best_answer and collection_general and collection_general.count() > 0:
         try:
             emb = embedder_general.encode(clean_text).tolist()
-            results = collection_general.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
+            results = collection_general.query(
+                query_embeddings=[emb],
+                n_results=10,
+                include=["metadatas", "distances"]
+            )
             for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
                 if dist < 0.4 and best_answer is None:
                     best_answer = meta["answer"]
@@ -208,10 +205,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
+    # === Векторный поиск (technical) ===
     if not best_answer and collection_technical and collection_technical.count() > 0:
         try:
             emb = embedder_technical.encode(clean_text).tolist()
-            results = collection_technical.query(query_embeddings=[emb], n_results=10, include=["metadatas", "distances"])
+            results = collection_technical.query(
+                query_embeddings=[emb],
+                n_results=10,
+                include=["metadatas", "distances"]
+            )
             for dist, meta in zip(results["distances"][0], results["metadatas"][0]):
                 if dist < 0.4 and best_answer is None:
                     best_answer = meta["answer"]
@@ -224,18 +226,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if best_answer:
         response_cache[cache_key] = best_answer
         await context.bot.send_message(chat_id=update.effective_chat.id, text=best_answer)
-
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
         return
 
     if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]])
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]]
+        )
         await update.message.reply_text(
             "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
             reply_markup=keyboard
         )
+
 # ====================== АДМИН-КОМАНДЫ ======================
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -274,9 +278,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
     app = Application.builder()\
-    .token(TELEGRAM_TOKEN)\
-    .concurrent_updates(False)\
-    .build()
+        .token(TELEGRAM_TOKEN)\
+        .concurrent_updates(False)\
+        .build()
 
     # блокируем личные чаты для не-админов
     app.add_handler(MessageHandler(
@@ -305,16 +309,8 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
 
     # первая загрузка базы через 15 секунд после старта
-    app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
+    app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("2.12.1 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.0 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
-
-
-
-
-
-
-
-
