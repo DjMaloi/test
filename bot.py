@@ -231,6 +231,79 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response_cache[cache_key] = best_answer
         await context.bot.send_message(chat_id=update.effective_chat.id, text=best_answer)
 
+# ====================== ЗАГРУЗКА БАЗЫ (обновление данных) ======================
+async def update_vector_db():
+    global collection_general, collection_technical
+    logger.info("=== Загрузка базы знаний ===")
+
+    # Загрузка данных для общей базы
+    try:
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="GeneralSupport!A:B").execute()
+        values = result.get("values", [])
+        logger.info(f"Общее хранилище: Получено строк: {len(values)}")
+
+        if len(values) < 2:
+            logger.warning("Таблица общего хранилища пуста")
+            collection_general = None
+            return
+
+        docs, ids, metadatas = [], [], []
+        for i, row in enumerate(values[1:], start=1):
+            if len(row) < 2: continue
+            q = row[0].strip()
+            a = row[1].strip()
+            if q and a:
+                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
+                ids.append(f"general_kb_{i}")
+                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
+
+        try:
+            chroma_client_general.delete_collection("general_kb")
+        except Exception as e:
+            logger.warning(f"Не удалось удалить старую коллекцию general_kb: {e}")
+
+        collection_general = chroma_client_general.get_or_create_collection("general_kb", metadata={"hnsw:space": "cosine"})
+        collection_general.add(documents=docs, ids=ids, metadatas=metadatas)
+        logger.info(f"БАЗА ОБЩЕГО ХРАНИЛИЩА ЗАГРУЖЕНА: {len(docs)} записей ✅")
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки общего хранилища: {e}", exc_info=True)
+        collection_general = None
+
+    # Загрузка данных для технической базы
+    try:
+        result = sheet.values().get(spreadsheetId=SHEET_ID, range="TechnicalSupport!A:B").execute()
+        values = result.get("values", [])
+        logger.info(f"Техническое хранилище: Получено строк: {len(values)}")
+
+        if len(values) < 2:
+            logger.warning("Таблица технического хранилища пуста")
+            collection_technical = None
+            return
+
+        docs, ids, metadatas = [], [], []
+        for i, row in enumerate(values[1:], start=1):
+            if len(row) < 2: continue
+            q = row[0].strip()
+            a = row[1].strip()
+            if q and a:
+                docs.append(q)  # сюда попадает вся ячейка, включая \n от Alt+Enter
+                ids.append(f"technical_kb_{i}")
+                metadatas.append({"question": q.split("\n")[0], "answer": a})  # в логах первая строка
+
+        try:
+            chroma_client_technical.delete_collection("technical_kb")
+        except Exception as e:
+            logger.warning(f"Не удалось удалить старую коллекцию technical_kb: {e}")
+
+        collection_technical = chroma_client_technical.get_or_create_collection("technical_kb", metadata={"hnsw:space": "cosine"})
+        collection_technical.add(documents=docs, ids=ids, metadatas=metadatas)
+        logger.info(f"БАЗА ТЕХНИЧЕСКОГО ХРАНИЛИЩА ЗАГРУЖЕНА: {len(docs)} записей ✅")
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки технического хранилища: {e}", exc_info=True)
+        collection_technical = None
+
 # ====================== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
@@ -287,12 +360,12 @@ if __name__ == "__main__":
     ))
 
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND &
+        filters.TEXT & ~filters.COMMAND & 
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
     app.add_handler(MessageHandler(
-        filters.CAPTION & ~filters.COMMAND &
+        filters.CAPTION & ~filters.COMMAND & 
         (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
         handle_message
     ))
@@ -306,6 +379,6 @@ if __name__ == "__main__":
 
     app.job_queue.run_once(lambda _: asyncio.create_task(update_vector_db()), when=15)
 
-    logger.info("2.6 Бот запущен — новая логика, 2 языковые базы")
+    logger.info("2.7 Бот запущен — новая логика, 2 языковые базы")
 
     app.run_polling(drop_pending_updates=True)
