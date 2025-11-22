@@ -5,6 +5,8 @@ import logging
 import asyncio
 # Ограничитель параллельных запросов к Groq
 GROQ_SEM = asyncio.Semaphore(2)
+VECTOR_THRESHOLD = 0.7   # порог для векторного поиска
+# MAX_LEN = 4000           # лимит длины сообщения для Telegram
 from hashlib import md5
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -202,7 +204,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка Google Sheets: {e}", exc_info=True)
 
     # === Векторный поиск (general) ===
-    # === Векторный поиск (general) ===
     if not best_answer and collection_general and collection_general.count() > 0:
         try:
             emb = embedder_general.encode(clean_text).tolist()
@@ -224,7 +225,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected_preview = None
 
             for d, m in zip(distances, metadatas):
-                if d < 0.7 and best_answer is None:
+                if d < VECTOR_THRESHOLD and best_answer is None:
                     best_answer = m.get("answer")
                     source = "vector"
                     stats["vector"] += 1
@@ -270,7 +271,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             selected_preview = None
 
             for d, m in zip(distances, metadatas):
-                if d < 0.7 and best_answer is None:
+                if d < VECTOR_THRESHOLD and best_answer is None:
                     best_answer = m.get("answer")
                     source = "vector"
                     stats["vector"] += 1
@@ -336,9 +337,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Groq fallback ✓ | user={user.id} ({display_name}) | "
                     f"ответ={len(best_answer)} симв."
                 )
-        except Exception as e:
-            logger.error(f"Groq ошибка: {e}", exc_info=True)
-            best_answer = None
+except Exception as e:
+    logger.error(f"Groq ошибка: {e}", exc_info=True)
+    # резервный ответ — ближайший из базы (даже если выше порога)
+    if 'distances' in locals() and 'metadatas' in locals() and metadatas:
+        best_answer = metadatas[0].get("answer")
+        reply = f"⚠️ Groq недоступен. Похожий ответ из базы:\n\n{best_answer}"
+        source = "vector-fallback"
+        logger.info(
+            f"Groq недоступен → используем vector-fallback | user={user.id} ({display_name}) | "
+            f"ответ={len(best_answer)} симв."
+        )
+    else:
+        best_answer = None
+        reply = "Извините, я сейчас не могу найти ответ. Попробуйте переформулировать вопрос или обратитесь в поддержку."
+        source = "none"
+
 
 
     # === Улучшаем через Groq, если ответ короткий ===
@@ -398,8 +412,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=update.effective_chat.id, text=reply[:4000])
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}", exc_info=True)
-
-
         
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -514,8 +526,6 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.11 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.12 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
-
-
