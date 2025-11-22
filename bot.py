@@ -29,7 +29,7 @@ ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x]
 
 # ====================== GOOGLE SHEETS ======================
 creds = Credentials.from_service_account_file(
-    os.getenv("GOOGLE_CREDENTIALS"),
+    os.getenv("GOOGLE_CREDENTIALS", "/app/service_account.json"),
     scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
 )
 sheet = build("sheets", "v4", credentials=creds).spreadsheets()
@@ -282,6 +282,7 @@ if __name__ == "__main__":
     logger.info("2.11 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
