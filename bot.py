@@ -91,7 +91,7 @@ async def safe_typing(bot, chat_id):
     except:
         pass
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
-async def update_vector_db(context: ContextTypes.DEFAULT_TYPE):
+async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
     global collection_general, collection_technical
     try:
         logger.info("Обновление базы знаний из Google Sheets...")
@@ -488,6 +488,7 @@ if __name__ == "__main__":
     logger.info("3.8 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
 
 
