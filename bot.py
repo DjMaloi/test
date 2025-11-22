@@ -229,9 +229,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Chroma ошибка: {e}", exc_info=True)
 
     # === Отправка ответа ===
+      
+    # === Fallback через Groq ===
+    if not best_answer:
+        try:
+            stats["groq"] += 1
+            save_stats()
+            completion = await groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": raw_text}]
+            )
+            best_answer = completion.choices[0].message.content
+            source = "groq"
+            logger.info("Ответ получен через Groq")
+        except Exception as e:
+            logger.error(f"Groq ошибка: {e}", exc_info=True)
+            best_answer = "Извините, я не смог найти ответ."
+
     if best_answer:
         response_cache[cache_key] = best_answer
         await context.bot.send_message(chat_id=update.effective_chat.id, text=best_answer)
+
+        
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and update.effective_user.id not in ADMIN_IDS:
@@ -317,7 +336,8 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.1 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("3.2 Бот запущен — логика с Google Sheets и ChromaDB")
 
     app.run_polling(drop_pending_updates=True)
+
 
