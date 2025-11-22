@@ -29,6 +29,10 @@ ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=ce
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Устанавливаем более высокий уровень логирования для telegram
+telegram_logger = logging.getLogger("telegram")
+telegram_logger.setLevel(logging.WARNING)  # Устанавливаем уровень WARNING или выше, чтобы убрать INFO логи
+
 # ====================== КОНФИГ ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -372,3 +376,4 @@ if __name__ == "__main__":
     logger.info("Бот запущен — пауза работает, Alt+Enter поддерживается, всё идеально!")
 
     app.run_polling(drop_pending_updates=True)
+
