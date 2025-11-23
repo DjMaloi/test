@@ -764,7 +764,7 @@ async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Пользователь {user_id} удалён из списка администраторов")
 
 async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список администраторов"""
+    """Показывает список администраторов с никнеймами"""
     if update.effective_user.id not in ADMIN_IDS:
         return
     
@@ -772,10 +772,35 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📋 Список администраторов пуст")
         return
     
-    admin_list = "\n".join([f"  • {uid}" for uid in sorted(adminlist)])
-    await update.message.reply_text(
-        f"👨‍💼 АДМИНИСТРАТОРЫ ({len(adminlist)}):\n\n{admin_list}",
-    )
+    try:
+        admin_info = []
+        
+        # ✅ Гарантируй int и сортируй
+        for user_id in sorted([int(uid) for uid in adminlist]):
+            try:
+                user = await context.bot.get_chat(user_id)
+                
+                # Приоритет: @username > Full Name
+                if user.username:
+                    display = f"@{user.username}"
+                else:
+                    display = user.first_name or "Unknown"
+                    if user.last_name:
+                        display += f" {user.last_name}"
+                
+                admin_info.append(f"  • {user_id} ({display})")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось получить юзера {user_id}: {e}")
+                admin_info.append(f"  • {user_id} (⚠️ Ошибка)")
+        
+        message = f"👨‍💼 АДМИНИСТРАТОРЫ ({len(adminlist)}):\n\n" + "\n".join(admin_info)
+        await update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"❌ adminlist_cmd error: {e}")
+        await update.message.reply_text(f"⚠️ Системная ошибка: {str(e)}")
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список команд"""
