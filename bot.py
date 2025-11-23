@@ -785,7 +785,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cached_pct = (stats['cached'] / total * 100) if total > 0 else 0
     vector_pct = (stats['vector'] / total * 100) if total > 0 else 0
     
-        text = (
+text = (
         f"📊 СТАТУС БОТА\n\n"
         f"Состояние: {paused}\n"
         f"Записей в базе:\n"
@@ -1132,3 +1132,4 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
+
