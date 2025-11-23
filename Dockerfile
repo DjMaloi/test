@@ -87,7 +87,13 @@ def load_adminlist():
     try:
         if os.path.exists(ADMINLIST_FILE):
             with open(ADMINLIST_FILE, "r") as f:
-                adminlist = json.load(f)
+                data = json.load(f)
+                # Конвертируем старый format (list) в новый (dict)
+                if isinstance(data, list):
+                    adminlist = {str(uid): f"User_{uid}" for uid in data}
+                    save_adminlist()  # Сохраняем в новом формате
+                else:
+                    adminlist = data if isinstance(data, dict) else {}
                 logger.info(f"Список администраторов загружен: {len(adminlist)} пользователей")
         else:
             adminlist = {}
