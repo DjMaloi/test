@@ -9,7 +9,8 @@ COPY requirements.txt .
 RUN pip install --upgrade pip
 
 # Ставим остальные зависимости (torch установится с CPU индексом из requirements.txt)
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
+# RUN pip install --no-cache-dir -r requirements.txt
 
 # Этап 2: финальный образ
 FROM python:3.12-slim
@@ -45,3 +46,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 
 # Запуск бота
 CMD ["python", "bot.py"]
+
