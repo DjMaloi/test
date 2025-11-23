@@ -462,17 +462,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
 # ====================== BLOCK PRIVATE ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_paused() and update.effective_user.id not in ADMIN_IDS:
+    # Эта функция срабатывает только для неадминов в личных чатах
+    if is_paused():
         return
 
-    if update.effective_chat.type == "private" and update.effective_user.id not in ADMIN_IDS:
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]]
-        )
-        await update.message.reply_text(
-            "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
-            reply_markup=keyboard
-        )
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Связаться с поддержкой", url="https://t.me/alexeymaloi")]]
+    )
+    await update.message.reply_text(
+        "Писать боту в личку могут только администраторы.\nНужна помощь — нажми ниже:",
+        reply_markup=keyboard
+    )
 
 # ====================== АДМИН-КОМАНДЫ ======================
 async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -584,15 +584,17 @@ if __name__ == "__main__":
         block_private
     ))
 
-    # обработка сообщений в группах и от админов
+    # обработка сообщений в группах и от админов (включая личные чаты админов)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND &
-        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        ((filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.ChatType.PRIVATE) & filters.User(user_id=ADMIN_IDS)) |
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
         handle_message
     ))
     app.add_handler(MessageHandler(
         filters.CAPTION & ~filters.COMMAND &
-        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.User(user_id=ADMIN_IDS)),
+        ((filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP | filters.ChatType.PRIVATE) & filters.User(user_id=ADMIN_IDS)) |
+        (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP),
         handle_message
     ))
 
@@ -616,6 +618,6 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("4.0 БОТ с АдминЛистом")
+    logger.info("4.1 Добавлены Админы Групп, Админы бота продолжают получать сообщения в ЛС бота")
 
     app.run_polling(drop_pending_updates=True)
