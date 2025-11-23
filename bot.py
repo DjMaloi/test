@@ -197,12 +197,16 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
 # ====================== MESSAGE HANDLER ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    chat_type = update.effective_chat.type
     
-    # проверяем список администраторов
-    if is_admin_special(user_id):
-        logger.info(f"Пользователь {user_id} в списке администраторов — игнорируем")
-        return
+    # Логика игнорирования в зависимости от типа чата
+    if chat_type in ["group", "supergroup"]:
+        # В группах: игнорируем пользователей из adminlist.json
+        if is_admin_special(user_id):
+            logger.info(f"Пользователь {user_id} в списке администраторов — игнорируем в группе")
+            return
     
+    # Общая проверка паузы
     if is_paused() and user_id not in ADMIN_IDS:
         return
 
@@ -618,6 +622,6 @@ if __name__ == "__main__":
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("4.1 Добавлены Админы Групп, Админы бота продолжают получать сообщения в ЛС бота")
+    logger.info("4.2 Бот с Админами группы и Админами бота")
 
     app.run_polling(drop_pending_updates=True)
