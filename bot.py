@@ -104,20 +104,18 @@ def set_paused(state: bool):
 # ====================== УПРАВЛЕНИЕ АДМИНАМИ ======================
 adminlist = set()
 
-def load_adminlist():
-    """Загружает список администраторов из файла"""
-    global adminlist
+def load_adminlist() -> set:
+    """Загружает список админов из файла"""
     try:
-        if os.path.exists(ADMINLIST_FILE):
-            with open(ADMINLIST_FILE, "r") as f:
-                adminlist = set(json.load(f))
-                logger.info(f"✓ Список администраторов загружен: {len(adminlist)} польз.")
-        else:
-            adminlist = set()
-            logger.info("ℹ️ Файл администраторов не найден, создан пустой список")
+        with open("adminlist.json", "r") as f:
+            data = json.load(f)
+        # 🔧 ИСПРАВЛЕНИЕ: преобразуй строки в int
+        adminlist = {int(x) for x in data.get("admins", [])}
+        logger.info(f"✅ Загружено {len(adminlist)} админов: {adminlist}")
+        return adminlist
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки adminlist: {e}")
-        adminlist = set()
+        return set()
 
 def save_adminlist():
     """Сохраняет список администраторов в файл"""
@@ -457,6 +455,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главная функция обработки сообщений"""
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
+    
+    # 🔧 ТЕСТОВЫЙ ЛОГ
+    logger.info(f"🧪 adminlist = {adminlist}")
+    logger.info(f"🧪 user_id = {user_id}, in adminlist? {user_id in adminlist}")
     
     # ============ ЛОГИКА ДОСТУПА ============
     
