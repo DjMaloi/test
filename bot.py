@@ -106,6 +106,7 @@ adminlist = set()
 
 def load_adminlist() -> set:
     """Загружает список админов из файла"""
+    global adminlist
     try:
         logger.info(f"🔍 Ищу adminlist.json по пути: {ADMINLIST_FILE}")
         
@@ -115,28 +116,36 @@ def load_adminlist() -> set:
             data = json.load(f)
             logger.info(f"📄 Прочитан файл: {data}")
         
+        # ИЗМЕНЕНИЕ №1: поддержка формата {"admins": [...]}
         adminlist = {int(x) for x in data.get("admins", [])}
         logger.info(f"✅ Загружено {len(adminlist)} админов: {adminlist}")
         return adminlist
     
     except FileNotFoundError:
         logger.error(f"❌ Файл не найден: {ADMINLIST_FILE}")
-        return set()
+        adminlist = set()
+        save_adminlist()  # Создаём пустой файл
+        return adminlist
     
     except json.JSONDecodeError as e:
         logger.error(f"❌ Ошибка парсинга JSON: {e}")
-        return set()
+        adminlist = set()
+        return adminlist
     
     except Exception as e:
         logger.error(f"❌ Неожиданная ошибка: {e}", exc_info=True)
-        return set()
+        adminlist = set()
+        return adminlist
 
 def save_adminlist():
     """Сохраняет список администраторов в файл"""
+    global adminlist
     try:
         os.makedirs(os.path.dirname(ADMINLIST_FILE), exist_ok=True)
         with open(ADMINLIST_FILE, "w") as f:
-            json.dump(list(adminlist), f, indent=2)
+            # ИЗМЕНЕНИЕ №2: сохраняем в формате {"admins": [...]}
+            json.dump({"admins": list(adminlist)}, f, indent=2)
+        logger.info(f"💾 Сохранено {len(adminlist)} админов")
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения adminlist: {e}")
 
@@ -146,16 +155,17 @@ def is_admin_special(user_id: int) -> bool:
 
 def add_admin(user_id: int):
     """Добавляет пользователя в список администраторов"""
+    global adminlist
     adminlist.add(user_id)
     save_adminlist()
     logger.info(f"➕ Пользователь {user_id} добавлен в adminlist")
 
 def remove_admin(user_id: int):
     """Удаляет пользователя из списка администраторов"""
+    global adminlist
     adminlist.discard(user_id)
     save_adminlist()
     logger.info(f"➖ Пользователь {user_id} удалён из adminlist")
-
 # ====================== СТАТИСТИКА ======================
 stats = {
     "total": 0,
@@ -918,11 +928,13 @@ async def shutdown(application: Application):
     logger.info("👋 Бот остановлен")
 
 # ====================== ЗАПУСК БОТА ======================
+
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
     
     # Загружаем сохранённые данные
-    load_adminlist()
+    adminlist = load_adminlist()
+    logger.info(f"📋 Текущих админов в списке: {len(adminlist)}")
     load_stats()
     
     # Создаём приложение
@@ -1005,4 +1017,5 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
+
 
