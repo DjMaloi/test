@@ -107,14 +107,25 @@ adminlist = set()
 def load_adminlist() -> set:
     """Загружает список админов из файла"""
     try:
-        with open("adminlist.json", "r") as f:
+        logger.info(f"🔍 Ищу adminlist.json...")
+        with open("app/data/adminlist.json", "r") as f:  # ← ДОБАВЬ ПУТЬ
             data = json.load(f)
-        # 🔧 ИСПРАВЛЕНИЕ: преобразуй строки в int
+            logger.info(f"📄 Прочитан файл: {data}")
+        
         adminlist = {int(x) for x in data.get("admins", [])}
         logger.info(f"✅ Загружено {len(adminlist)} админов: {adminlist}")
         return adminlist
+    
+    except FileNotFoundError:
+        logger.error(f"❌ Файл adminlist.json НЕ НАЙДЕН!")
+        return set()
+    
+    except json.JSONDecodeError as e:
+        logger.error(f"❌ Ошибка парсинга JSON: {e}")
+        return set()
+    
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки adminlist: {e}")
+        logger.error(f"❌ Неожиданная ошибка: {e}", exc_info=True)
         return set()
 
 def save_adminlist():
