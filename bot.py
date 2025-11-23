@@ -681,31 +681,33 @@ def is_mismatch(question: str, answer: str) -> bool:
             embedder_general,
             clean_text
         )
-        
-    if answer:
-# 🔍 Проверяем, не противоречит ли ответ вопросу
-        if is_mismatch(raw_text, answer):
-            logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ: вопрос про '{raw_text}' → но найден ответ с '{next(w for w in CRITICAL_MISMATCHES.get('касса', []) if w in answer.lower())}'")
-            answer = None  # игнорируем
-        else:
-            best_answer = answer
-            distance = dist
-            source = "vector_general"
-            stats["vector"] += 1
-            save_stats()
+    
+        if answer:
+            # 🔍 Проверяем, не противоречит ли ответ вопросу
+            if is_mismatch(raw_text, answer):
+                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ: вопрос про '{raw_text}' → но найден ответ с '{next(w for w in CRITICAL_MISMATCHES.get('касса', []) if w in answer.lower())}'")
+                answer = None  # игнорируем
+            else:
+                best_answer = answer
+                distance = dist
+                source = "vector_general"
+                stats["vector"] += 1
+                save_stats()
             
-            preview = (answer or "").replace("\n", " ")[:200]
-            logger.info(
-                f"🎯 VECTOR (General) ✓ | dist={dist:.4f} | user={user.id} | "
-                f"→ \"{preview}\" | топ-3: {' | '.join(top_log[:3])}"
-            )
+                # ✅ Только здесь логируем УСПЕШНЫЙ векторный ответ
+                preview = (answer or "").replace("\n", " ")[:200]
+                logger.info(
+                    f"🎯 VECTOR (General) ✓ | dist={dist:.4f} | user={user.id} | "
+                    f"→ \"{preview}\" | топ-3: {' | '.join(top_log[:3])}"
+                )
         else:
             best_dist = top_log[0].split("→")[0] if top_log else "N/A"
             logger.info(
                 f"❌ VECTOR (General) ✗ | лучший dist={best_dist} | "
                 f"user={user.id} | топ-5: {' | '.join(top_log[:5])}"
             )
-    
+
+
     # ============ ЭТАП 3: Векторный поиск (Technical) ============
     if not best_answer:
         answer, dist, top_log = await search_in_collection(
