@@ -785,7 +785,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cached_pct = (stats['cached'] / total * 100) if total > 0 else 0
     vector_pct = (stats['vector'] / total * 100) if total > 0 else 0
     
-    text = (
+        text = (
         f"📊 СТАТУС БОТА\n\n"
         f"Состояние: {paused}\n"
         f"Записей в базе:\n"
@@ -799,8 +799,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  • Groq API: {stats['groq']}\n"
         f"  • Ошибки: {stats['errors']}\n\n"
         f"Кэш: {cache_usage} записей\n"
-        f"Порог вектора: {VECTOR_THRESHOLD}"
+        f"Порог вектора: {VECTOR_THRESHOLD}\n"
+        f"\n"
+        f"Alarm-уведомление:\n"
+        f"  {'✅ Активно: ' + current_alarm[:50] + '...' if current_alarm and len(current_alarm) > 50 else current_alarm if current_alarm else '❌ Не установлено'}\n"
     )
+
     
     await update.message.reply_text(text)
 
