@@ -695,12 +695,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vector_pct = (stats['vector'] / total * 100) if total > 0 else 0
     
     text = (
-        f"📊 <b>Статус бота</b>\n\n"
+        f"📊 СТАТУС БОТА\n\n"
         f"Состояние: {paused}\n"
         f"Записей в базе:\n"
         f"  • General: {count_general}\n"
         f"  • Technical: {count_technical}\n\n"
-        f"<b>Статистика запросов:</b>\n"
+        f"Статистика запросов:\n"
         f"Всего: {stats['total']}\n"
         f"  • Из кэша: {stats['cached']} ({cached_pct:.1f}%)\n"
         f"  • Векторный поиск: {stats['vector']} ({vector_pct:.1f}%)\n"
@@ -711,7 +711,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Порог вектора: {VECTOR_THRESHOLD}"
     )
     
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text)
 
 async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Очищает кэш ответов"""
@@ -774,8 +774,7 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     admin_list = "\n".join([f"  • {uid}" for uid in sorted(adminlist)])
     await update.message.reply_text(
-        f"👨‍💼 <b>Администраторы</b> ({len(adminlist)}):\n\n{admin_list}",
-        parse_mode="HTML"
+        f"👨‍💼 АДМИНИСТРАТОРЫ ({len(adminlist)}):\n\n{admin_list}",
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -784,8 +783,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     text = (
-        "📌 <b>Команды администратора</b>\n\n"
-        "<b>Управление ботом:</b>\n"
+        "📌 КОМАНДЫ АДМИНИСТРАТОРА\n\n"
+        "Управление ботом:\n"
         "/pause — поставить бота на паузу\n"
         "/resume — возобновить работу\n"
         "/status — показать статус и статистику\n"
@@ -793,14 +792,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Управление кэшем:</b>\n"
         "/clearcache — очистить кэш ответов\n\n"
         "<b>Управление администраторами:</b>\n"
-        "/addadmin <user_id> — добавить в adminlist\n"
+        "/addadmin [user_id] — добавить в adminlist\n"
         "/removeadmin <user_id> — удалить из adminlist\n"
         "/adminlist — показать список\n\n"
         "/help — показать это меню\n\n"
         "<i>💡 Админы из adminlist.json игнорируются ботом в группах</i>"
     )
     
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(text)
 
 async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Изменяет порог векторного поиска (для экспериментов)"""
