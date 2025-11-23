@@ -48,6 +48,11 @@ collection_general = chroma_client.get_or_create_collection("general_kb")
 collection_technical = chroma_client.get_or_create_collection("technical_kb")
 
 # ====================== EMBEDDERS ======================
+# Используем кэш моделей в persistent volume
+import os
+os.environ['TRANSFORMERS_CACHE'] = '/app/models_cache'
+os.environ['SENTENCE_TRANSFORMERS_HOME'] = '/app/models_cache'
+
 #embedder_general = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 embedder_general = SentenceTransformer("ai-forever/sbert_large_nlu_ru")
 embedder_technical = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -56,8 +61,9 @@ embedder_technical = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # ====================== PAUSE & STATS ======================
-PAUSE_FILE = "/app/paused.flag"
-STATS_FILE = "/app/stats.json"
+PAUSE_FILE = "/app/data/paused.flag"
+STATS_FILE = "/app/data/stats.json"
+ADMINLIST_FILE = "/app/data/adminlist.json"
 
 def is_paused() -> bool:
     return os.path.exists(PAUSE_FILE)
@@ -72,6 +78,42 @@ def set_paused(state: bool):
         except FileNotFoundError:
             pass
         logger.info("Пауза снята")
+
+# ====================== ADMIN LIST ======================
+adminlist = set()
+
+def load_adminlist():
+    global adminlist
+    try:
+        if os.path.exists(ADMINLIST_FILE):
+            with open(ADMINLIST_FILE, "r") as f:
+                adminlist = set(json.load(f))
+                logger.info(f"Список администраторов загружен: {len(adminlist)} пользователей")
+        else:
+            adminlist = set()
+    except Exception as e:
+        logger.error(f"Ошибка загрузки списка администраторов: {e}")
+        adminlist = set()
+
+def save_adminlist():
+    try:
+        with open(ADMINLIST_FILE, "w") as f:
+            json.dump(list(adminlist), f)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения списка администраторов: {e}")
+
+def is_admin_special(user_id: int) -> bool:
+    return user_id in adminlist
+
+def add_admin(user_id: int):
+    adminlist.add(user_id)
+    save_adminlist()
+    logger.info(f"Пользователь {user_id} добавлен в список администраторов")
+
+def remove_admin(user_id: int):
+    adminlist.discard(user_id)
+    save_adminlist()
+    logger.info(f"Пользователь {user_id} удалён из списка администраторов")
 
 stats = {"total": 0, "cached": 0, "groq": 0, "vector": 0, "keyword": 0}
 
@@ -154,7 +196,14 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
 
 # ====================== MESSAGE HANDLER ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if is_paused() and update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    
+    # проверяем список администраторов
+    if is_admin_special(user_id):
+        logger.info(f"Пользователь {user_id} в списке администраторов — игнорируем")
+        return
+    
+    if is_paused() and user_id not in ADMIN_IDS:
         return
 
     raw_text = (update.message.text or update.message.caption or "").strip()
@@ -468,6 +517,41 @@ async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_stats()
     await update.message.reply_text("Кэш очищен!")
 
+async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /addadmin <user_id>")
+        return
+    
+    user_id = int(context.args[0])
+    add_admin(user_id)
+    await update.message.reply_text(f"✅ Пользователь {user_id} добавлен в список администраторов")
+
+async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /removeadmin <user_id>")
+        return
+    
+    user_id = int(context.args[0])
+    remove_admin(user_id)
+    await update.message.reply_text(f"✅ Пользователь {user_id} удален из списка администраторов")
+
+async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not adminlist:
+        await update.message.reply_text("Список администраторов пуст")
+        return
+    
+    admin_users = "\n".join([str(uid) for uid in sorted(adminlist)])
+    await update.message.reply_text(f"👨‍💼 Администраторы ({len(adminlist)}):\n{admin_users}")
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -478,7 +562,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/resume – возобновить работу бота\n"
         "/status – показать статус и статистику\n"
         "/clearcache – очистить кэш ответов\n"
-        "/clearstats – обнулить статистику\n"
+        "/addadmin <user_id> – добавить администратора\n"
+        "/removeadmin <user_id> – удалить администратора\n"
+        "/adminlist – показать список администраторов\n"
         "/help – показать это меню\n"
     )
     await update.message.reply_text(commands_text)
@@ -516,16 +602,20 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("clearcache", clear_cache))
+    app.add_handler(CommandHandler("addadmin", add_admin_cmd))
+    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
+    app.add_handler(CommandHandler("adminlist", adminlist_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
 
 
     app.add_error_handler(error_handler)
 
+    # загрузка списка администраторов
+    load_adminlist()
+
     # первая загрузка базы через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
 
-    logger.info("3.12 Бот запущен — логика с Google Sheets и ChromaDB")
+    logger.info("4.0 БОТ с АдминЛистом")
 
     app.run_polling(drop_pending_updates=True)
-
-
