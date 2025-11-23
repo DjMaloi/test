@@ -544,9 +544,11 @@ async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user = await context.bot.get_chat(user_id)
             username = user.username or f"User_{user_id}"
+            logger.info(f"Username получен из Telegram: {user_id} -> @{username}")
         except Exception as e:
-            logger.warning(f"Не удалось получить username пользователя {user_id}: {e}")
-            username = f"User_{user_id}"
+            # Если не можем получить — используем ID
+            logger.warning(f"Не удалось получить username пользователя {user_id}: {e}. Используем ID.")
+            username = f"ID_{user_id}"
     
     add_admin(user_id, username)
     await update.message.reply_text(f"✅ Пользователь {user_id} (@{username}) добавлен в список администраторов")
