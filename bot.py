@@ -637,10 +637,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ============ ЭТАП 6: Отправка ответа ============
     if not final_reply:
-        final_reply = (
-            "Извините, я не смог найти точный ответ на ваш вопрос. "
-            "Попробуйте переформулировать или обратитесь в поддержку."
-        )
+       # final_reply = (
+       #     "Извините, я не смог найти точный ответ на ваш вопрос. "
+       #     "Попробуйте переформулировать или обратитесь в поддержку."
+       # )
+        return 
         source = "default_fallback"
     
     # Сохраняем в кэш
@@ -1004,3 +1005,4 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
+
