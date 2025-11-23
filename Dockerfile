@@ -779,4 +779,179 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список
+    """Показывает список команд"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    text = (
+        "📌 <b>Команды администратора</b>\n\n"
+        "<b>Управление ботом:</b>\n"
+        "/pause — поставить бота на паузу\n"
+        "/resume — возобновить работу\n"
+        "/status — показать статус и статистику\n"
+        "/reload — перезагрузить базу знаний\n\n"
+        "<b>Управление кэшем:</b>\n"
+        "/clearcache — очистить кэш ответов\n\n"
+        "<b>Управление администраторами:</b>\n"
+        "/addadmin <user_id> — добавить в adminlist\n"
+        "/removeadmin <user_id> — удалить из adminlist\n"
+        "/adminlist — показать список\n\n"
+        "/help — показать это меню\n\n"
+        "<i>💡 Админы из adminlist.json игнорируются ботом в группах</i>"
+    )
+    
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Изменяет порог векторного поиска (для экспериментов)"""
+    global VECTOR_THRESHOLD
+    
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    if not context.args or not context.args[0].replace(".", "").isdigit():
+        await update.message.reply_text(
+            f"❌ Использование: /threshold <значение>\n"
+            f"Текущий порог: {VECTOR_THRESHOLD}\n"
+            f"Рекомендуемый диапазон: 0.5-0.8"
+        )
+        return
+    
+    try:
+        new_threshold = float(context.args[0])
+        
+        if not 0.0 <= new_threshold <= 1.0:
+            await update.message.reply_text("❌ Порог должен быть от 0.0 до 1.0")
+            return
+        
+        old_threshold = VECTOR_THRESHOLD
+        VECTOR_THRESHOLD = new_threshold
+        
+        await update.message.reply_text(
+            f"✅ Порог изменён: {old_threshold} → {new_threshold}\n\n"
+            f"⚠️ Это изменение временное (до перезапуска бота)"
+        )
+        
+        logger.info(f"🎚️ Порог изменён: {old_threshold} → {new_threshold}")
+        
+    except ValueError:
+        await update.message.reply_text("❌ Неверный формат числа")
+
+# ====================== ОБРАБОТЧИК ОШИБОК ======================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"❌ Необработанная ошибка: {context.error}", exc_info=context.error)
+    
+    stats["errors"] += 1
+    save_stats()
+    
+    # Пытаемся уведомить пользователя если возможно
+    if update and isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Произошла внутренняя ошибка. Попробуйте позже или обратитесь к администратору."
+            )
+        except Exception:
+            pass
+
+# ====================== GRACEFUL SHUTDOWN ======================
+async def shutdown(application: Application):
+    """Корректное завершение работы бота"""
+    logger.info("🛑 Начало корректного завершения работы...")
+    
+    # Сохраняем все данные
+    save_stats()
+    save_adminlist()
+    
+    logger.info("💾 Все данные сохранены")
+    logger.info("👋 Бот остановлен")
+
+# ====================== ЗАПУСК БОТА ======================
+if __name__ == "__main__":
+    logger.info("🚀 Запуск бота...")
+    
+    # Загружаем сохранённые данные
+    load_adminlist()
+    load_stats()
+    
+    # Создаём приложение
+    app = Application.builder()\
+        .token(TELEGRAM_TOKEN)\
+        .concurrent_updates(False)\
+        .build()
+    
+    # ============ ФИЛЬТРЫ СООБЩЕНИЙ ============
+    
+    # Блокировка личных чатов для не-админов
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & 
+        ~filters.COMMAND & 
+        ~filters.User(user_id=ADMIN_IDS),
+        block_private
+    ))
+    
+    # Обработка текстовых сообщений
+    # В группах: от всех кроме adminlist
+    # В личке: только от ADMIN_IDS
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & (
+            # Личные чаты админов
+            (filters.ChatType.PRIVATE & filters.User(user_id=ADMIN_IDS)) |
+            # Все группы
+            (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
+        ),
+        handle_message
+    ))
+    
+    # Обработка сообщений с подписями (caption)
+    app.add_handler(MessageHandler(
+        filters.CAPTION & ~filters.COMMAND & (
+            (filters.ChatType.PRIVATE & filters.User(user_id=ADMIN_IDS)) |
+            (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
+        ),
+        handle_message
+    ))
+    
+    # ============ КОМАНДЫ АДМИНИСТРАТОРА ============
+    app.add_handler(CommandHandler("reload", reload_kb))
+    app.add_handler(CommandHandler("pause", pause_bot))
+    app.add_handler(CommandHandler("resume", resume_bot))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("clearcache", clear_cache))
+    app.add_handler(CommandHandler("addadmin", add_admin_cmd))
+    app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
+    app.add_handler(CommandHandler("adminlist", adminlist_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("threshold", set_threshold_cmd))
+    
+    # ============ ОБРАБОТЧИК ОШИБОК ============
+    app.add_error_handler(error_handler)
+    
+    # ============ ОТЛОЖЕННЫЕ ЗАДАЧИ ============
+    # Загружаем базу через 15 секунд после старта
+    app.job_queue.run_once(update_vector_db, when=15)
+    
+    # Опционально: Автоматическое обновление базы каждые 6 часов
+    # app.job_queue.run_repeating(update_vector_db, interval=21600, first=15)
+    
+    # ============ ЗАПУСК ============
+    logger.info("=" * 60)
+    logger.info("✅ БОТ ГОТОВ К РАБОТЕ")
+    logger.info(f"📊 Порог вектора: {VECTOR_THRESHOLD}")
+    logger.info(f"👥 Главных админов: {len(ADMIN_IDS)}")
+    logger.info(f"👨‍💼 Админов в списке: {len(adminlist)}")
+    logger.info(f"📈 Всего запросов: {stats['total']}")
+    logger.info("=" * 60)
+    
+    try:
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False
+        )
+    except KeyboardInterrupt:
+        logger.info("⌨️ Получен сигнал остановки (Ctrl+C)")
+    finally:
+        # Корректное завершение
+        import asyncio
+        asyncio.run(shutdown(app))
