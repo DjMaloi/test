@@ -83,6 +83,8 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 PAUSE_FILE = "/app/data/paused.flag"
 STATS_FILE = "/app/data/stats.json"
 ADMINLIST_FILE = "/app/data/adminlist.json"
+ALARM_FILE = "/app/data/alarm.txt"
+
 
 # ====================== ФУНКЦИИ ПАУЗЫ ======================
 def is_paused() -> bool:
@@ -102,6 +104,8 @@ def set_paused(state: bool):
             pass
 
 # ====================== УПРАВЛЕНИЕ АДМИНАМИ ======================
+current_alarm: Optional[str] = None  # Новое: глобальная переменная для хранения текущего alarm
+
 adminlist = set()
 
 def load_adminlist() -> set:
@@ -166,6 +170,43 @@ def remove_admin(user_id: int):
     adminlist.discard(user_id)
     save_adminlist()
     logger.info(f"➖ Пользователь {user_id} удалён из adminlist")
+
+# ====================== ALARM СИСТЕМА ======================
+
+def load_alarm() -> Optional[str]:
+    """Загружает текст alarm из файла"""
+    try:
+        if os.path.exists(ALARM_FILE):
+            with open(ALARM_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    logger.info(f"🔊 Загружен alarm: {content[:100]}{'...' if len(content) > 100 else ''}")
+                    return content
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки alarm: {e}")
+    return None
+
+def save_alarm(text: str):
+    """Сохраняет текст alarm в файл"""
+    try:
+        os.makedirs(os.path.dirname(ALARM_FILE), exist_ok=True)
+        with open(ALARM_FILE, "w", encoding="utf-8") as f:
+            f.write(text)
+        logger.info(f"📢 Alarm сохранён: {text[:100]}{'...' if len(text) > 100 else ''}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения alarm: {e}")
+
+def clear_alarm():
+    """Удаляет файл alarm"""
+    try:
+        os.remove(ALARM_FILE)
+        logger.info("🔇 Alarm удалён")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.error(f"❌ Ошибка удаления alarm: {e}")
+
+
 # ====================== СТАТИСТИКА ======================
 stats = {
     "total": 0,
@@ -474,6 +515,8 @@ async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3):
     
     return False
 
+
+
 # ====================== ОСНОВНОЙ ОБРАБОТЧИК ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главная функция обработки сообщений"""
@@ -534,6 +577,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_long_message(context.bot, update.effective_chat.id, response_cache[cache_key])
         return
     
+    # ============ ALARM: отправка системного сообщения ============
+    if current_alarm and chat_type in ["group", "supergroup"]:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"🔔 {current_alarm}",
+                disable_notification=True  # Чтобы не будить всех
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось отправить alarm: {e}")
+
+
     await safe_typing(context.bot, update.effective_chat.id)
     
     best_answer = None
@@ -837,6 +892,53 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ adminlist_cmd error: {e}")
         await update.message.reply_text(f"⚠️ Системная ошибка: {str(e)}")
 
+async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Устанавливает alarm-сообщение, которое бот будет выводить при каждом сообщении"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    if not context.args:
+        await update.message.reply_text('❌ Использование: /addalarm "Текст сообщения"')
+        return
+
+    # Собираем аргументы, учитывая кавычки
+    raw_text = " ".join(context.args)
+    # Пытаемся извлечь текст в кавычках
+    import re
+    match = re.search(r'"([^"]+)"', raw_text)
+    if match:
+        text = match.group(1)
+    else:
+        text = raw_text  # Если кавычек нет — берём всё
+
+    if not text.strip():
+        await update.message.reply_text("❌ Текст сообщения пуст!")
+        return
+
+    global current_alarm
+    current_alarm = text.strip()
+    save_alarm(current_alarm)
+
+    await update.message.reply_text(
+        f"📢 Alarm установлен:\n\n{current_alarm}\n\n"
+        "✅ Бот будет показывать это при каждом сообщении."
+    )
+
+async def delalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаляет текущий alarm"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    global current_alarm
+    if current_alarm is None:
+        await update.message.reply_text("🔇 Нет активного alarm для удаления.")
+        return
+
+    clear_alarm()
+    current_alarm = None
+
+    await update.message.reply_text("✅ Alarm удалён.")
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список команд"""
@@ -852,6 +954,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reload — перезагрузить базу знаний\n\n"
         "Управление кэшем:\n"
         "/clearcache — очистить кэш ответов\n\n"
+        "Управление уведомлениями:\n"
+        "/addalarm \"текст\" — установить уведомление при каждом сообщении\n"
+        "/delalarm — удалить уведомление\n\n"
         "Управление администраторами:\n"
         "/addadmin [user_id] — добавить в adminlist\n"
         "/removeadmin <user_id> — удалить из adminlist\n"
@@ -937,6 +1042,9 @@ if __name__ == "__main__":
     logger.info(f"📋 Текущих админов в списке: {len(adminlist)}")
     load_stats()
     
+    # Загружаем alarm
+    current_alarm = load_alarm()
+
     # Создаём приложение
     app = Application.builder()\
         .token(TELEGRAM_TOKEN)\
@@ -986,6 +1094,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
+    app.add_handler(CommandHandler("addalarm", addalarm_cmd))
+    app.add_handler(CommandHandler("delalarm", delalarm_cmd))
+
     
     # ============ ОБРАБОТЧИК ОШИБОК ============
     app.add_error_handler(error_handler)
@@ -1017,5 +1128,3 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
-
-
