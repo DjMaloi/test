@@ -148,13 +148,13 @@ def load_adminlist() -> set:
     """Загружает список админов из файла"""
     global adminlist
     try:
-        logger.info(f"🔍 Ищу adminlist.json по пути: {ADMINLIST_FILE}")
+        #logger.info(f"🔍 Ищу adminlist.json по пути: {ADMINLIST_FILE}")
         
         os.makedirs(os.path.dirname(ADMINLIST_FILE), exist_ok=True)
         
         with open(ADMINLIST_FILE, "r") as f:
             data = json.load(f)
-            logger.info(f"📄 Прочитан файл: {data}")
+           # logger.info(f"📄 Прочитан файл: {data}")
         
         # ИЗМЕНЕНИЕ №1: поддержка формата {"admins": [...]}
         adminlist = {int(x) for x in data.get("admins", [])}
@@ -162,7 +162,7 @@ def load_adminlist() -> set:
         return adminlist
     
     except FileNotFoundError:
-        logger.error(f"❌ Файл не найден: {ADMINLIST_FILE}")
+        #logger.error(f"❌ Файл не найден: {ADMINLIST_FILE}")
         adminlist = set()
         save_adminlist()  # Создаём пустой файл
         return adminlist
@@ -261,7 +261,7 @@ def load_stats():
             with open(STATS_FILE, "r") as f:
                 loaded = json.load(f)
                 stats.update(loaded)
-                logger.info(f"✓ Статистика загружена: {stats['total']} запросов")
+                #logger.info(f"✓ Статистика загружена: {stats['total']} запросов")
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки статистики: {e}")
 
@@ -618,8 +618,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     
     # 🔧 ТЕСТОВЫЙ ЛОГ
-    logger.info(f"🧪 adminlist = {adminlist}")
-    logger.info(f"🧪 user_id = {user_id}, in adminlist? {user_id in adminlist}")
+    #logger.info(f"🧪 adminlist = {adminlist}")
+    #logger.info(f"🧪 user_id = {user_id}, in adminlist? {user_id in adminlist}")
     
     # ============ ЛОГИКА ДОСТУПА ============
     
@@ -633,9 +633,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # В ЛС (private): отвечаем ТОЛЬКО админам из ADMIN_IDS
     elif chat_type == "private":
         if user_id not in ADMIN_IDS:
-            logger.info(f"🚫 БЛОКИРУЮ ЛС от {user_id} (не админ)")
+            #logger.info(f"🚫 БЛОКИРУЮ ЛС от {user_id} (не админ)")
             return
-        logger.info(f"✅ Отвечу админу {user_id} в ЛС")
+        #logger.info(f"✅ Отвечу админу {user_id} в ЛС")
     
     # Проверка паузы (кроме главных админов из env)
     if is_paused() and user_id not in ADMIN_IDS:
