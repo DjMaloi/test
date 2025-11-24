@@ -58,6 +58,7 @@ def is_mismatch(question: str, answer: str) -> bool:
     return False
 
 # ====================== LOGGING ======================
+LOG_FILE = "/app/data/bot.log"
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     level=logging.INFO,
@@ -1272,3 +1273,4 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
+
