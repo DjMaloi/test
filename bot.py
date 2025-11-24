@@ -74,6 +74,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -1293,4 +1294,5 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
+
 
