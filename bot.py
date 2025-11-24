@@ -60,9 +60,14 @@ def is_mismatch(question: str, answer: str) -> bool:
 # ====================== LOGGING ======================
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+
 
 # Уменьшаем шум от библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -112,6 +117,8 @@ PAUSE_FILE = "/app/data/paused.flag"
 STATS_FILE = "/app/data/stats.json"
 ADMINLIST_FILE = "/app/data/adminlist.json"
 ALARM_FILE = "/app/data/alarm.txt"
+LOG_FILE = "/app/data/bot.log"
+
 
 
 # ====================== ФУНКЦИИ ПАУЗЫ ======================
@@ -546,6 +553,19 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
             stats["errors"] += 1
             save_stats()
 
+def get_source_emoji(source: str) -> str:
+    """Возвращает смайлик в зависимости от источника ответа"""
+    emoji_map = {
+        "cached": "💾",           # Из кэша
+        "keyword": "🔑",          # Ключевые слова
+        "vector_general": "🎯",   # Векторный поиск (General)
+        "vector_technical": "⚙️", # Векторный поиск (Technical)
+        "groq_fallback": "🤖",    # Ответ от AI
+        "default_fallback": "❓"  # Не найдено
+    }
+    return emoji_map.get(source, "")
+
+
 # ====================== ОТПРАВКА СООБЩЕНИЙ ======================
 async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3):
     """
@@ -639,8 +659,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stats["cached"] += 1
         save_stats()
         logger.info(f"💾 КЭШИРОВАННЫЙ ОТВЕТ для user={user.id}")
-        await send_long_message(context.bot, update.effective_chat.id, response_cache[cache_key])
+    
+        cached_answer = response_cache[cache_key]
+        emoji = get_source_emoji("cached")
+        final_text = f"{cached_answer}\n\n{emoji}"
+    
+        await send_long_message(context.bot, update.effective_chat.id, final_text)
         return
+
 
     
     # ============ ALARM: отправка системного сообщения ============
@@ -786,16 +812,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return 
         source = "default_fallback"
     
-    # Сохраняем в кэш
+    # Сохраняем в кэш (БЕЗ смайлика)
     response_cache[cache_key] = final_reply
-    
+
+    # Добавляем смайлик только для отправки
+    emoji = get_source_emoji(source)
+    final_text_with_emoji = f"{final_reply}\n\n{emoji}"
+
     logger.info(
         f"📤 ОТПРАВКА | source={source} | dist={distance:.3f} | "
         f"len={len(final_reply)} | user={user.id} | "
         f"\"{final_reply[:100]}{'...' if len(final_reply) > 100 else ''}\""
     )
-    
-    success = await send_long_message(context.bot, update.effective_chat.id, final_reply)
+
+    success = await send_long_message(context.bot, update.effective_chat.id, final_text_with_emoji)
+
+
     
     if not success:
         stats["errors"] += 1
@@ -1020,6 +1052,34 @@ async def delalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("✅ Alarm удалён.")
 
+async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет последние 200 строк лога"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    try:
+        if not os.path.exists(LOG_FILE):
+            await update.message.reply_text("❌ Лог-файл не найден")
+            return
+        
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        # Берём последние 200 строк
+        last_lines = lines[-200:]
+        log_text = "".join(last_lines)
+        
+        # Ограничиваем длину для Telegram
+        if len(log_text) > 4000:
+            log_text = "...\n" + log_text[-3900:]
+        
+        await update.message.reply_text(
+            f"📋 ПОСЛЕДНИЕ {len(last_lines)} СТРОК ЛОГА:\n\n{log_text}"
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения логов: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список команд"""
@@ -1043,6 +1103,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/removeadmin <user_id> — удалить из adminlist\n"
         "/adminlist — показать список\n\n"
         "/help — показать это меню\n\n"
+        "Диагностика:\n"
+        "/logs — последние 200 строк лога\n\n"
         "💡 Админы из adminlist.json игнорируются ботом в группах"
     )
     
@@ -1174,6 +1236,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("logs", logs_cmd))
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
