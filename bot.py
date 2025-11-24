@@ -158,7 +158,7 @@ def load_adminlist() -> set:
         
         # ИЗМЕНЕНИЕ №1: поддержка формата {"admins": [...]}
         adminlist = {int(x) for x in data.get("admins", [])}
-        logger.info(f"✅ Загружено {len(adminlist)} админов: {adminlist}")
+        #logger.info(f"✅ Загружено {len(adminlist)} админов: {adminlist}")
         return adminlist
     
     except FileNotFoundError:
@@ -1293,3 +1293,4 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
+
