@@ -568,16 +568,24 @@ def get_source_emoji(source: str) -> str:
 
 
 # ====================== ОТПРАВКА СООБЩЕНИЙ ======================
-async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3):
+async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, reply_to_message_id: int = None):
+
     """
     Безопасно отправляет длинное сообщение с разбивкой и повторами
     """
     for attempt in range(max_retries):
         try:
             # Разбиваем на части если нужно
-            for i in range(0, len(text), MAX_MESSAGE_LENGTH):
-                chunk = text[i:i + MAX_MESSAGE_LENGTH]
-                await bot.send_message(chat_id=chat_id, text=chunk)
+            chunks = [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+            for idx, chunk in enumerate(chunks):
+                # Цитируем только первое сообщение
+                reply_id = reply_to_message_id if idx == 0 else None
+                await bot.send_message(
+                    chat_id=chat_id, 
+                    text=chunk,
+                    reply_to_message_id=reply_id
+                )
+
             return True
             
         except RetryAfter as e:
@@ -665,8 +673,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emoji = get_source_emoji("cached")
         final_text = f"{cached_answer}\n\n{emoji}"
     
-        await send_long_message(context.bot, update.effective_chat.id, final_text)
+        await send_long_message(
+            context.bot, 
+            update.effective_chat.id, 
+            final_text,
+            reply_to_message_id=update.message.message_id
+        )
         return
+
 
 
     
@@ -826,7 +840,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\"{final_reply[:100]}{'...' if len(final_reply) > 100 else ''}\""
     )
 
-    success = await send_long_message(context.bot, update.effective_chat.id, final_text_with_emoji)
+    success = await send_long_message(
+        context.bot, 
+        update.effective_chat.id, 
+        final_text_with_emoji,
+        reply_to_message_id=update.message.message_id
+    )
+
 
 
     
@@ -1273,4 +1293,3 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
-
