@@ -593,6 +593,40 @@ def get_source_emoji(source: str) -> str:
     return emoji_map.get(source, "")
 
 
+async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
+    """Запускает автопроверку ключевого поиска при старте"""
+    logger.info("🧪 Запуск автопроверки ключевого поиска...")
+
+    # Тестовый ключ, который ДОЛЖЕН быть в базе
+    test_query = "как дела"  # ← ЗАМЕНИ НА ЛЮБОЙ РЕАЛЬНЫЙ, ЕСТЬ В ТАБЛИЦЕ
+    clean_test = preprocess(test_query)
+
+    try:
+        # Проверяем General
+        results = collection_general.get(
+            where={"query": {"$eq": clean_test}},
+            include=["metadatas"]
+        )
+
+        if results["metadatas"]:
+            answer = results["metadatas"][0]["answer"]
+            logger.info(f"✅ УСПЕШНЫЙ ТЕСТ: найдено в General → '{answer}'")
+        else:
+            # Проверяем Technical
+            results = collection_technical.get(
+                where={"query": {"$eq": clean_test}},
+                include=["metadatas"]
+            )
+            if results["metadatas"]:
+                answer = results["metadatas"][0]["answer"]
+                logger.info(f"✅ УСПЕШНЫЙ ТЕСТ: найдено в Technical → '{answer}'")
+            else:
+                logger.warning(f"❌ НЕ НАЙДЕНО: ключевой запрос '{test_query}' не найден ни в одной базе!")
+                logger.warning("🔧 Проверь: 1) Есть ли он в Google Sheets? 2) Выполнен ли /reload? 3) Правильно ли сохраняется query в metadatas?")
+    except Exception as e:
+        logger.error(f"❌ ОШИБКА при автопроверке: {e}", exc_info=True)
+
+
 # ====================== ОТПРАВКА СООБЩЕНИЙ ======================
 async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, reply_to_message_id: int = None):
 
@@ -1334,6 +1368,10 @@ if __name__ == "__main__":
     # ============ ОТЛОЖЕННЫЕ ЗАДАЧИ ============
     # Загружаем базу через 15 секунд после старта
     app.job_queue.run_once(update_vector_db, when=15)
+
+    # Запускаем автопроверку через 20 секунд после обновления базы
+    app.job_queue.run_once(run_startup_test, when=20)
+
     
     # Опционально: Автоматическое обновление базы каждые 6 часов
     # app.job_queue.run_repeating(update_vector_db, interval=21600, first=15)
