@@ -642,6 +642,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главная функция обработки сообщений"""
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
+
+    # 🔥 ОБЯЗАТЕЛЬНО: объявляем переменные
+    best_answer = None
+    source = "none"
+    distance = 1.0
     
     # 🔧 ТЕСТОВЫЙ ЛОГ
     #logger.info(f"🧪 adminlist = {adminlist}")
