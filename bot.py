@@ -1366,11 +1366,12 @@ if __name__ == "__main__":
     app.add_error_handler(error_handler)
     
     # ============ ОТЛОЖЕННЫЕ ЗАДАЧИ ============
-    # Загружаем базу через 15 секунд после старта
-    app.job_queue.run_once(update_vector_db, when=15)
+    async def update_and_test(context: ContextTypes.DEFAULT_TYPE):
+        await update_vector_db(context)
+        await run_startup_test(context)
 
-    # Запускаем автопроверку через 20 секунд после обновления базы
-    app.job_queue.run_once(run_startup_test, when=20)
+    app.job_queue.run_once(update_and_test, when=15)
+
 
     
     # Опционально: Автоматическое обновление базы каждые 6 часов
