@@ -488,12 +488,12 @@ async def fallback_groq(question: str) -> Optional[str]:
 
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
 async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
-    """Обновляет векторную базу из Google Sheets"""
+    """Обновляет векторную базу из Google Sheets с сохранением query в метаданных"""
     global collection_general, collection_technical
     
-    async with collection_lock:  # Защита от race condition
+    async with collection_lock:
         try:
-            logger.info("🔄 Начало обновления базы знаний...")
+            logger.info("🔄 Начало обновления базы знаний из Google Sheets...")
             
             # Читаем данные из Google Sheets
             result_general = sheet.values().get(
@@ -510,50 +510,75 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
             
             logger.info(f"📥 Загружено: General={len(general_rows)}, Technical={len(technical_rows)}")
             
-            # Пересоздаём коллекции
+            # Удаляем старые коллекции
             for name in ["general_kb", "technical_kb"]:
                 try:
                     chroma_client.delete_collection(name)
-                except Exception:
-                    pass
+                    logger.debug(f"🗑️ Удалена коллекция: {name}")
+                except Exception as e:
+                    logger.debug(f"🔍 Коллекция {name} не найдена или уже удалена: {e}")
             
+            # Создаём новые коллекции
             collection_general = chroma_client.create_collection("general_kb")
             collection_technical = chroma_client.create_collection("technical_kb")
             
-            # Заполняем коллекцию General
+            # === Заполняем General ===
             if general_rows:
-                keys = [row[0] for row in general_rows if len(row) > 0]
-                answers = [row[1] if len(row) > 1 else "" for row in general_rows]
+                # Фильтруем пустые строки
+                valid_rows = [row for row in general_rows if len(row) >= 2 and row[0].strip()]
                 
+                keys = [row[0].strip() for row in valid_rows]
+                answers = [row[1].strip() for row in valid_rows]
+                
+                # Генерируем эмбеддинги
                 embeddings = embedder_general.encode(keys).tolist()
                 
+                # Сохраняем query + answer в метаданных
                 collection_general.add(
-                    ids=[f"general_{i}" for i in range(len(keys))],
-                    documents=keys,
-                    metadatas=[{"answer": ans} for ans in answers],
+                    ids=[f"general_{i}" for i in range(len(valid_rows))],
+                    documents=keys,  # для векторного поиска
+                    metadatas=[
+                        {"query": keys[i], "answer": answers[i]} 
+                        for i in range(len(valid_rows))
+                    ],
                     embeddings=embeddings
                 )
+                
+                logger.info(f"✅ General: добавлено {len(valid_rows)} пар (вопрос/ответ)")
+            else:
+                logger.info("🟡 General: нет данных для загрузки")
             
-            # Заполняем коллекцию Technical
+            # === Заполняем Technical ===
             if technical_rows:
-                keys = [row[0] for row in technical_rows if len(row) > 0]
-                answers = [row[1] if len(row) > 1 else "" for row in technical_rows]
+                valid_rows = [row for row in technical_rows if len(row) >= 2 and row[0].strip()]
+                
+                keys = [row[0].strip() for row in valid_rows]
+                answers = [row[1].strip() for row in valid_rows]
                 
                 embeddings = embedder_technical.encode(keys).tolist()
                 
                 collection_technical.add(
-                    ids=[f"technical_{i}" for i in range(len(keys))],
+                    ids=[f"technical_{i}" for i in range(len(valid_rows))],
                     documents=keys,
-                    metadatas=[{"answer": ans} for ans in answers],
+                    metadatas=[
+                        {"query": keys[i], "answer": answers[i]} 
+                        for i in range(len(valid_rows))
+                    ],
                     embeddings=embeddings
                 )
+                
+                logger.info(f"✅ Technical: добавлено {len(valid_rows)} пар (вопрос/ответ)")
+            else:
+                logger.info("🟡 Technical: нет данных для загрузки")
             
-            logger.info(f"✅ База обновлена успешно!")
+            logger.info("🟢 Обновление векторной базы завершено успешно!")
             
         except Exception as e:
             logger.error(f"❌ Критическая ошибка обновления базы: {e}", exc_info=True)
             stats["errors"] += 1
             save_stats()
+
+
 
 def get_source_emoji(source: str) -> str:
     """Возвращает смайлик в зависимости от источника ответа"""
@@ -682,6 +707,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+# ============ ЭТАП 1.5: Поиск по точному совпадению ключа (в метаданных) ============
+    if not best_answer:
+        try:
+            # Поиск в General
+            results = collection_general.get(
+                where={"query": {"$eq": clean_text}},
+                include=["metadatas"]
+            )
+            if results["metadatas"]:
+                best_answer = results["metadatas"][0].get("answer")
+                if best_answer:
+                    source = "keyword"
+                    stats["keyword"] += 1
+                    save_stats()
+                    logger.info(f"🔑 KEYWORD MATCH (General) | query='{clean_text}'")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка поиска по метаданным General: {e}")
+
+    if not best_answer:
+        try:
+            # Поиск в Technical
+            results = collection_technical.get(
+                where={"query": {"$eq": clean_text}},
+                include=["metadatas"]
+            )
+            if results["metadatas"]:
+                best_answer = results["metadatas"][0].get("answer")
+                if best_answer:
+                    source = "keyword"
+                    stats["keyword"] += 1
+                    save_stats()
+                    logger.info(f"🔑 KEYWORD MATCH (Technical) | query='{clean_text}'")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка поиска по метаданным Technical: {e}")
 
 
     
@@ -1294,5 +1353,3 @@ if __name__ == "__main__":
         # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
-
-
