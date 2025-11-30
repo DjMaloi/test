@@ -17,7 +17,7 @@ import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from telegram.error import TimedOut, NetworkError, RetryAfter
 
 # Google Sheets
@@ -789,6 +789,190 @@ def get_contextual_prompt(query_type: str, is_fallback: bool = False) -> str:
     
     return prompts.get(query_type, prompts['mixed'])
 
+# ====================== UX УЛУЧШЕНИЯ ======================
+def get_quick_access_keyboard(chat_type: str = "group") -> InlineKeyboardMarkup:
+    """
+    Возвращает клавиатуру быстрого доступа в зависимости от типа чата
+    
+    Args:
+        chat_type: "group", "supergroup", "private"
+    """
+    if chat_type == "private":
+        # Для личных чатов админов - расширенная панель
+        keyboard = [
+            [
+                InlineKeyboardButton("🔧 Технические вопросы", callback_data="quick_tech"),
+                InlineKeyboardButton("📞 Общие вопросы", callback_data="quick_general")
+            ],
+            [
+                InlineKeyboardButton("⚙️ Настройка кассы", callback_data="quick_cash_setup"),
+                InlineKeyboardButton("🖥️ Настройка киоска", callback_data="quick_kiosk_setup")
+            ],
+            [
+                InlineKeyboardButton("💳 Оплата и чеки", callback_data="quick_payment"),
+                InlineKeyboardButton("🛠️ Ошибки и сбой", callback_data="quick_errors")
+            ],
+            [
+                InlineKeyboardButton("📊 Статистика бота", callback_data="quick_status"),
+                InlineKeyboardButton("🏥 Проверка систем", callback_data="quick_health")
+            ]
+        ]
+    else:
+        # Для групп - упрощенная панель
+        keyboard = [
+            [
+                InlineKeyboardButton("🔧 Техническая поддержка", callback_data="quick_tech"),
+                InlineKeyboardButton("📞 Общая информация", callback_data="quick_general")
+            ],
+            [
+                InlineKeyboardButton("💳 Вопросы оплаты", callback_data="quick_payment"),
+                InlineKeyboardButton("🛠️ Проблемы с оборудованием", callback_data="quick_errors")
+            ]
+        ]
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def get_suggested_questions(query_type: str) -> List[str]:
+    """
+    Возвращает список предложенных вопросов в зависимости от типа запроса
+    
+    Args:
+        query_type: 'technical', 'general', 'mixed'
+    """
+    suggestions = {
+        'technical': [
+            "Как настроить фискальный регистратор?",
+            "Киоск не печатает чеки, что делать?",
+            "Ошибка подключения к серверу",
+            "Как обновить ПО на кассе?",
+            "Принтер чеков не работает"
+        ],
+        'general': [
+            "Время работы поддержки",
+            "Контакты технической службы",
+            "Стоимость обслуживания",
+            "Как заказать оборудование?",
+            "График работы компании"
+        ],
+        'mixed': [
+            "Проблемы с оплатой картой",
+            "Настройка нового терминала",
+            "Обслуживание кассового аппарата",
+            "Интеграция с учетной системой",
+            "Гарантия и ремонт оборудования"
+        ]
+    }
+    
+    return suggestions.get(query_type, suggestions['mixed'])
+
+def get_adaptive_context_message(chat_type: str, user_name: str = "") -> str:
+    """
+    Возвращает адаптивное приветствие в зависимости от типа чата
+    
+    Args:
+        chat_type: "group", "supergroup", "private"
+        user_name: имя пользователя для персонализации
+    """
+    if chat_type == "private":
+        if user_name:
+            return f"👋 {user_name}, я ваш персональный ассистент поддержки!\n\nВыберите интересующую тему:"
+        else:
+            return "👋 Я ваш персональный ассистент поддержки!\n\nВыберите интересующую тему:"
+    else:
+        return "🤖 Бот поддержки готов помочь!\n\nВыберите категорию вопроса или напишите свой вопрос:"
+
+async def handle_quick_access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает нажатия на кнопки быстрого доступа
+    """
+    query = update.callback_query
+    await query.answer()
+    
+    chat_type = update.effective_chat.type
+    user = update.effective_user
+    user_name = user.first_name or ""
+    
+    # Определяем ответ в зависимости от кнопки
+    responses = {
+        "quick_tech": (
+            "🔧 **Техническая поддержка**\n\n"
+            "Задайте ваш вопрос про оборудование:\n"
+            "• Настройка касс и киосков\n"
+            "• Ошибки и сбои\n"
+            "• Подключение устройств\n"
+            "• Обновление ПО\n\n"
+            "Напишите конкретный вопрос для получения помощи."
+        ),
+        "quick_general": (
+            "📞 **Общая информация**\n\n"
+            "Могу ответить на вопросы:\n"
+            "• Режим работы компании\n"
+            "• Контакты и адреса\n"
+            "• Условия обслуживания\n"
+            "• Стоимость услуг\n\n"
+            "Что вас интересует?"
+        ),
+        "quick_cash_setup": (
+            "⚙️ **Настройка кассы**\n\n"
+            "Популярные вопросы:\n"
+            "• Как подключить фискальный регистратор?\n"
+            "• Настройка реквизитов компании\n"
+            "• Подключение принтера чеков\n"
+            "• Настройка способов оплаты\n\n"
+            "Опишите вашу проблему подробно."
+        ),
+        "quick_kiosk_setup": (
+            "🖥️ **Настройка киоска**\n\n"
+            "Помогу с вопросами:\n"
+            "• Установка ПО киоска\n"
+            "• Настройка сенсорного экрана\n"
+            "• Подключение сканера и принтера\n"
+            "• Интеграция с платежной системой\n\n"
+            "Какой у вас вопрос?"
+        ),
+        "quick_payment": (
+            "💳 **Оплата и чеки**\n\n"
+            "Могу помочь с:\n"
+            "• Настройкой эквайринга\n"
+            "• Проблемами с печатью чеков\n"
+            "• Подключением банковских терминалов\n"
+            "• Настройкой безналичной оплаты\n\n"
+            "Опишите вашу ситуацию."
+        ),
+        "quick_errors": (
+            "🛠️ **Ошибки и сбои**\n\n"
+            "Распространенные проблемы:\n"
+            "• Касса не включается\n"
+            "• Киоск зависает\n"
+            "• Ошибка связи с сервером\n"
+            "• Принтер не печатает\n\n"
+            "Напишите текст ошибки или опишите проблему."
+        ),
+        "quick_status": "📊 Статистику бота может показать только администратор. Используйте команду /status",
+        "quick_health": "🏥 Проверку систем может выполнить только администратор. Используйте команду /health"
+    }
+    
+    response_text = responses.get(query.data, "❓ Неизвестная команда")
+    
+    # Показываем кнопки с предложениями
+    if query.data in ["quick_tech", "quick_general", "quick_cash_setup", "quick_kiosk_setup", "quick_payment", "quick_errors"]:
+        query_type = "technical" if "tech" in query.data or "cash" in query.data or "kiosk" in query.data or "payment" in query.data or "errors" in query.data else "general"
+        suggestions = get_suggested_questions(query_type)
+        
+        # Добавляем предложения
+        if suggestions:
+            response_text += "\n\n**Популярные вопросы:**\n"
+            for i, suggestion in enumerate(suggestions[:3], 1):
+                response_text += f"{i}. {suggestion}\n"
+            response_text += "\nИли напишите свой вопрос:"
+    
+    # Отправляем ответ с кнопками
+    await query.edit_message_text(
+        text=response_text,
+        reply_markup=get_quick_access_keyboard(chat_type),
+        parse_mode="Markdown"
+    )
+
 # ====================== GRACEFUL DEGRADATION ======================
 async def robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
     """
@@ -1296,12 +1480,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ============ ЭТАП 6: Отправка ответа ============
     if not final_reply:
-       # final_reply = (
-       #     "Извините, я не смог найти точный ответ на ваш вопрос. "
-       #     "Попробуйте переформулировать или обратитесь в поддержку."
-       # )
-        return 
-        source = "default_fallback"
+        # Показываем предложения переформулировать
+        query_type = classify_query_type(raw_text)
+        suggestions = get_suggested_questions(query_type)
+        
+        fallback_text = (
+            "🤔 К сожалению, я не нашел ответ на ваш вопрос.\n\n"
+            "Попробуйте:\n"
+            "• Переформулировать вопрос другими словами\n"
+            "• Использовать более конкретные термины\n"
+            "• Выбрать из популярных вопросов ниже\n\n"
+        )
+        
+        if suggestions:
+            fallback_text += "**Популярные вопросы:**\n"
+            for i, suggestion in enumerate(suggestions[:3], 1):
+                fallback_text += f"{i}. {suggestion}\n"
+        
+        fallback_text += f"\nИли используйте кнопки быстрого доступа:"
+        
+        await send_long_message(
+            context.bot, 
+            update.effective_chat.id, 
+            fallback_text,
+            reply_to_message_id=update.message.message_id
+        )
+        
+        # Показываем кнопки быстрого доступа
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🔍 Выберите категорию вопроса:",
+            reply_markup=get_quick_access_keyboard(chat_type)
+        )
+        return
     
     # Сохраняем в кэш (БЕЗ смайлика)
     response_cache[cache_key] = final_reply
@@ -1601,6 +1812,23 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка чтения логов: {e}")
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Команда /start - показывает приветствие и кнопки быстрого доступа
+    """
+    chat_type = update.effective_chat.type
+    user = update.effective_user
+    user_name = user.first_name or ""
+    
+    # Персонализированное приветствие
+    welcome_text = get_adaptive_context_message(chat_type, user_name)
+    
+    await update.message.reply_text(
+        text=welcome_text,
+        reply_markup=get_quick_access_keyboard(chat_type),
+        parse_mode="Markdown"
+    )
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список команд"""
     if update.effective_user.id not in ADMIN_IDS:
@@ -1748,6 +1976,7 @@ if __name__ == "__main__":
     ))
     
     # ============ КОМАНДЫ АДМИНИСТРАТОРА ============
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("reload", reload_kb))
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
@@ -1762,6 +1991,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
+    
+    # ============ ОБРАБОТЧИК КНОПОК ============
+    app.add_handler(CallbackQueryHandler(handle_quick_access_callback))
 
     
     # ============ ОБРАБОТЧИК ОШИБОК ============
