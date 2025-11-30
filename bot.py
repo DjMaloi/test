@@ -676,9 +676,11 @@ async def search_in_collection(
     collection,
     embedder_type: str,
     query: str,
-    threshold: float = VECTOR_THRESHOLD,
+    threshold: float = None,
     n_results: int = 10
 ) -> Tuple[Optional[str], float, List[str]]:
+    if threshold is None:
+        threshold = VECTOR_THRESHOLD  # ✅ Защита от None
     """Универсальная функция векторного поиска с кэшированием эмбеддингов"""
     if not collection or collection.count() == 0:
         return None, 1.0, []
@@ -724,7 +726,11 @@ async def search_in_collection(
         return None, 1.0, []
 
 # Оптимизированный поиск с параллельными запросами
-async def parallel_vector_search(query: str, threshold: float = VECTOR_THRESHOLD) -> Tuple[Optional[str], str, float]:
+async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[Optional[str], str, float]:
+    
+    if threshold is None:
+        threshold = VECTOR_THRESHOLD  # ✅ Подставляем только при вызове
+
     """Параллельный векторный поиск в обеих коллекциях"""
     tasks = []
     
