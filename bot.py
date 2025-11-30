@@ -1086,9 +1086,28 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     cache_usage = f"{len(response_cache)}/{CACHE_SIZE}"
     
+    # Получаем статистику кэша эмбеддингов
+    try:
+        from functools import lru_cache
+        general_cache_info = get_embedding_general.cache_info()
+        technical_cache_info = get_embedding_technical.cache_info()
+        
+        embedding_cache = (
+            f"General: {general_cache_info.hits}/{general_cache_info.hits + general_cache_info.misses} "
+            f"({general_cache_info.currsize}/{general_cache_info.maxsize})\n"
+            f"  • Technical: {technical_cache_info.hits}/{technical_cache_info.hits + technical_cache_info.misses} "
+            f"({technical_cache_info.currsize}/{technical_cache_info.maxsize})"
+        )
+    except Exception:
+        embedding_cache = "❌ Недоступно"
+    
     total = stats['total']
     cached_pct = (stats['cached'] / total * 100) if total > 0 else 0
     vector_pct = (stats['vector'] / total * 100) if total > 0 else 0
+    keyword_pct = (stats['keyword'] / total * 100) if total > 0 else 0
+    
+    # Эффективность бота (сколько запросов обработано без AI)
+    efficiency = ((stats['cached'] + stats['keyword']) / total * 100) if total > 0 else 0
     
     text = (
         f"📊 СТАТУС БОТА\n\n"
@@ -1096,17 +1115,21 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Записей в базе:\n"
         f"  • General: {count_general}\n"
         f"  • Technical: {count_technical}\n\n"
-        f"Статистика запросов:\n"
+        f"📈 Статистика запросов:\n"
         f"Всего: {stats['total']}\n"
-        f"  • Из кэша: {stats['cached']} ({cached_pct:.1f}%)\n"
+        f"  • Из кэша ответов: {stats['cached']} ({cached_pct:.1f}%)\n"
+        f"  • Ключевые слова: {stats['keyword']} ({keyword_pct:.1f}%)\n"
         f"  • Векторный поиск: {stats['vector']} ({vector_pct:.1f}%)\n"
-        f"  • Ключевые слова: {stats['keyword']}\n"
         f"  • Groq API: {stats['groq']}\n"
         f"  • Ошибки: {stats['errors']}\n\n"
-        f"Кэш: {cache_usage} записей\n"
-        f"Порог вектора: {VECTOR_THRESHOLD}\n"
-        f"\n"
-        f"Alarm-уведомление:\n"
+        f"🚀 Производительность:\n"
+        f"  • Эффективность: {efficiency:.1f}% (без AI)\n"
+        f"  • Порог вектора: {VECTOR_THRESHOLD}\n\n"
+        f"💾 Кэширование:\n"
+        f"  • Ответы: {cache_usage} записей\n"
+        f"  • Эмбеддинги:\n"
+        f"    {embedding_cache}\n\n"
+        f"🔔 Alarm-уведомление:\n"
         f"  {'✅ Активно: ' + current_alarm[:50] + '...' if current_alarm and len(current_alarm) > 50 else current_alarm if current_alarm else '❌ Не установлено'}\n"
     )
 
