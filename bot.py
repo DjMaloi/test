@@ -6,6 +6,7 @@ import asyncio
 from hashlib import md5
 from typing import Optional, Tuple, List
 from contextlib import asynccontextmanager
+from functools import lru_cache
 
 # Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,6 +29,27 @@ VECTOR_THRESHOLD = 0.65  # Понижен с 0.7 до 0.65 для лучшего
 MAX_MESSAGE_LENGTH = 4000
 CACHE_SIZE = 2000  # Увеличен с 1000
 CACHE_TTL = 7200  # Увеличен с 3600 (2 часа)
+
+# ====================== КЛАССЫ ИСКЛЮЧЕНИЙ ======================
+class BotError(Exception):
+    """Базовый класс для ошибок бота"""
+    pass
+
+class DatabaseError(BotError):
+    """Ошибки базы данных (ChromaDB, Google Sheets)"""
+    pass
+
+class AIServiceError(BotError):
+    """Ошибки AI сервисов (Groq, эмбеддинги)"""
+    pass
+
+class TelegramError(BotError):
+    """Ошибки Telegram API"""
+    pass
+
+class ConfigurationError(BotError):
+    """Ошибки конфигурации"""
+    pass
 
 CRITICAL_MISMATCHES = {
     "касса": ["киоск", "КСО", "сканер", "принтер чеков", "терминал самообслуживания"],
@@ -278,6 +300,25 @@ def save_stats():
 # ====================== КЭШИРОВАНИЕ ======================
 response_cache = TTLCache(maxsize=CACHE_SIZE, ttl=CACHE_TTL)
 
+# Кэширование эмбеддингов для ускорения
+@lru_cache(maxsize=1000)
+def get_embedding_general(text: str) -> List[float]:
+    """Кэшированное получение эмбеддинга для General модели"""
+    try:
+        return embedder_general.encode(text).tolist()
+    except Exception as e:
+        logger.error(f"❌ Ошибка эмбеддинга General: {e}")
+        raise AIServiceError(f"General embedding error: {e}")
+
+@lru_cache(maxsize=1000)
+def get_embedding_technical(text: str) -> List[float]:
+    """Кэшированное получение эмбеддинга для Technical модели"""
+    try:
+        return embedder_technical.encode(text).tolist()
+    except Exception as e:
+        logger.error(f"❌ Ошибка эмбеддинга Technical: {e}")
+        raise AIServiceError(f"Technical embedding error: {e}")
+
 def preprocess(text: str) -> str:
     """Нормализует текст для поиска и кэширования"""
     text = text.lower()
@@ -295,13 +336,13 @@ async def safe_typing(bot, chat_id):
 # ====================== ВЕКТОРНЫЙ ПОИСК ======================
 async def search_in_collection(
     collection,
-    embedder: SentenceTransformer,
+    embedder_type: str,
     query: str,
     threshold: float = VECTOR_THRESHOLD,
     n_results: int = 10
 ) -> Tuple[Optional[str], float, List[str]]:
     """
-    Универсальная функция векторного поиска
+    Универсальная функция векторного поиска с кэшированием эмбеддингов
     
     Возвращает: (лучший_ответ, расстояние, топ_результаты_для_логов)
     """
@@ -309,8 +350,13 @@ async def search_in_collection(
         return None, 1.0, []
     
     try:
-        # Генерируем эмбеддинг запроса
-        emb = embedder.encode(query).tolist()
+        # Используем кэшированные эмбеддинги
+        if embedder_type == "general":
+            emb = get_embedding_general(query)
+        elif embedder_type == "technical":
+            emb = get_embedding_technical(query)
+        else:
+            raise AIServiceError(f"Unknown embedder type: {embedder_type}")
         
         # Выполняем поиск
         results = collection.query(
@@ -338,9 +384,15 @@ async def search_in_collection(
         
         return best_answer, best_distance, top_log
         
+    except chromadb.errors.DuplicateIDException as e:
+        logger.warning(f"⚠️ Дубликат ID в векторном поиске: {e}")
+        return None, 1.0, []
+    except chromadb.errors.InvalidDimensionException as e:
+        logger.error(f"❌ Неверная размерность вектора: {e}")
+        return None, 1.0, []
     except Exception as e:
         logger.error(f"❌ Ошибка векторного поиска: {e}", exc_info=True)
-        return None, 1.0, []
+        raise DatabaseError(f"Vector search error: {e}")
 
 # ====================== GROQ API ======================
 @asynccontextmanager
@@ -530,8 +582,8 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
                 keys = [row[0].strip() for row in valid_rows]
                 answers = [row[1].strip() for row in valid_rows]
                 
-                # Генерируем эмбеддинги
-                embeddings = embedder_general.encode(keys).tolist()
+                # Используем кэшированные эмбеддинги
+                embeddings = [get_embedding_general(key) for key in keys]
                 
                 # Сохраняем query + answer в метаданных
                 collection_general.add(
@@ -555,7 +607,8 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
                 keys = [row[0].strip() for row in valid_rows]
                 answers = [row[1].strip() for row in valid_rows]
                 
-                embeddings = embedder_technical.encode(keys).tolist()
+                # Используем кэшированные эмбеддинги
+                embeddings = [get_embedding_technical(key) for key in keys]
                 
                 collection_technical.add(
                     ids=[f"technical_{i}" for i in range(len(valid_rows))],
@@ -671,6 +724,92 @@ async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, 
 
 
 
+# ====================== УНИФИЦИРОВАННЫЙ ПОИСК ======================
+async def unified_keyword_search(clean_text: str) -> Optional[str]:
+    """
+    Единая функция поиска по ключевым словам
+    
+    Приоритет:
+    1. Поиск в метаданных ChromaDB (быстро)
+    2. Если ничего не найдено - поиск в Google Sheets (медленно)
+    """
+    # Этап 1: Быстрый поиск в метаданных ChromaDB
+    try:
+        # Поиск в General
+        results = collection_general.get(
+            where={"query": {"$eq": clean_text}},
+            include=["metadatas"]
+        )
+        if results["metadatas"]:
+            answer = results["metadatas"][0].get("answer")
+            if answer:
+                stats["keyword"] += 1
+                save_stats()
+                logger.info(f"🔑 KEYWORD MATCH (General) | query='{clean_text}'")
+                return answer
+    except chromadb.errors.DuplicateIDException as e:
+        logger.warning(f"⚠️ Дубликат ID в ChromaDB General: {e}")
+    except chromadb.errors.InvalidDimensionException as e:
+        logger.error(f"❌ Неверная размерность вектора в General: {e}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка поиска в метаданных General: {e}", exc_info=True)
+        raise DatabaseError(f"ChromaDB General error: {e}")
+
+    try:
+        # Поиск в Technical
+        results = collection_technical.get(
+            where={"query": {"$eq": clean_text}},
+            include=["metadatas"]
+        )
+        if results["metadatas"]:
+            answer = results["metadatas"][0].get("answer")
+            if answer:
+                stats["keyword"] += 1
+                save_stats()
+                logger.info(f"🔑 KEYWORD MATCH (Technical) | query='{clean_text}'")
+                return answer
+    except chromadb.errors.DuplicateIDException as e:
+        logger.warning(f"⚠️ Дубликат ID в ChromaDB Technical: {e}")
+    except chromadb.errors.InvalidDimensionException as e:
+        logger.error(f"❌ Неверная размерность вектора в Technical: {e}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка поиска в метаданных Technical: {e}", exc_info=True)
+        raise DatabaseError(f"ChromaDB Technical error: {e}")
+
+    # Этап 2: Поиск в Google Sheets (только если ничего не найдено)
+    try:
+        result_general = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:B").execute()
+        general_rows = result_general.get("values", [])
+        
+        result_technical = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:B").execute()
+        technical_rows = result_technical.get("values", [])
+        
+        all_rows = general_rows + technical_rows
+        
+        for row in all_rows:
+            if len(row) >= 2:
+                keyword = row[0].strip().lower()
+                answer = row[1].strip()
+                
+                # Простое вхождение подстроки
+                if keyword in clean_text or clean_text in keyword:
+                    stats["keyword"] += 1
+                    save_stats()
+                    logger.info(f"🔑 KEYWORD MATCH (Sheets) | keyword=\"{keyword[:50]}\"")
+                    return answer
+                    
+    except googleapiclient.errors.HttpError as e:
+        logger.error(f"❌ HTTP ошибка Google Sheets: {e}")
+        raise DatabaseError(f"Google Sheets HTTP error: {e}")
+    except googleapiclient.errors.Error as e:
+        logger.error(f"❌ Ошибка API Google Sheets: {e}")
+        raise DatabaseError(f"Google Sheets API error: {e}")
+    except Exception as e:
+        logger.error(f"❌ Неизвестная ошибка Google Sheets: {e}", exc_info=True)
+        raise DatabaseError(f"Google Sheets unknown error: {e}")
+    
+    return None
+
 # ====================== ОСНОВНОЙ ОБРАБОТЧИК ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главная функция обработки сообщений"""
@@ -746,40 +885,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# ============ ЭТАП 1.5: Поиск по точному совпадению ключа (в метаданных) ============
-    if not best_answer:
-        try:
-            # Поиск в General
-            results = collection_general.get(
-                where={"query": {"$eq": clean_text}},
-                include=["metadatas"]
-            )
-            if results["metadatas"]:
-                best_answer = results["metadatas"][0].get("answer")
-                if best_answer:
-                    source = "keyword"
-                    stats["keyword"] += 1
-                    save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH (General) | query='{clean_text}'")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка поиска по метаданным General: {e}")
-
-    if not best_answer:
-        try:
-            # Поиск в Technical
-            results = collection_technical.get(
-                where={"query": {"$eq": clean_text}},
-                include=["metadatas"]
-            )
-            if results["metadatas"]:
-                best_answer = results["metadatas"][0].get("answer")
-                if best_answer:
-                    source = "keyword"
-                    stats["keyword"] += 1
-                    save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH (Technical) | query='{clean_text}'")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка поиска по метаданным Technical: {e}")
+# ============ ЭТАП 1.5: Поиск по ключевым словам ============
+    best_answer = await unified_keyword_search(clean_text)
+    if best_answer:
+        source = "keyword"
 
 
     
@@ -794,52 +903,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"❌ Не удалось отправить alarm: {e}")
 
-
-    
     # Показываем "печатает", только если ответ НЕ из кэша
     await safe_typing(context.bot, update.effective_chat.id)
-
-    best_answer = None
-    source = "none"
-    distance = 1.0
-    
-    # ============ ЭТАП 1: Поиск по ключевым словам в Google Sheets ============
-    try:
-        all_rows = []
-        
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:B").execute()
-        all_rows.extend(result.get("values", []))
-        
-        result = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:B").execute()
-        all_rows.extend(result.get("values", []))
-        
-        for row in all_rows:
-            if len(row) >= 2:
-                keyword = row[0].strip().lower()
-                answer = row[1].strip()
-                
-                # Простое вхождение подстроки
-                if keyword in clean_text or clean_text in keyword:
-                    best_answer = answer
-                    source = "keyword"
-                    stats["keyword"] += 1
-                    save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH | keyword=\"{keyword[:50]}\"")
-                    break
-                    
-    except Exception as e:
-        logger.error(f"❌ Ошибка Google Sheets: {e}", exc_info=True)
     
     # ============ ЭТАП 2: Векторный поиск (General) ============
     if not best_answer:
         answer, dist, top_log = await search_in_collection(
             collection_general,
-            embedder_general,
+            "general",
             clean_text
         )
         
         if answer:
-            # 🔍 Проверяем, не противоречит ли ответ вопросу
+            # Проверяем, не противоречит ли ответ вопросу
             if is_mismatch(raw_text, answer):
                 mismatch_words = [w for w in CRITICAL_MISMATCHES.get("касса", []) if w in answer.lower()]
                 if not mismatch_words:
@@ -870,7 +946,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not best_answer:
         answer, dist, top_log = await search_in_collection(
             collection_technical,
-            embedder_technical,
+            "technical",
             clean_text
         )
         
