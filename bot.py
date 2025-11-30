@@ -1360,12 +1360,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean_text = preprocess(raw_text)
     cache_key = md5(clean_text.encode()).hexdigest()
     
-    if cache_key in response_cache:
+    # Проверяем кэш через метод get()
+    cached_answer = response_cache.get(cache_key)
+    if cached_answer is not None:
         stats["cached"] += 1
         save_stats()
         logger.info(f"💾 КЭШИРОВАННЫЙ ОТВЕТ для user={user.id}")
     
-        cached_answer = response_cache[cache_key]
         emoji = get_source_emoji("cached")
         final_text = f"{cached_answer}\n\n{emoji}"
     
@@ -1542,7 +1543,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count_general = collection_general.count() if collection_general else 0
     count_technical = collection_technical.count() if collection_technical else 0
     
-    cache_usage = f"{len(response_cache)}/{CACHE_SIZE}"
+    # Получаем размер кэша ответов через метод get_stats()
+    try:
+        response_stats = response_cache.get_stats()
+        cache_usage = f"{response_stats['size']}/{CACHE_SIZE}"
+    except Exception:
+        cache_usage = f"❌/{CACHE_SIZE}"
     
     try:
         cache_stats = get_cache_stats()
@@ -1601,9 +1607,24 @@ async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🧹 Начинаю очистку кэшей...")
     
-    old_response_size = len(response_cache)
-    old_general_size = len(embedding_cache_general.cache)
-    old_technical_size = len(embedding_cache_technical.cache)
+    # Получаем размеры кэшей через методы get_stats()
+    try:
+        response_stats = response_cache.get_stats()
+        old_response_size = response_stats['size']
+    except Exception:
+        old_response_size = 0
+    
+    try:
+        general_stats = embedding_cache_general.get_stats()
+        old_general_size = general_stats['size']
+    except Exception:
+        old_general_size = 0
+    
+    try:
+        technical_stats = embedding_cache_technical.get_stats()
+        old_technical_size = technical_stats['size']
+    except Exception:
+        old_technical_size = 0
     
     response_cache.clear()
     embedding_cache_general.clear()
