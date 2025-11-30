@@ -3,21 +3,18 @@ import re
 import json
 import logging
 import asyncio
+import time
+import gc
 from hashlib import md5
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 from contextlib import asynccontextmanager
-from functools import lru_cache
+from threading import RLock
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 
 # Telegram imports
-import asyncio
-import logging
-import os
-import hashlib
-import time
-from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from telegram.error import TimedOut, NetworkError, RetryAfter
 
 # Google Sheets
@@ -31,32 +28,11 @@ import chromadb
 from groq import AsyncGroq
 
 # ====================== КОНСТАНТЫ ======================
-GROQ_SEM = asyncio.Semaphore(3)  # Увеличено с 2 до 3
-VECTOR_THRESHOLD = 0.65  # Понижен с 0.7 до 0.65 для лучшего покрытия
+GROQ_SEM = asyncio.Semaphore(3)
+VECTOR_THRESHOLD = 0.65
 MAX_MESSAGE_LENGTH = 4000
-CACHE_SIZE = 2000  # Увеличен с 1000
-CACHE_TTL = 7200  # Увеличен с 3600 (2 часа)
-
-# ====================== КЛАССЫ ИСКЛЮЧЕНИЙ ======================
-class BotError(Exception):
-    """Базовый класс для ошибок бота"""
-    pass
-
-class DatabaseError(BotError):
-    """Ошибки базы данных (ChromaDB, Google Sheets)"""
-    pass
-
-class AIServiceError(BotError):
-    """Ошибки AI сервисов (Groq, эмбеддинги)"""
-    pass
-
-class TelegramError(BotError):
-    """Ошибки Telegram API"""
-    pass
-
-class ConfigurationError(BotError):
-    """Ошибки конфигурации"""
-    pass
+CACHE_SIZE = 2000
+CACHE_TTL = 7200
 
 CRITICAL_MISMATCHES = {
     "касса": ["киоск", "КСО", "сканер", "принтер чеков", "терминал самообслуживания"],
@@ -64,20 +40,16 @@ CRITICAL_MISMATCHES = {
 }
 
 def is_mismatch(question: str, answer: str) -> bool:
-    """
-    Проверяет, не противоречит ли ответ вопросу
-    """
+    """Проверяет, не противоречит ли ответ вопросу"""
     question_lower = question.lower()
     answer_lower = answer.lower()
 
-    # Правило 1: вопрос про кассу → ответ не должен содержать "киоск", "КСО"
     if "касса" in question_lower:
         forbidden = ["киоск", "КСО", "самообслуживания", "самообслуживани", "kiosk"]
         for word in forbidden:
             if word.lower() in answer_lower:
                 return True
 
-    # Правило 2: вопрос про киоск → ответ не должен содержать "касса", "онлайн-касса"
     if "киоск" in question_lower or "КСО" in question_lower or "самообслуживани" in question_lower:
         forbidden = ["касса", "онлайн-касса", "фискальный", "регистратор", "терминал оплаты"]
         for word in forbidden:
@@ -98,8 +70,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# Уменьшаем шум от библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
@@ -111,7 +81,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 SHEET_ID = os.getenv("SHEET_ID")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x]
 
-# Валидация конфигурации
 if not all([TELEGRAM_TOKEN, GROQ_API_KEY, SHEET_ID]):
     raise ValueError("Отсутствуют обязательные переменные окружения!")
 
@@ -126,7 +95,6 @@ sheet = build("sheets", "v4", credentials=creds).spreadsheets()
 CHROMA_DIR = "/app/chroma"
 chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 
-# Блокировка для безопасного обновления коллекций
 collection_lock = asyncio.Lock()
 collection_general = None
 collection_technical = None
@@ -148,9 +116,6 @@ PAUSE_FILE = "/app/data/paused.flag"
 STATS_FILE = "/app/data/stats.json"
 ADMINLIST_FILE = "/app/data/adminlist.json"
 ALARM_FILE = "/app/data/alarm.txt"
-THRESHOLD_FILE = "/app/data/threshold.json"
-LOG_FILE = "/app/data/bot.log"
-
 
 # ====================== ФУНКЦИИ ПАУЗЫ ======================
 def is_paused() -> bool:
@@ -170,38 +135,26 @@ def set_paused(state: bool):
             pass
 
 # ====================== УПРАВЛЕНИЕ АДМИНАМИ ======================
-current_alarm: Optional[str] = None  # Новое: глобальная переменная для хранения текущего alarm
-
+current_alarm: Optional[str] = None
 adminlist = set()
 
 def load_adminlist() -> set:
     """Загружает список админов из файла"""
     global adminlist
     try:
-        #logger.info(f"🔍 Ищу adminlist.json по пути: {ADMINLIST_FILE}")
-        
         os.makedirs(os.path.dirname(ADMINLIST_FILE), exist_ok=True)
-        
         with open(ADMINLIST_FILE, "r") as f:
             data = json.load(f)
-           # logger.info(f"📄 Прочитан файл: {data}")
-        
-        # ИЗМЕНЕНИЕ №1: поддержка формата {"admins": [...]}
         adminlist = {int(x) for x in data.get("admins", [])}
-        #logger.info(f"✅ Загружено {len(adminlist)} админов: {adminlist}")
         return adminlist
-    
     except FileNotFoundError:
-        #logger.error(f"❌ Файл не найден: {ADMINLIST_FILE}")
         adminlist = set()
-        save_adminlist()  # Создаём пустой файл
+        save_adminlist()
         return adminlist
-    
     except json.JSONDecodeError as e:
         logger.error(f"❌ Ошибка парсинга JSON: {e}")
         adminlist = set()
         return adminlist
-    
     except Exception as e:
         logger.error(f"❌ Неожиданная ошибка: {e}", exc_info=True)
         adminlist = set()
@@ -213,7 +166,6 @@ def save_adminlist():
     try:
         os.makedirs(os.path.dirname(ADMINLIST_FILE), exist_ok=True)
         with open(ADMINLIST_FILE, "w") as f:
-            # ИЗМЕНЕНИЕ №2: сохраняем в формате {"admins": [...]}
             json.dump({"admins": list(adminlist)}, f, indent=2)
         logger.info(f"💾 Сохранено {len(adminlist)} админов")
     except Exception as e:
@@ -238,7 +190,6 @@ def remove_admin(user_id: int):
     logger.info(f"➖ Пользователь {user_id} удалён из adminlist")
 
 # ====================== ALARM СИСТЕМА ======================
-
 def load_alarm() -> Optional[str]:
     """Загружает текст alarm из файла"""
     try:
@@ -272,32 +223,6 @@ def clear_alarm():
     except Exception as e:
         logger.error(f"❌ Ошибка удаления alarm: {e}")
 
-# ====================== УПРАВЛЕНИЕ ПОРОГОМ ======================
-
-def load_threshold() -> Optional[float]:
-    """Загружает порог векторного поиска из файла"""
-    try:
-        if os.path.exists(THRESHOLD_FILE):
-            with open(THRESHOLD_FILE, "r") as f:
-                data = json.load(f)
-                threshold = data.get("threshold")
-                if threshold is not None and 0.0 <= threshold <= 1.0:
-                    logger.info(f"🎚️ Загружен порог: {threshold}")
-                    return threshold
-    except Exception as e:
-        logger.error(f"❌ Ошибка загрузки порога: {e}")
-    return None
-
-def save_threshold(threshold: float):
-    """Сохраняет порог векторного поиска в файл"""
-    try:
-        os.makedirs(os.path.dirname(THRESHOLD_FILE), exist_ok=True)
-        with open(THRESHOLD_FILE, "w") as f:
-            json.dump({"threshold": threshold}, f, indent=2)
-        logger.info(f"💾 Порог сохранён: {threshold}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка сохранения порога: {e}")
-
 # ====================== СТАТИСТИКА ======================
 stats = {
     "total": 0,
@@ -305,7 +230,10 @@ stats = {
     "groq": 0,
     "vector": 0,
     "keyword": 0,
-    "errors": 0
+    "errors": 0,
+    "no_answer": 0,
+    "quality_good": 0,
+    "quality_bad": 0
 }
 
 def load_stats():
@@ -316,7 +244,6 @@ def load_stats():
             with open(STATS_FILE, "r") as f:
                 loaded = json.load(f)
                 stats.update(loaded)
-                #logger.info(f"✓ Статистика загружена: {stats['total']} запросов")
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки статистики: {e}")
 
@@ -329,16 +256,47 @@ def save_stats():
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения статистики: {e}")
 
+def track_quality(distance: float, source: str):
+    """Отслеживает качество ответов"""
+    if source in ["vector_general", "vector_technical"]:
+        if distance < 0.5:
+            stats["quality_good"] += 1
+            logger.info(f"🟢 Отличное совпадение: {distance:.3f}")
+        elif distance > 0.8:
+            stats["quality_bad"] += 1
+            logger.warning(f"🔴 Плохое совпадение: {distance:.3f}")
+        else:
+            logger.info(f"🟡 Среднее совпадение: {distance:.3f}")
+
+def get_quality_metrics() -> dict:
+    """Возвращает метрики качества"""
+    total = stats['total']
+    if total == 0:
+        return {}
+    
+    success_rate = (stats['cached'] + stats['vector'] + stats['keyword']) / total
+    no_answer_rate = stats.get('no_answer', 0) / total
+    
+    vector_total = stats['vector']
+    if vector_total > 0:
+        good_rate = stats.get('quality_good', 0) / vector_total
+        bad_rate = stats.get('quality_bad', 0) / vector_total
+    else:
+        good_rate = bad_rate = 0
+    
+    return {
+        'success_rate': success_rate,
+        'no_answer_rate': no_answer_rate,
+        'vector_good_rate': good_rate,
+        'vector_bad_rate': bad_rate,
+        'total_requests': total
+    }
+
 # ====================== ОПТИМИЗИРОВАННОЕ КЭШИРОВАНИЕ ======================
-import gc
-from threading import RLock
-from collections import OrderedDict
 
 # Улучшенный LRU кэш с метриками
 class AdvancedLRUCache:
-    """
-    Продвинутый LRU кэш с метриками и автоматической очисткой
-    """
+    """Продвинутый LRU кэш с метриками и автоматической очисткой"""
     def __init__(self, maxsize: int = 1000, cleanup_ratio: float = 0.8):
         self.maxsize = maxsize
         self.cleanup_ratio = cleanup_ratio
@@ -350,9 +308,8 @@ class AdvancedLRUCache:
     def get(self, key):
         with self.lock:
             if key in self.cache:
-                # Перемещаем в конец (LRU)
                 value = self.cache.pop(key)
-                self.cache[key] = value
+                self.cache[key] = value  # Перемещаем в конец
                 self.hits += 1
                 return value
             else:
@@ -361,10 +318,8 @@ class AdvancedLRUCache:
     
     def put(self, key, value):
         with self.lock:
-            # Если ключ уже есть - обновляем
             if key in self.cache:
                 self.cache.pop(key)
-            # Если достигли лимита - чистим
             elif len(self.cache) >= self.maxsize:
                 self._cleanup()
             
@@ -374,7 +329,7 @@ class AdvancedLRUCache:
         """Удаляет старые элементы до cleanup_ratio от лимита"""
         cleanup_size = int(self.maxsize * (1 - self.cleanup_ratio))
         while len(self.cache) > cleanup_size:
-            self.cache.popitem(last=False)  # Удаляем самые старые
+            self.cache.popitem(last=False)
     
     def clear(self):
         with self.lock:
@@ -400,9 +355,7 @@ embedding_cache_technical = AdvancedLRUCache(maxsize=2000, cleanup_ratio=0.8)
 
 # Кэш ответов с метриками
 class ResponseCache:
-    """
-    Кэш ответов с TTL и метриками
-    """
+    """Кэш ответов с TTL и метриками"""
     def __init__(self, maxsize: int = 2000, ttl: int = 7200):
         self.maxsize = maxsize
         self.ttl = ttl
@@ -416,7 +369,6 @@ class ResponseCache:
         with self.lock:
             current_time = time.time()
             
-            # Проверяем TTL
             if key in self.timestamps:
                 if current_time - self.timestamps[key] > self.ttl:
                     self._remove(key)
@@ -434,7 +386,6 @@ class ResponseCache:
         with self.lock:
             current_time = time.time()
             
-            # Чистим старые записи
             if len(self.cache) >= self.maxsize:
                 self._cleanup()
             
@@ -445,7 +396,6 @@ class ResponseCache:
         """Удаляет просроченные и самые старые записи"""
         current_time = time.time()
         
-        # Удаляем просроченные
         expired_keys = [
             key for key, ts in self.timestamps.items()
             if current_time - ts > self.ttl
@@ -453,15 +403,8 @@ class ResponseCache:
         for key in expired_keys:
             self._remove(key)
         
-        # Если все еще много - удаляем самые старые
         if len(self.cache) >= self.maxsize:
-            # Сортируем по времени
-            sorted_items = sorted(
-                self.timestamps.items(), 
-                key=lambda x: x[1]
-            )
-            
-            # Удаляем 25% самых старых
+            sorted_items = sorted(self.timestamps.items(), key=lambda x: x[1])
             cleanup_count = int(self.maxsize * 0.25)
             for key, _ in sorted_items[:cleanup_count]:
                 self._remove(key)
@@ -498,37 +441,33 @@ def get_embedding_general(text: str) -> List[float]:
     """Оптимизированное получение эмбеддинга для General модели"""
     cache_key = f"general_{text}"
     
-    # Проверяем кэш
     cached = embedding_cache_general.get(cache_key)
     if cached is not None:
         return cached
     
-    # Генерируем новый эмбеддинг
     try:
         embedding = embedder_general.encode(text).tolist()
         embedding_cache_general.put(cache_key, embedding)
         return embedding
     except Exception as e:
         logger.error(f"❌ Ошибка эмбеддинга General: {e}")
-        raise AIServiceError(f"General embedding error: {e}")
+        raise Exception(f"General embedding error: {e}")
 
 def get_embedding_technical(text: str) -> List[float]:
     """Оптимизированное получение эмбеддинга для Technical модели"""
     cache_key = f"technical_{text}"
     
-    # Проверяем кэш
     cached = embedding_cache_technical.get(cache_key)
     if cached is not None:
         return cached
     
-    # Генерируем новый эмбеддинг
     try:
         embedding = embedder_technical.encode(text).tolist()
         embedding_cache_technical.put(cache_key, embedding)
         return embedding
     except Exception as e:
         logger.error(f"❌ Ошибка эмбеддинга Technical: {e}")
-        raise AIServiceError(f"Technical embedding error: {e}")
+        raise Exception(f"Technical embedding error: {e}")
 
 def get_cache_stats() -> Dict[str, Any]:
     """Возвращает статистику всех кэшей"""
@@ -546,15 +485,12 @@ def cleanup_caches():
     embedding_cache_general.clear()
     embedding_cache_technical.clear()
     
-    # Вызываем сборщик мусора
     collected = gc.collect()
     
     logger.info(f"🧹 Очистка завершена. Собрано объектов: {collected}")
     return collected
 
 # ====================== КЭШИРОВАНИЕ ======================
-# Старые функции оставлены для совместимости, но используют новые кэши
-
 def preprocess(text: str) -> str:
     """Нормализует текст для поиска и кэширования"""
     text = text.lower()
@@ -570,64 +506,12 @@ async def safe_typing(bot, chat_id):
         logger.error(f"❌ Ошибка индикатора 'печатает': {e}")
 
 # ====================== ОПТИМИЗАЦИЯ ПАРАЛЛЕЛИЗМА ======================
-import aiohttp
-from concurrent.futures import ThreadPoolExecutor
-
 # Пул потоков для CPU-intensive операций
 thread_pool = ThreadPoolExecutor(max_workers=4)
 
-# Оптимизированный поиск с параллельными запросами
-async def parallel_vector_search(query: str, threshold: float = VECTOR_THRESHOLD) -> Tuple[Optional[str], str, float]:
-    """
-    Параллельный векторный поиск в обеих коллекциях
-    
-    Returns:
-        (best_answer, source_type, distance)
-    """
-    tasks = []
-    
-    # Создаем задачи для параллельного выполнения
-    if collection_general and collection_general.count() > 0:
-        task_general = asyncio.create_task(
-            search_in_collection(collection_general, "general", query, threshold)
-        )
-        tasks.append(("general", task_general))
-    
-    if collection_technical and collection_technical.count() > 0:
-        task_technical = asyncio.create_task(
-            search_in_collection(collection_technical, "technical", query, threshold)
-        )
-        tasks.append(("technical", task_technical))
-    
-    if not tasks:
-        return None, "none", 1.0
-    
-    # Ждем выполнения всех задач
-    results = []
-    for source_type, task in tasks:
-        try:
-            answer, distance, _ = await asyncio.wait_for(task, timeout=10)
-            if answer:
-                results.append((answer, source_type, distance))
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Таймаут векторного поиска в {source_type}")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
-    
-    # Выбираем лучший результат (минимальное расстояние)
-    if results:
-        results.sort(key=lambda x: x[2])  # Сортируем по distance
-        best_answer, best_source, best_distance = results[0]
-        logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
-        return best_answer, f"vector_{best_source}", best_distance
-    
-    return None, "none", 1.0
-
 # Оптимизированная работа с Google Sheets
 class GoogleSheetsPool:
-    """
-    Пул подключений к Google Sheets с кэшированием
-    """
+    """Пул подключений к Google Sheets с кэшированием"""
     def __init__(self, max_connections: int = 3):
         self.max_connections = max_connections
         self.semaphore = asyncio.Semaphore(max_connections)
@@ -639,19 +523,16 @@ class GoogleSheetsPool:
         cache_key = f"range_{range_name}"
         current_time = time.time()
         
-        # Проверяем кэш
         if cache_key in self._cache:
             cached_data, cached_time = self._cache[cache_key]
             if current_time - cached_time < self._cache_ttl:
                 logger.debug(f"📋 Используем кэш Google Sheets: {range_name}")
                 return cached_data
         
-        # Загружаем данные
         async with self.semaphore:
             try:
                 loop = asyncio.get_event_loop()
                 
-                # Выполняем в потоке, так как googleapiclient синхронный
                 result = await loop.run_in_executor(
                     thread_pool,
                     lambda: sheet.values().get(
@@ -662,10 +543,8 @@ class GoogleSheetsPool:
                 
                 data = result.get("values", [])
                 
-                # Кэшируем результат
                 self._cache[cache_key] = (data, current_time)
                 
-                # Чистим старые записи в кэше
                 if len(self._cache) > 20:
                     self._cleanup_cache()
                 
@@ -674,7 +553,7 @@ class GoogleSheetsPool:
                 
             except Exception as e:
                 logger.error(f"❌ Ошибка Google Sheets ({range_name}): {e}")
-                raise DatabaseError(f"Google Sheets error: {e}")
+                raise Exception(f"Google Sheets error: {e}")
     
     def _cleanup_cache(self):
         """Чистит старые записи в кэше"""
@@ -694,51 +573,11 @@ class GoogleSheetsPool:
 # Глобальный пул для Google Sheets
 sheets_pool = GoogleSheetsPool(max_connections=3)
 
-# Оптимизированный Groq клиент с пулом соединений
-class OptimizedGroqClient:
-    """
-    Оптимизированный клиент Groq с пулом сессий
-    """
-    def __init__(self, api_key: str, pool_size: int = 5):
-        self.api_key = api_key
-        self.pool_size = pool_size
-        self._session_pool = asyncio.Queue(maxsize=pool_size)
-        self._initialized = False
-        
-    async def _get_session(self):
-        """Получает сессию из пула или создает новую"""
-        if not self._initialized:
-            # Инициализируем пул сессиями
-            for _ in range(self.pool_size):
-                session = aiohttp.ClientSession()
-                await self._session_pool.put(session)
-            self._initialized = True
-        
-        return await self._session_pool.get()
-    
-    async def _return_session(self, session):
-        """Возвращает сессию в пул"""
-        try:
-            await self._session_pool.put(session)
-        except asyncio.QueueFull:
-            # Если пул полон - закрываем сессию
-            await session.close()
-    
-    async def close(self):
-        """Закрывает все сессии"""
-        while not self._session_pool.empty():
-            session = await self._session_pool.get()
-            await session.close()
-        self._initialized = False
-
 # Оптимизированная функция поиска по ключевым словам
 async def optimized_keyword_search(clean_text: str) -> Optional[str]:
-    """
-    Оптимизированный поиск по ключевым словам с параллельными запросами
-    """
+    """Оптимизированный поиск по ключевым словам с параллельными запросами"""
     tasks = []
     
-    # Параллельно ищем в метаданных ChromaDB
     async def search_in_metadata(collection, collection_name):
         try:
             results = collection.get(
@@ -756,17 +595,14 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
             logger.warning(f"⚠️ Ошибка поиска в метаданных {collection_name}: {e}")
         return None
     
-    # Задачи для поиска в метаданных
     if collection_general:
         tasks.append(search_in_metadata(collection_general, "General"))
     
     if collection_technical:
         tasks.append(search_in_metadata(collection_technical, "Technical"))
     
-    # Задача для поиска в Google Sheets (если ничего не найдено в метаданных)
     async def search_in_sheets():
         try:
-            # Параллельно загружаем оба диапазона
             general_task = sheets_pool.get_range("General!A:B")
             technical_task = sheets_pool.get_range("Technical!A:B")
             
@@ -781,7 +617,6 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
                     keyword = row[0].strip().lower()
                     answer = row[1].strip()
                     
-                    # Простое вхождение подстроки
                     if keyword in clean_text or clean_text in keyword:
                         stats["keyword"] += 1
                         save_stats()
@@ -793,16 +628,13 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
         
         return None
     
-    # Выполняем параллельный поиск
     if tasks:
-        # Сначала ищем в метаданных
         metadata_results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for result in metadata_results:
             if isinstance(result, str) and result:
                 return result
     
-    # Если ничего не найдено - ищем в Google Sheets
     return await search_in_sheets()
 
 # ====================== ВЕКТОРНЫЙ ПОИСК ======================
@@ -813,22 +645,19 @@ async def search_in_collection(
     threshold: float = VECTOR_THRESHOLD,
     n_results: int = 10
 ) -> Tuple[Optional[str], float, List[str]]:
-    """
-    Универсальная функция векторного поиска с кэшированием эмбеддингов
-    
-    Возвращает: (лучший_ответ, расстояние, топ_результаты_для_логов)
-    """
+    """Универсальная функция векторного поиска с кэшированием эмбеддингов"""
     if not collection or collection.count() == 0:
         return None, 1.0, []
     
     try:
-        # Используем кэшированные эмбеддинги
+        # Выбираем нужный эмбеддер и кэш
         if embedder_type == "general":
-            emb = get_embedding_general(query)
-        elif embedder_type == "technical":
-            emb = get_embedding_technical(query)
+            embedder_func = get_embedding_general
         else:
-            raise AIServiceError(f"Unknown embedder type: {embedder_type}")
+            embedder_func = get_embedding_technical
+        
+        # Генерируем эмбеддинг с кэшированием
+        emb = embedder_func(query)
         
         # Выполняем поиск
         results = collection.query(
@@ -856,15 +685,67 @@ async def search_in_collection(
         
         return best_answer, best_distance, top_log
         
-    except chromadb.errors.DuplicateIDException as e:
-        logger.warning(f"⚠️ Дубликат ID в векторном поиске: {e}")
-        return None, 1.0, []
-    except chromadb.errors.InvalidDimensionException as e:
-        logger.error(f"❌ Неверная размерность вектора: {e}")
-        return None, 1.0, []
     except Exception as e:
         logger.error(f"❌ Ошибка векторного поиска: {e}", exc_info=True)
-        raise DatabaseError(f"Vector search error: {e}")
+        return None, 1.0, []
+
+# Оптимизированный поиск с параллельными запросами
+async def parallel_vector_search(query: str, threshold: float = VECTOR_THRESHOLD) -> Tuple[Optional[str], str, float]:
+    """Параллельный векторный поиск в обеих коллекциях"""
+    tasks = []
+    
+    if collection_general and collection_general.count() > 0:
+        task_general = asyncio.create_task(
+            search_in_collection(collection_general, "general", query, threshold)
+        )
+        tasks.append(("general", task_general))
+    
+    if collection_technical and collection_technical.count() > 0:
+        task_technical = asyncio.create_task(
+            search_in_collection(collection_technical, "technical", query, threshold)
+        )
+        tasks.append(("technical", task_technical))
+    
+    if not tasks:
+        return None, "none", 1.0
+    
+    results = []
+    for source_type, task in tasks:
+        try:
+            answer, distance, _ = await asyncio.wait_for(task, timeout=10)
+            if answer:
+                results.append((answer, source_type, distance))
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Таймаут векторного поиска в {source_type}")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
+    
+    if results:
+        results.sort(key=lambda x: x[2])
+        best_answer, best_source, best_distance = results[0]
+        logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
+        return best_answer, f"vector_{best_source}", best_distance
+    
+    return None, "none", 1.0
+
+# ====================== RATE LIMITING ======================
+user_requests = defaultdict(deque)
+RATE_LIMIT = 10
+RATE_WINDOW = 60
+
+def is_rate_limited(user_id: int) -> bool:
+    """Проверяет, не превышает ли пользователь лимит запросов"""
+    now = time.time()
+    user_times = user_requests[user_id]
+    
+    while user_times and user_times[0] < now - RATE_WINDOW:
+        user_times.popleft()
+    
+    if len(user_times) >= RATE_LIMIT:
+        return True
+    
+    user_times.append(now)
+    return False
 
 # ====================== GROQ API ======================
 @asynccontextmanager
@@ -880,18 +761,32 @@ async def groq_with_timeout(timeout: int = 20):
             raise
 
 async def improve_with_groq(original_answer: str, question: str) -> Optional[str]:
-    """
-    Улучшает ответ через Groq с учетом типа запроса
-    
-    Возвращает улучшенный ответ или None при ошибке
-    """
-    # Определяем тип запроса
-    query_type = classify_query_type(question)
-    system_prompt = get_contextual_prompt(query_type, is_fallback=False)
-    
+    """Улучшает ответ через Groq, делая его более понятным"""
+    system_prompt = (
+        "Ты — помощник техподдержки. Твоя задача — упростить и переформулировать "
+        "уже существующий ответ так, чтобы он был понятен обычному пользователю.\n\n"
+        
+        "ИНСТРУКЦИЯ:\n"
+        "1. Упрощай язык, но НЕ теряй точность и технические детали.\n"
+        "2. НИКОГДА не добавляй информацию, которой нет в исходном ответе.\n"
+        "3. Сохраняй ВСЕ ссылки, ID, артикулы, коды и термины без изменений.\n"
+        "4. Не заменяй термины: 'касса' ≠ 'киоск', 'КСО' ≠ 'терминал оплаты' — это разные вещи.\n"
+        "5. Если не понимаешь — верни оригинальный ответ без изменений.\n"
+        "6. Максимум 800 символов, не длиннее оригинала более чем на 20%.\n"
+        "7. НЕ используй списки, markdown или форматирование.\n"
+        "8. НЕ начинай с 'Конечно', 'Вот улучшенный ответ' и т.п. — только с сути.\n\n"
+        
+        "ЗАПРЕЩЕНО:\n"
+        "- НИКОГДА не заменяй 'киоск' на 'кассу' и наоборот.\n"
+        "- Не адаптируй термины под вопрос — передавай ответ В ТОЧНОСТИ как есть.\n"
+        "- Если в исходном ответе 'киоск' — не меняй на 'кассу', даже если вопрос про кассу.\n\n"
+        
+        "ФОРМАТ ВЫВОДА:\n"
+        "Один связный абзац, без вступлений — только улучшенный ответ."
+    )
+
     user_prompt = f"Исходный ответ:\n{original_answer}\n\nВопрос: {question}\n\nУлучшенный ответ:"
     
-    # 🔒 Запрет улучшения ложных ответов
     if "касса" in question.lower() and "киоск" in original_answer.lower():
         logger.warning("⚠️ Запрет улучшения: вопрос про 'кассу', но ответ содержит 'киоск'")
         return None
@@ -918,23 +813,17 @@ async def improve_with_groq(original_answer: str, question: str) -> Optional[str
             
             improved = resp.choices[0].message.content.strip()
             
-            # Проверяем качество улучшения
             if 30 < len(improved) <= 800 and len(improved) <= len(original_answer) * 1.2:
-                logger.info(f"✨ GROQ УЛУЧШИЛ ({query_type}) | было={len(original_answer)} → стало={len(improved)}")
                 return improved
             
             return None
             
     except Exception as e:
-        logger.warning(f"⚠️ Groq улучшение не удалось ({query_type}): {e}")
+        logger.warning(f"⚠️ Groq улучшение не удалось: {e}")
         return None
 
 async def fallback_groq(question: str) -> Optional[str]:
-    """
-    Запрос к Groq когда ничего не найдено в базе
-    
-    Возвращает ответ или None если модель не знает ответа
-    """
+    """Запрос к Groq когда ничего не найдено в базе"""
     system_prompt = (
         "Ты — помощник техподдержки. Отвечай ТОЛЬКО если уверен в ответе.\n\n"
         
@@ -957,8 +846,6 @@ async def fallback_groq(question: str) -> Optional[str]:
         "Один абзац или краткий список — только суть."
     )
 
-
-    
     user_prompt = f"Вопрос: {question}\n\nОтвет:"
     
     try:
@@ -979,7 +866,6 @@ async def fallback_groq(question: str) -> Optional[str]:
             
             answer = completion.choices[0].message.content.strip()
             
-            # Проверяем, что модель не отказалась отвечать
             if not answer or answer.upper().startswith("НЕТ ДАННЫХ") or \
                answer.lower().startswith("не знаю") or len(answer) < 10:
                 return None
@@ -999,7 +885,6 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
         try:
             logger.info("🔄 Начало обновления базы знаний из Google Sheets...")
             
-            # Читаем данные из Google Sheets
             result_general = sheet.values().get(
                 spreadsheetId=SHEET_ID, 
                 range="General!A:B"
@@ -1014,7 +899,6 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
             
             logger.info(f"📥 Загружено: General={len(general_rows)}, Technical={len(technical_rows)}")
             
-            # Удаляем старые коллекции
             for name in ["general_kb", "technical_kb"]:
                 try:
                     chroma_client.delete_collection(name)
@@ -1022,25 +906,20 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
                 except Exception as e:
                     logger.debug(f"🔍 Коллекция {name} не найдена или уже удалена: {e}")
             
-            # Создаём новые коллекции
             collection_general = chroma_client.create_collection("general_kb")
             collection_technical = chroma_client.create_collection("technical_kb")
             
-            # === Заполняем General ===
             if general_rows:
-                # Фильтруем пустые строки
                 valid_rows = [row for row in general_rows if len(row) >= 2 and row[0].strip()]
                 
                 keys = [row[0].strip() for row in valid_rows]
                 answers = [row[1].strip() for row in valid_rows]
                 
-                # Используем кэшированные эмбеддинги
-                embeddings = [get_embedding_general(key) for key in keys]
+                embeddings = embedder_general.encode(keys).tolist()
                 
-                # Сохраняем query + answer в метаданных
                 collection_general.add(
                     ids=[f"general_{i}" for i in range(len(valid_rows))],
-                    documents=keys,  # для векторного поиска
+                    documents=keys,
                     metadatas=[
                         {"query": keys[i], "answer": answers[i]} 
                         for i in range(len(valid_rows))
@@ -1052,15 +931,13 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
             else:
                 logger.info("🟡 General: нет данных для загрузки")
             
-            # === Заполняем Technical ===
             if technical_rows:
                 valid_rows = [row for row in technical_rows if len(row) >= 2 and row[0].strip()]
                 
                 keys = [row[0].strip() for row in valid_rows]
                 answers = [row[1].strip() for row in valid_rows]
                 
-                # Используем кэшированные эмбеддинги
-                embeddings = [get_embedding_technical(key) for key in keys]
+                embeddings = embedder_technical.encode(keys).tolist()
                 
                 collection_technical.add(
                     ids=[f"technical_{i}" for i in range(len(valid_rows))],
@@ -1083,31 +960,26 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
             stats["errors"] += 1
             save_stats()
 
-
-
 def get_source_emoji(source: str) -> str:
     """Возвращает смайлик в зависимости от источника ответа"""
     emoji_map = {
-        "cached": "💾",           # Из кэша
-        "keyword": "🔑",          # Ключевые слова
-        "vector_general": "🎯",   # Векторный поиск (General)
-        "vector_technical": "⚙️", # Векторный поиск (Technical)
-        "groq_fallback": "🤖",    # Ответ от AI
-        "default_fallback": "❓"  # Не найдено
+        "cached": "💾",
+        "keyword": "🔑",
+        "vector_general": "🎯",
+        "vector_technical": "⚙️",
+        "groq_fallback": "🤖",
+        "default_fallback": "❓"
     }
     return emoji_map.get(source, "")
-
 
 async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
     """Запускает автопроверку ключевого поиска при старте"""
     logger.info("🧪 Запуск автопроверки ключевого поиска...")
 
-    # Тестовый ключ, который ДОЛЖЕН быть в базе
-    test_query = "как дела"  # ← ЗАМЕНИ НА ЛЮБОЙ РЕАЛЬНЫЙ, ЕСТЬ В ТАБЛИЦЕ
+    test_query = "как дела"
     clean_test = preprocess(test_query)
 
     try:
-        # Проверяем General
         results = collection_general.get(
             where={"query": {"$eq": clean_test}},
             include=["metadatas"]
@@ -1117,7 +989,6 @@ async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
             answer = results["metadatas"][0]["answer"]
             logger.info(f"✅ УСПЕШНЫЙ ТЕСТ: найдено в General → '{answer}'")
         else:
-            # Проверяем Technical
             results = collection_technical.get(
                 where={"query": {"$eq": clean_test}},
                 include=["metadatas"]
@@ -1131,139 +1002,101 @@ async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"❌ ОШИБКА при автопроверке: {e}", exc_info=True)
 
+# ====================== ОТПРАВКА СООБЩЕНИЙ ======================
+async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, reply_to_message_id: int = None):
+    """Безопасно отправляет длинное сообщение с разбивкой и повторами"""
+    for attempt in range(max_retries):
+        try:
+            chunks = [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+            for idx, chunk in enumerate(chunks):
+                reply_id = reply_to_message_id if idx == 0 else None
+                await bot.send_message(
+                    chat_id=chat_id, 
+                    text=chunk,
+                    reply_to_message_id=reply_id
+                )
 
-# ====================== КЛАССИФИКАЦИЯ ЗАПРОСОВ ======================
-def classify_query_type(query: str) -> str:
-    """
-    Определяет тип запроса для выбора лучшей стратегии ответа
+            return True
+            
+        except RetryAfter as e:
+            wait_time = e.retry_after + 1
+            logger.warning(f"⏸️ Rate limit, ждём {wait_time}с...")
+            await asyncio.sleep(wait_time)
+            
+        except TimedOut:
+            logger.warning(f"⏱️ Таймаут отправки (попытка {attempt + 1}/{max_retries})")
+            await asyncio.sleep(2 ** attempt)
+            
+        except NetworkError as e:
+            logger.error(f"🌐 Сетевая ошибка: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки: {e}", exc_info=True)
+            return False
     
-    Returns:
-        'technical' - технический вопрос (касса, киоск, оборудование)
-        'general' - общий вопрос (работа, доступ, поддержка)
-        'mixed' - смешанный тип
-    """
-    query_lower = query.lower()
-    
-    # Технические ключевые слова
-    technical_keywords = [
-        'касса', 'киоск', 'ксо', 'терминал', 'оборудование', 
-        'принтер', 'сканер', 'фискальный', 'чек', 'оплата',
-        'самообслуживание', 'интеграция', 'настройка', 'ошибка',
-        'сбой', 'ремонт', 'установка', 'подключение'
-    ]
-    
-    # Общие ключевые слова
-    general_keywords = [
-        'работа', 'часы', 'график', 'доступ', 'поддержка',
-        'контакты', 'адрес', 'телефон', 'email', 'помощь',
-        'вопрос', 'ответ', 'стоимость', 'цена', 'оплата'
-    ]
-    
-    technical_count = sum(1 for word in technical_keywords if word in query_lower)
-    general_count = sum(1 for word in general_keywords if word in query_lower)
-    
-    if technical_count > general_count and technical_count > 0:
-        return 'technical'
-    elif general_count > 0:
-        return 'general'
-    else:
-        return 'mixed'
+    return False
 
-def get_contextual_prompt(query_type: str, is_fallback: bool = False) -> str:
-    """
-    Возвращает контекстный промпт в зависимости от типа запроса
+# ====================== ОПТИМИЗИРОВАННЫЙ ПОИСК ======================
+async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
+    """Оптимизированный надежный поиск с параллельными запросами"""
+    clean_text = preprocess(query)
     
-    Args:
-        query_type: 'technical', 'general', 'mixed'
-        is_fallback: True для fallback запросов, False для улучшения ответов
-    """
+    # Попытка 1: Кэш ответов
+    try:
+        cache_key = md5(clean_text.encode()).hexdigest()
+        cached_answer = response_cache.get(cache_key)
+        if cached_answer:
+            stats["cached"] += 1
+            save_stats()
+            logger.info(f"💾 ОПТИМИЗИРОВАННЫЙ КЭШИРОВАННЫЙ ОТВЕТ")
+            return cached_answer, "cached", 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка кэша: {e}")
     
-    if is_fallback:
-        # Промпты для fallback (когда ничего не найдено в базе)
-        prompts = {
-            'technical': (
-                "Ты — технический специалист поддержки. Отвечай ТОЛЬКО на технические вопросы.\n\n"
-                "СТРОГИЕ ПРАВИЛА:\n"
-                "1. Если вопрос не технический или данных недостаточно — ответь: 'НЕТ ДАННЫХ'.\n"
-                "2. Отвечай только про кассы, киоски, терминалы, оборудование.\n"
-                "3. НЕ выдумывай спецификации, модели, цены.\n"
-                "4. Сохраняй точную терминологию: 'касса' ≠ 'киоск'.\n"
-                "5. Ответ — до 600 символов, без форматирования.\n\n"
-                "ОБЛАСТЬ КОМПЕТЕНЦИИ:\n"
-                "- Оборудование: кассы, киоски, принтеры чеков, сканеры\n"
-                "- Программное обеспечение: настройка, интеграция\n"
-                "- Технические проблемы: ошибки, сбои, ремонт\n\n"
-                "ФОРМАТ: Краткий технический ответ."
-            ),
-            'general': (
-                "Ты — консультант поддержки. Отвечай на общие вопросы о работе компании.\n\n"
-                "СТРОГИЕ ПРАВИЛА:\n"
-                "1. Если вопрос технический — ответь: 'НЕТ ДАННЫХ'.\n"
-                "2. Отвечай только про работу, контакты, услуги.\n"
-                "3. НЕ давай технических консультаций.\n"
-                "4. Ответ — до 600 символов, дружелюбный тон.\n\n"
-                "ОБЛАСТЬ КОМПЕТЕНЦИИ:\n"
-                "- Режим работы, часы, контакты\n"
-                "- Услуги, стоимость, условия\n"
-                "- Общая информация о компании\n\n"
-                "ФОРМАТ: Дружелюбный краткий ответ."
-            ),
-            'mixed': (
-                "Ты — универсальный консультант. Определи тип вопроса и отвечай соответственно.\n\n"
-                "СТРОГИЕ ПРАВИЛА:\n"
-                "1. Если unsure — ответь: 'НЕТ ДАННЫХ'.\n"
-                "2. Технические вопросы: кратко и по делу.\n"
-                "3. Общие вопросы: дружелюбно и понятно.\n"
-                "4. НЕ смешивай технические и общие темы.\n"
-                "5. Ответ — до 600 символов.\n\n"
-                "ФОРМАТ: Адаптивный ответ под тип вопроса."
-            )
-        }
-    else:
-        # Промпты для улучшения существующих ответов
-        prompts = {
-            'technical': (
-                "Ты — технический редактор. Улучши технический ответ, сохранив точность.\n\n"
-                "ПРАВИЛА УЛУЧШЕНИЯ:\n"
-                "1. Упрости сложные термины, но НЕ меняй их.\n"
-                "2. Добавь структуру, если поможет понять.\n"
-                "3. Сохраняй все технические детали и параметры.\n"
-                "4. НЕ заменяй 'касса' ↔ 'киоск'.\n"
-                "5. Длина — до 800 символов.\n\n"
-                "ЦЕЛЬ: Сделать технический ответ понятнее без потери точности."
-            ),
-            'general': (
-                "Ты — редактор поддержки. Улучши общий ответ, сделав его дружелюбнее.\n\n"
-                "ПРАВИЛА УЛУЧШЕНИЯ:\n"
-                "1. Добавь дружелюбный тон и эмпатию.\n"
-                "2. Структурируй информацию для лучшего понимания.\n"
-                "3. Упрости формулировки без потери смысла.\n"
-                "4. Длина — до 800 символов.\n\n"
-                "ЦЕЛЬ: Сделать ответ более helpful и понятным."
-            ),
-            'mixed': (
-                "Ты — универсальный редактор. Адаптируй ответ под контекст вопроса.\n\n"
-                "ПРАВИЛА УЛУЧШЕНИЯ:\n"
-                "1. Определи тип вопроса и адаптируй стиль.\n"
-                "2. Технические детали — точными, общие — понятными.\n"
-                "3. Сохраняй баланс между детализацией и простотой.\n"
-                "4. Длина — до 800 символов.\n\n"
-                "ЦЕЛЬ: Идеальный баланс техничности и понятности."
-            )
-        }
+    # Попытка 2: Оптимизированный параллельный поиск по ключевым словам
+    try:
+        keyword_answer = await optimized_keyword_search(clean_text)
+        if keyword_answer:
+            logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
+            return keyword_answer, "keyword", 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка оптимизированного поиска по ключевым словам: {e}")
     
-    return prompts.get(query_type, prompts['mixed'])
+    # Попытка 3: Параллельный векторный поиск
+    try:
+        answer, source, distance = await parallel_vector_search(clean_text)
+        if answer and distance < VECTOR_THRESHOLD:
+            if not is_mismatch(raw_text, answer):
+                stats["vector"] += 1
+                save_stats()
+                logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ВЕКТОРНЫЙ ПОИСК | dist={distance:.4f}")
+                return answer, source, distance
+            else:
+                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка параллельного векторного поиска: {e}")
+    
+    # Попытка 4: Groq fallback
+    try:
+        groq_answer = await fallback_groq(raw_text)
+        if groq_answer:
+            logger.info(f"🤖 GROQ FALLBACK")
+            return groq_answer, "groq_fallback", 1.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
+    
+    logger.error(f"🚨 ВСЕ ОПТИМИЗИРОВАННЫЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ для запроса: '{query[:50]}...'")
+    stats["errors"] += 1
+    save_stats()
+    
+    return None, "error", 1.0
 
 # ====================== UX УЛУЧШЕНИЯ ======================
 def get_quick_access_keyboard(chat_type: str = "group") -> InlineKeyboardMarkup:
-    """
-    Возвращает клавиатуру быстрого доступа в зависимости от типа чата
-    
-    Args:
-        chat_type: "group", "supergroup", "private"
-    """
+    """Возвращает клавиатуру быстрого доступа в зависимости от типа чата"""
     if chat_type == "private":
-        # Для личных чатов админов - расширенная панель
         keyboard = [
             [
                 InlineKeyboardButton("🔧 Технические вопросы", callback_data="quick_tech"),
@@ -1283,7 +1116,6 @@ def get_quick_access_keyboard(chat_type: str = "group") -> InlineKeyboardMarkup:
             ]
         ]
     else:
-        # Для групп - упрощенная панель
         keyboard = [
             [
                 InlineKeyboardButton("🔧 Техническая поддержка", callback_data="quick_tech"),
@@ -1298,12 +1130,7 @@ def get_quick_access_keyboard(chat_type: str = "group") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def get_suggested_questions(query_type: str) -> List[str]:
-    """
-    Возвращает список предложенных вопросов в зависимости от типа запроса
-    
-    Args:
-        query_type: 'technical', 'general', 'mixed'
-    """
+    """Возвращает список предложенных вопросов в зависимости от типа запроса"""
     suggestions = {
         'technical': [
             "Как настроить фискальный регистратор?",
@@ -1331,13 +1158,7 @@ def get_suggested_questions(query_type: str) -> List[str]:
     return suggestions.get(query_type, suggestions['mixed'])
 
 def get_adaptive_context_message(chat_type: str, user_name: str = "") -> str:
-    """
-    Возвращает адаптивное приветствие в зависимости от типа чата
-    
-    Args:
-        chat_type: "group", "supergroup", "private"
-        user_name: имя пользователя для персонализации
-    """
+    """Возвращает адаптивное приветствие в зависимости от типа чата"""
     if chat_type == "private":
         if user_name:
             return f"👋 {user_name}, я ваш персональный ассистент поддержки!\n\nВыберите интересующую тему:"
@@ -1347,9 +1168,7 @@ def get_adaptive_context_message(chat_type: str, user_name: str = "") -> str:
         return "🤖 Бот поддержки готов помочь!\n\nВыберите категорию вопроса или напишите свой вопрос:"
 
 async def handle_quick_access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает нажатия на кнопки быстрого доступа
-    """
+    """Обрабатывает нажатия на кнопки быстрого доступа"""
     query = update.callback_query
     await query.answer()
     
@@ -1357,7 +1176,6 @@ async def handle_quick_access_callback(update: Update, context: ContextTypes.DEF
     user = update.effective_user
     user_name = user.first_name or ""
     
-    # Определяем ответ в зависимости от кнопки
     responses = {
         "quick_tech": (
             "🔧 **Техническая поддержка**\n\n"
@@ -1419,483 +1237,82 @@ async def handle_quick_access_callback(update: Update, context: ContextTypes.DEF
     
     response_text = responses.get(query.data, "❓ Неизвестная команда")
     
-    # Показываем кнопки с предложениями
     if query.data in ["quick_tech", "quick_general", "quick_cash_setup", "quick_kiosk_setup", "quick_payment", "quick_errors"]:
         query_type = "technical" if "tech" in query.data or "cash" in query.data or "kiosk" in query.data or "payment" in query.data or "errors" in query.data else "general"
         suggestions = get_suggested_questions(query_type)
         
-        # Добавляем предложения
         if suggestions:
             response_text += "\n\n**Популярные вопросы:**\n"
             for i, suggestion in enumerate(suggestions[:3], 1):
                 response_text += f"{i}. {suggestion}\n"
             response_text += "\nИли напишите свой вопрос:"
     
-    # Отправляем ответ с кнопками
     await query.edit_message_text(
         text=response_text,
         reply_markup=get_quick_access_keyboard(chat_type),
         parse_mode="Markdown"
     )
 
-# ====================== GRACEFUL DEGRADATION ======================
-async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
-    """
-    Оптимизированный надежный поиск с параллельными запросами
+def classify_query_type(query: str) -> str:
+    """Классифицирует тип запроса для улучшения ответов"""
+    technical_keywords = [
+        "касса", "киоск", "ксо", "принтер", "сканер", "терминал", 
+        "фискальный", "эквайринг", "платеж", "чек", "ошибка", 
+        "настройка", "подключение", "обновление", "по"
+    ]
     
-    Порядок попыток:
-    1. Кэш ответов
-    2. Параллельный поиск по ключевым словам  
-    3. Параллельный векторный поиск
-    4. Groq fallback
-    5. Сообщение об ошибке
+    general_keywords = [
+        "время", "работа", "контакт", "адрес", "стоимость", 
+        "цена", "оплата", "доставка", "гарантия", "сервис", 
+        "поддержка", "компания", "офис"
+    ]
     
-    Returns:
-        (answer, source, distance)
-    """
-    clean_text = preprocess(query)
+    query_lower = query.lower()
     
-    # Попытка 1: Кэш ответов
-    try:
-        cache_key = md5(clean_text.encode()).hexdigest()
-        cached_answer = response_cache.get(cache_key)
-        if cached_answer:
-            stats["cached"] += 1
-            save_stats()
-            logger.info(f"💾 ОПТИМИЗИРОВАННЫЙ КЭШИРОВАННЫЙ ОТВЕТ")
-            return cached_answer, "cached", 0.0
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка кэша: {e}")
+    technical_score = sum(1 for keyword in technical_keywords if keyword in query_lower)
+    general_score = sum(1 for keyword in general_keywords if keyword in query_lower)
     
-    # Попытка 2: Оптимизированный параллельный поиск по ключевым словам
-    try:
-        keyword_answer = await optimized_keyword_search(clean_text)
-        if keyword_answer:
-            logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
-            return keyword_answer, "keyword", 0.0
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка оптимизированного поиска по ключевым словам: {e}")
-    
-    # Попытка 3: Параллельный векторный поиск
-    try:
-        answer, source, distance = await parallel_vector_search(clean_text)
-        if answer and distance < VECTOR_THRESHOLD:
-            # Проверка на несоответствие
-            if not is_mismatch(raw_text, answer):
-                stats["vector"] += 1
-                save_stats()
-                logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ВЕКТОРНЫЙ ПОИСК | dist={distance:.4f}")
-                return answer, source, distance
-            else:
-                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка параллельного векторного поиска: {e}")
-    
-    # Попытка 4: Groq fallback
-    try:
-        groq_answer = await fallback_groq(raw_text)
-        if groq_answer:
-            logger.info(f"🤖 GROQ FALLBACK")
-            return groq_answer, "groq_fallback", 1.0
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
-    
-    # Попытка 5: Ultimate fallback
-    logger.error(f"🚨 ВСЕ ОПТИМИЗИРОВАННЫЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ для запроса: '{query[:50]}...'")
-    stats["errors"] += 1
-    save_stats()
-    
-    return None, "error", 1.0
+    if technical_score > general_score:
+        return "technical"
+    elif general_score > technical_score:
+        return "general"
+    else:
+        return "mixed"
 
-async def robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
-    """
-    Надежный поиск с плавным снижением качества при проблемах
-    
-    Порядок попыток:
-    1. Кэш ответов
-    2. Поиск по ключевым словам  
-    3. Векторный поиск (General + Technical)
-    4. Groq fallback
-    5. Сообщение об ошибке
-    
-    Returns:
-        (answer, source, distance)
-    """
-    clean_text = preprocess(query)
-    
-    # Попытка 1: Кэш ответов
-    try:
-        cache_key = md5(clean_text.encode()).hexdigest()
-        if cache_key in response_cache:
-            stats["cached"] += 1
-            save_stats()
-            logger.info(f"💾 КЭШИРОВАННЫЙ ОТВЕТ (robust)")
-            return response_cache[cache_key], "cached", 0.0
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка кэша: {e}")
-    
-    # Попытка 2: Поиск по ключевым словам
-    try:
-        keyword_answer = await unified_keyword_search(clean_text)
-        if keyword_answer:
-            logger.info(f"🔑 КЛЮЧЕВОЙ ПОИСК (robust)")
-            return keyword_answer, "keyword", 0.0
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка поиска по ключевым словам: {e}")
-    
-    # Попытка 3: Векторный поиск General
-    try:
-        answer, dist, _ = await search_in_collection(collection_general, "general", clean_text)
-        if answer and dist < VECTOR_THRESHOLD:
-            # Проверка на несоответствие
-            if not is_mismatch(raw_text, answer):
-                stats["vector"] += 1
-                save_stats()
-                logger.info(f"🎯 ВЕКТОРНЫЙ ПОИСК General (robust) | dist={dist:.4f}")
-                return answer, "vector_general", dist
-            else:
-                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в General, пробуем Technical")
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка векторного поиска General: {e}")
-    
-    # Попытка 4: Векторный поиск Technical
-    try:
-        answer, dist, _ = await search_in_collection(collection_technical, "technical", clean_text)
-        if answer and dist < VECTOR_THRESHOLD:
-            stats["vector"] += 1
-            save_stats()
-            logger.info(f"🎯 ВЕКТОРНЫЙ ПОИСК Technical (robust) | dist={dist:.4f}")
-            return answer, "vector_technical", dist
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка векторного поиска Technical: {e}")
-    
-    # Попытка 5: Groq fallback
-    try:
-        groq_answer = await fallback_groq(raw_text)
-        if groq_answer:
-            logger.info(f"🤖 GROQ FALLBACK (robust)")
-            return groq_answer, "groq_fallback", 1.0
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
-    
-    # Попытка 6: Ultimate fallback
-    logger.error(f"🚨 ВСЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ для запроса: '{query[:50]}...'")
-    stats["errors"] += 1
-    save_stats()
-    
-    return None, "error", 1.0
-
-async def notify_admins_about_problems(context: ContextTypes.DEFAULT_TYPE, problem_type: str, error_msg: str):
-    """Уведомляет админов о проблемах с сервисами"""
-    if not ADMIN_IDS:
-        return
-    
-    message = f"🚨 ПРОБЛЕМА С СЕРВИСАМИ\n\nТип: {problem_type}\nОшибка: {error_msg}\n\nВремя: {datetime.now().strftime('%H:%M:%S')}"
-    
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=message
-            )
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось уведомить админа {admin_id}: {e}")
-
-# ====================== HEALTH CHECKS ======================
-async def check_google_sheets_health() -> Dict[str, Any]:
-    """Проверка доступности Google Sheets"""
-    try:
-        result = sheet.values().get(
-            spreadsheetId=SHEET_ID, 
-            range="General!A1:A1"
-        ).execute()
-        return {
-            "status": "✅ OK",
-            "response_time": "fast",
-            "error": None
-        }
-    except googleapiclient.errors.HttpError as e:
-        return {
-            "status": "❌ HTTP Error", 
-            "response_time": "N/A",
-            "error": str(e)
-        }
-    except Exception as e:
-        return {
-            "status": "❌ Error",
-            "response_time": "N/A", 
-            "error": str(e)
-        }
-
-async def check_groq_health() -> Dict[str, Any]:
-    """Проверка доступности Groq API"""
-    try:
-        start_time = time.time()
-        async with groq_with_timeout():
-            resp = await asyncio.wait_for(
-                groq_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=[{"role": "user", "content": "test"}],
-                    max_tokens=1,
-                    temperature=0.0,
-                ),
-                timeout=5
-            )
-        response_time = f"{(time.time() - start_time)*1000:.0f}ms"
-        return {
-            "status": "✅ OK",
-            "response_time": response_time,
-            "error": None
-        }
-    except Exception as e:
-        return {
-            "status": "❌ Error",
-            "response_time": "N/A",
-            "error": str(e)
-        }
-
-def check_chromadb_health() -> Dict[str, Any]:
-    """Проверка состояния ChromaDB"""
-    try:
-        general_count = collection_general.count() if collection_general else 0
-        technical_count = collection_technical.count() if collection_technical else 0
-        
-        return {
-            "status": "✅ OK",
-            "general_records": general_count,
-            "technical_records": technical_count,
-            "error": None
-        }
-    except Exception as e:
-        return {
-            "status": "❌ Error",
-            "general_records": 0,
-            "technical_records": 0,
-            "error": str(e)
-        }
-
-def check_embedding_models_health() -> Dict[str, Any]:
-    """Проверка состояния моделей эмбеддингов"""
-    try:
-        # Тестовое эмбеддингирование
-        test_text = "тест"
-        general_emb = get_embedding_general(test_text)
-        technical_emb = get_embedding_technical(test_text)
-        
-        general_cache = get_embedding_general.cache_info()
-        technical_cache = get_embedding_technical.cache_info()
-        
-        return {
-            "status": "✅ OK",
-            "general_cache": f"{general_cache.currsize}/{general_cache.maxsize}",
-            "technical_cache": f"{technical_cache.currsize}/{technical_cache.maxsize}",
-            "error": None
-        }
-    except Exception as e:
-        return {
-            "status": "❌ Error",
-            "general_cache": "N/A",
-            "technical_cache": "N/A", 
-            "error": str(e)
-        }
-
-async def run_health_checks() -> Dict[str, Any]:
-    """Запуск всех проверок здоровья"""
-    logger.info("🔍 Запуск health checks...")
-    
-    # Параллельное выполнение проверок
-    sheets_task = asyncio.create_task(check_google_sheets_health())
-    groq_task = asyncio.create_task(check_groq_health())
-    
-    sheets_result = await sheets_task
-    groq_result = await groq_task
-    
-    chromadb_result = check_chromadb_health()
-    embedding_result = check_embedding_models_health()
-    
-    # Общий статус
-    all_ok = all([
-        sheets_result["status"] == "✅ OK",
-        groq_result["status"] == "✅ OK", 
-        chromadb_result["status"] == "✅ OK",
-        embedding_result["status"] == "✅ OK"
-    ])
-    
-    overall_status = "🟢 Все системы работают" if all_ok else "🟡 Есть проблемы"
-    
-    return {
-        "overall": overall_status,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "google_sheets": sheets_result,
-        "groq_api": groq_result,
-        "chromadb": chromadb_result,
-        "embedding_models": embedding_result
+def get_contextual_prompt(query_type: str) -> str:
+    """Возвращает контекстный промпт в зависимости от типа запроса"""
+    prompts = {
+        'technical': (
+            "Ты — технический специалист поддержки. Улучши технический ответ, "
+            "сохраняя все точные детали.\n\n"
+            "ПРАВИЛА УЛУЧШЕНИЯ:\n"
+            "1. Сохраняй ВСЕ технические термины: 'касса', 'киоск', 'КСО', 'фискальный регистратор'.\n"
+            "2. НЕ заменяй 'касса' ↔ 'киоск'.\n"
+            "3. Структурируй техническую информацию чётко.\n"
+            "4. Длина — до 800 символов.\n\n"
+            "ЦЕЛЬ: Сделать технический ответ понятнее без потери точности."
+        ),
+        'general': (
+            "Ты — редактор поддержки. Улучши общий ответ, делая его дружелюбнее.\n\n"
+            "ПРАВИЛА УЛУЧШЕНИЯ:\n"
+            "1. Добавь дружелюбный тон и эмпатию.\n"
+            "2. Структурируй информацию для лучшего понимания.\n"
+            "3. Упрости формулировки без потери смысла.\n"
+            "4. Длина — до 800 символов.\n\n"
+            "ЦЕЛЬ: Сделать ответ более helpful и понятным."
+        ),
+        'mixed': (
+            "Ты — универсальный редактор. Адаптируй ответ под контекст вопроса.\n\n"
+            "ПРАВИЛА УЛУЧШЕНИЯ:\n"
+            "1. Определи тип вопроса и адаптируй стиль.\n"
+            "2. Технические детали — точными, общие — понятными.\n"
+            "3. Сохраняй баланс между детализацией и простотой.\n"
+            "4. Длина — до 800 символов.\n\n"
+            "ЦЕЛЬ: Идеальный баланс техничности и понятности."
+        )
     }
-
-async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда проверки здоровья системы"""
-    if update.effective_user.id not in ADMIN_IDS:
-        return
     
-    await update.message.reply_text("🔍 Проверяю состояние системы...")
-    
-    health_report = await run_health_checks()
-    
-    text = (
-        f"🏥 HEALTH CHECK\n\n"
-        f"Общий статус: {health_report['overall']}\n"
-        f"Время проверки: {health_report['timestamp']}\n\n"
-        f"📊 Google Sheets:\n"
-        f"  Статус: {health_report['google_sheets']['status']}\n"
-        f"  Время ответа: {health_report['google_sheets']['response_time']}\n"
-        f"  Ошибка: {health_report['google_sheets']['error'] or 'Нет'}\n\n"
-        f"🤖 Groq API:\n"
-        f"  Статус: {health_report['groq_api']['status']}\n"
-        f"  Время ответа: {health_report['groq_api']['response_time']}\n"
-        f"  Ошибка: {health_report['groq_api']['error'] or 'Нет'}\n\n"
-        f"🗄️ ChromaDB:\n"
-        f"  Статус: {health_report['chromadb']['status']}\n"
-        f"  General записей: {health_report['chromadb']['general_records']}\n"
-        f"  Technical записей: {health_report['chromadb']['technical_records']}\n"
-        f"  Ошибка: {health_report['chromadb']['error'] or 'Нет'}\n\n"
-        f"🧠 Модели эмбеддингов:\n"
-        f"  Статус: {health_report['embedding_models']['status']}\n"
-        f"  General кэш: {health_report['embedding_models']['general_cache']}\n"
-        f"  Technical кэш: {health_report['embedding_models']['technical_cache']}\n"
-        f"  Ошибка: {health_report['embedding_models']['error'] or 'Нет'}"
-    )
-    
-    await update.message.reply_text(text)
-
-# ====================== ОТПРАВКА СООБЩЕНИЙ ======================
-async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, reply_to_message_id: int = None):
-
-    """
-    Безопасно отправляет длинное сообщение с разбивкой и повторами
-    """
-    for attempt in range(max_retries):
-        try:
-            # Разбиваем на части если нужно
-            chunks = [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
-            for idx, chunk in enumerate(chunks):
-                # Цитируем только первое сообщение
-                reply_id = reply_to_message_id if idx == 0 else None
-                await bot.send_message(
-                    chat_id=chat_id, 
-                    text=chunk,
-                    reply_to_message_id=reply_id
-                )
-
-            return True
-            
-        except RetryAfter as e:
-            # Telegram просит подождать
-            wait_time = e.retry_after + 1
-            logger.warning(f"⏸️ Rate limit, ждём {wait_time}с...")
-            await asyncio.sleep(wait_time)
-            
-        except TimedOut:
-            logger.warning(f"⏱️ Таймаут отправки (попытка {attempt + 1}/{max_retries})")
-            await asyncio.sleep(2 ** attempt)  # Экспоненциальная задержка
-            
-        except NetworkError as e:
-            logger.error(f"🌐 Сетевая ошибка: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(3)
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки: {e}", exc_info=True)
-            return False
-    
-    return False
-
-
-
-# ====================== УНИФИЦИРОВАННЫЙ ПОИСК ======================
-async def unified_keyword_search(clean_text: str) -> Optional[str]:
-    """
-    Единая функция поиска по ключевым словам
-    
-    Приоритет:
-    1. Поиск в метаданных ChromaDB (быстро)
-    2. Если ничего не найдено - поиск в Google Sheets (медленно)
-    """
-    # Этап 1: Быстрый поиск в метаданных ChromaDB
-    try:
-        # Поиск в General
-        results = collection_general.get(
-            where={"query": {"$eq": clean_text}},
-            include=["metadatas"]
-        )
-        if results["metadatas"]:
-            answer = results["metadatas"][0].get("answer")
-            if answer:
-                stats["keyword"] += 1
-                save_stats()
-                logger.info(f"🔑 KEYWORD MATCH (General) | query='{clean_text}'")
-                return answer
-    except chromadb.errors.DuplicateIDException as e:
-        logger.warning(f"⚠️ Дубликат ID в ChromaDB General: {e}")
-    except chromadb.errors.InvalidDimensionException as e:
-        logger.error(f"❌ Неверная размерность вектора в General: {e}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка поиска в метаданных General: {e}", exc_info=True)
-        raise DatabaseError(f"ChromaDB General error: {e}")
-
-    try:
-        # Поиск в Technical
-        results = collection_technical.get(
-            where={"query": {"$eq": clean_text}},
-            include=["metadatas"]
-        )
-        if results["metadatas"]:
-            answer = results["metadatas"][0].get("answer")
-            if answer:
-                stats["keyword"] += 1
-                save_stats()
-                logger.info(f"🔑 KEYWORD MATCH (Technical) | query='{clean_text}'")
-                return answer
-    except chromadb.errors.DuplicateIDException as e:
-        logger.warning(f"⚠️ Дубликат ID в ChromaDB Technical: {e}")
-    except chromadb.errors.InvalidDimensionException as e:
-        logger.error(f"❌ Неверная размерность вектора в Technical: {e}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка поиска в метаданных Technical: {e}", exc_info=True)
-        raise DatabaseError(f"ChromaDB Technical error: {e}")
-
-    # Этап 2: Поиск в Google Sheets (только если ничего не найдено)
-    try:
-        result_general = sheet.values().get(spreadsheetId=SHEET_ID, range="General!A:B").execute()
-        general_rows = result_general.get("values", [])
-        
-        result_technical = sheet.values().get(spreadsheetId=SHEET_ID, range="Technical!A:B").execute()
-        technical_rows = result_technical.get("values", [])
-        
-        all_rows = general_rows + technical_rows
-        
-        for row in all_rows:
-            if len(row) >= 2:
-                keyword = row[0].strip().lower()
-                answer = row[1].strip()
-                
-                # Простое вхождение подстроки
-                if keyword in clean_text or clean_text in keyword:
-                    stats["keyword"] += 1
-                    save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH (Sheets) | keyword=\"{keyword[:50]}\"")
-                    return answer
-                    
-    except googleapiclient.errors.HttpError as e:
-        logger.error(f"❌ HTTP ошибка Google Sheets: {e}")
-        raise DatabaseError(f"Google Sheets HTTP error: {e}")
-    except googleapiclient.errors.Error as e:
-        logger.error(f"❌ Ошибка API Google Sheets: {e}")
-        raise DatabaseError(f"Google Sheets API error: {e}")
-    except Exception as e:
-        logger.error(f"❌ Неизвестная ошибка Google Sheets: {e}", exc_info=True)
-        raise DatabaseError(f"Google Sheets unknown error: {e}")
-    
-    return None
+    return prompts.get(query_type, prompts['mixed'])
 
 # ====================== ОСНОВНОЙ ОБРАБОТЧИК ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1903,41 +1320,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
 
-    # 🔥 ОБЯЗАТЕЛЬНО: объявляем переменные
     best_answer = None
     source = "none"
     distance = 1.0
     
-    # 🔧 ТЕСТОВЫЙ ЛОГ
-    #logger.info(f"🧪 adminlist = {adminlist}")
-    #logger.info(f"🧪 user_id = {user_id}, in adminlist? {user_id in adminlist}")
-    
     # ============ ЛОГИКА ДОСТУПА ============
     
-    # В ГРУППЕ: игнорируем админов из adminlist
     if chat_type in ["group", "supergroup"]:
         if is_admin_special(user_id):
             logger.debug(f"⏭️ Игнор admin {user_id} в группе (из adminlist.json)")
             return
         logger.info(f"✅ Обработаю обычного пользователя {user_id} в группе")
     
-    # В ЛС (private): отвечаем ТОЛЬКО админам из ADMIN_IDS
     elif chat_type == "private":
         if user_id not in ADMIN_IDS:
-            #logger.info(f"🚫 БЛОКИРУЮ ЛС от {user_id} (не админ)")
             return
-        #logger.info(f"✅ Отвечу админу {user_id} в ЛС")
     
-    # Проверка паузы (кроме главных админов из env)
     if is_paused() and user_id not in ADMIN_IDS:
         return
     
-    # Валидация сообщения
     raw_text = (update.message.text or update.message.caption or "").strip()
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
     
-    # Информация о пользователе для логов
     user = update.effective_user
     username = f"@{user.username}" if user.username else ""
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -1955,12 +1360,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean_text = preprocess(raw_text)
     cache_key = md5(clean_text.encode()).hexdigest()
     
-    if cache_key in response_cache:
+    # Проверяем кэш через метод get()
+    cached_answer = response_cache.get(cache_key)
+    if cached_answer is not None:
         stats["cached"] += 1
         save_stats()
         logger.info(f"💾 КЭШИРОВАННЫЙ ОТВЕТ для user={user.id}")
     
-        cached_answer = response_cache[cache_key]
         emoji = get_source_emoji("cached")
         final_text = f"{cached_answer}\n\n{emoji}"
     
@@ -1972,24 +1378,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# ============ ALARM: отправка системного сообщения ============
+    # ============ ALARM: отправка системного сообщения ============
     if current_alarm and chat_type in ["group", "supergroup"]:
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=f"🔔 {current_alarm}",
-                disable_notification=True  # Чтобы не будить всех
+                disable_notification=True
             )
         except Exception as e:
             logger.error(f"❌ Не удалось отправить alarm: {e}")
 
-    # Показываем "печатает", только если ответ НЕ из кэша
     await safe_typing(context.bot, update.effective_chat.id)
     
     # ============ ОСНОВНОЙ ПОИСК С ОПТИМИЗАЦИЕЙ ============
     best_answer, source, distance = await optimized_robust_search(raw_text, clean_text)
     
-    # Если все методы провалились, уведомляем админов
     if source == "error":
         await notify_admins_about_problems(
             context, 
@@ -2013,7 +1417,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ============ ЭТАП 6: Отправка ответа ============
     if not final_reply:
-        # Показываем предложения переформулировать
         query_type = classify_query_type(raw_text)
         suggestions = get_suggested_questions(query_type)
         
@@ -2039,7 +1442,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_to_message_id=update.message.message_id
         )
         
-        # Показываем кнопки быстрого доступа
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="🔍 Выберите категорию вопроса:",
@@ -2048,9 +1450,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Сохраняем в кэш (БЕЗ смайлика)
-    response_cache[cache_key] = final_reply
+    response_cache.put(cache_key, final_reply)
 
-    # Добавляем смайлик только для отправки
     emoji = get_source_emoji(source)
     final_text_with_emoji = f"{final_reply}\n\n{emoji}"
 
@@ -2066,13 +1467,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final_text_with_emoji,
         reply_to_message_id=update.message.message_id
     )
-
-
-
     
     if not success:
         stats["errors"] += 1
         save_stats()
+
+async def notify_admins_about_problems(context: ContextTypes.DEFAULT_TYPE, problem_type: str, error_msg: str):
+    """Уведомляет админов о проблемах с сервисами"""
+    if not ADMIN_IDS:
+        return
+    
+    message = f"🚨 ПРОБЛЕМА С СЕРВИСАМИ\n\nТип: {problem_type}\nОшибка: {error_msg}\n\nВремя: {time.strftime('%H:%M:%S')}"
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось уведомить админа {admin_id}: {e}")
 
 # ====================== БЛОКИРОВКА ЛИЧНЫХ ЧАТОВ ======================
 async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2129,9 +1543,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count_general = collection_general.count() if collection_general else 0
     count_technical = collection_technical.count() if collection_technical else 0
     
-    cache_usage = f"{len(response_cache)}/{CACHE_SIZE}"
+    # Получаем размер кэша ответов через метод get_stats()
+    try:
+        response_stats = response_cache.get_stats()
+        cache_usage = f"{response_stats['size']}/{CACHE_SIZE}"
+    except Exception:
+        cache_usage = f"❌/{CACHE_SIZE}"
     
-    # Получаем статистику всех кэшей
     try:
         cache_stats = get_cache_stats()
         response_stats = cache_stats["response_cache"]
@@ -2154,7 +1572,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vector_pct = (stats['vector'] / total * 100) if total > 0 else 0
     keyword_pct = (stats['keyword'] / total * 100) if total > 0 else 0
     
-    # Эффективность бота (сколько запросов обработано без AI)
     efficiency = ((stats['cached'] + stats['keyword']) / total * 100) if total > 0 else 0
     
     text = (
@@ -2181,7 +1598,6 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  {'✅ Активно: ' + current_alarm[:50] + '...' if current_alarm and len(current_alarm) > 50 else current_alarm if current_alarm else '❌ Не установлено'}\n"
     )
 
-    
     await update.message.reply_text(text)
 
 async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2191,18 +1607,30 @@ async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("🧹 Начинаю очистку кэшей...")
     
-    # Сохраняем старые размеры
-    old_response_size = len(response_cache)
-    old_general_size = len(embedding_cache_general.cache)
-    old_technical_size = len(embedding_cache_technical.cache)
+    # Получаем размеры кэшей через методы get_stats()
+    try:
+        response_stats = response_cache.get_stats()
+        old_response_size = response_stats['size']
+    except Exception:
+        old_response_size = 0
     
-    # Очищаем все кэши
+    try:
+        general_stats = embedding_cache_general.get_stats()
+        old_general_size = general_stats['size']
+    except Exception:
+        old_general_size = 0
+    
+    try:
+        technical_stats = embedding_cache_technical.get_stats()
+        old_technical_size = technical_stats['size']
+    except Exception:
+        old_technical_size = 0
+    
     response_cache.clear()
     embedding_cache_general.clear()
     embedding_cache_technical.clear()
     sheets_pool.clear_cache()
     
-    # Вызываем garbage collector
     collected = cleanup_caches()
     
     await update.message.reply_text(
@@ -2215,6 +1643,43 @@ async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧹 Garbage collector: {collected} объектов\n"
         f"✅ Память оптимизирована!"
     )
+
+async def optimize_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оптимизирует память и производительность бота"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    await update.message.reply_text("🧠 Начинаю оптимизацию памяти...")
+    
+    try:
+        old_stats = get_cache_stats()
+        collected = cleanup_caches()
+        sheets_pool._cleanup_cache()
+        new_stats = get_cache_stats()
+        
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+        except ImportError:
+            memory_mb = 0
+        
+        message = (
+            f"🧠 Оптимизация памяти завершена!\n\n"
+            f"📊 Статистика кэшей:\n"
+            f"  • Ответы: {new_stats['response_cache']['size']}/{new_stats['response_cache']['maxsize']}\n"
+            f"  • General: {new_stats['embedding_general']['size']}/{new_stats['embedding_general']['maxsize']}\n"
+            f"  • Technical: {new_stats['embedding_technical']['size']}/{new_stats['embedding_technical']['maxsize']}\n\n"
+            f"🧹 Garbage collector: {collected} объектов\n"
+            f"💾 Использование памяти: {memory_mb:.1f} MB\n\n"
+            f"✅ Производительность оптимизирована!"
+        )
+        
+        await update.message.reply_text(message)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка оптимизации: {e}")
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавляет администратора в adminlist"""
@@ -2268,12 +1733,10 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         admin_info = []
         
-        # ✅ Гарантируй int и сортируй
         for user_id in sorted([int(uid) for uid in adminlist]):
             try:
                 user = await context.bot.get_chat(user_id)
                 
-                # Приоритет: @username > Full Name
                 if user.username:
                     display = f"@{user.username}"
                 else:
@@ -2303,15 +1766,13 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('❌ Использование: /addalarm "Текст сообщения"')
         return
 
-    # Собираем аргументы, учитывая кавычки
     raw_text = " ".join(context.args)
-    # Пытаемся извлечь текст в кавычках
     import re
     match = re.search(r'"([^"]+)"', raw_text)
     if match:
         text = match.group(1)
     else:
-        text = raw_text  # Если кавычек нет — берём всё
+        text = raw_text
 
     if not text.strip():
         await update.message.reply_text("❌ Текст сообщения пуст!")
@@ -2354,11 +1815,9 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
         
-        # Берём последние 200 строк
         last_lines = lines[-200:]
         log_text = "".join(last_lines)
         
-        # Ограничиваем длину для Telegram
         if len(log_text) > 4000:
             log_text = "...\n" + log_text[-3900:]
         
@@ -2371,14 +1830,11 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Команда /start - показывает приветствие и кнопки быстрого доступа
-    """
+    """Команда /start - показывает приветствие и кнопки быстрого доступа"""
     chat_type = update.effective_chat.type
     user = update.effective_user
     user_name = user.first_name or ""
     
-    # Персонализированное приветствие
     welcome_text = get_adaptive_context_message(chat_type, user_name)
     
     await update.message.reply_text(
@@ -2401,7 +1857,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/health — проверка здоровья системы\n"
         "/reload — перезагрузить базу знаний\n\n"
         "Управление кэшем:\n"
-        "/clearcache — очистить кэш ответов\n\n"
+        "/clearcache — очистить кэш ответов\n"
+        "/optimize — оптимизировать память\n\n"
         "Управление уведомлениями:\n"
         "/addalarm \"текст\" — установить уведомление при каждом сообщении\n"
         "/delalarm — удалить уведомление\n\n"
@@ -2411,54 +1868,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/adminlist — показать список\n\n"
         "/help — показать это меню\n\n"
         "Диагностика:\n"
-        "/logs — последние 200 строк лога\n"
-        "/threshold <значение> — изменить порог векторного поиска\n\n"
+        "/logs — последние 200 строк лога\n\n"
         "💡 Админы из adminlist.json игнорируются ботом в группах"
     )
     
     await update.message.reply_text(text)
-
-async def optimize_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Оптимизирует память и производительность бота"""
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    await update.message.reply_text("🧠 Начинаю оптимизацию памяти...")
-    
-    try:
-        # 1. Очищаем старые кэши
-        old_stats = get_cache_stats()
-        
-        # 2. Выполняем garbage collection
-        collected = cleanup_caches()
-        
-        # 3. Очищаем старые записи в Google Sheets кэше
-        sheets_pool._cleanup_cache()
-        
-        # 4. Получаем новые статистики
-        new_stats = get_cache_stats()
-        
-        # 5. Информация о памяти процесс
-        import psutil
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        memory_mb = memory_info.rss / 1024 / 1024
-        
-        message = (
-            f"🧠 Оптимизация памяти завершена!\n\n"
-            f"📊 Статистика кэшей:\n"
-            f"  • Ответы: {new_stats['response_cache']['size']}/{new_stats['response_cache']['maxsize']}\n"
-            f"  • General: {new_stats['embedding_general']['size']}/{new_stats['embedding_general']['maxsize']}\n"
-            f"  • Technical: {new_stats['embedding_technical']['size']}/{new_stats['embedding_technical']['maxsize']}\n\n"
-            f"🧹 Garbage collector: {collected} объектов\n"
-            f"💾 Использование памяти: {memory_mb:.1f} MB\n\n"
-            f"✅ Производительность оптимизирована!"
-        )
-        
-        await update.message.reply_text(message)
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка оптимизации: {e}")
 
 async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Изменяет порог векторного поиска (для экспериментов)"""
@@ -2485,19 +1899,175 @@ async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old_threshold = VECTOR_THRESHOLD
         VECTOR_THRESHOLD = new_threshold
         
-        # Сохраняем порог в файл
-        save_threshold(VECTOR_THRESHOLD)
-        
         await update.message.reply_text(
             f"✅ Порог изменён: {old_threshold} → {new_threshold}\n\n"
-            f"🔄 Изменение применено немедленно и сохранено\n"
-            f"📍 Будет загружен при следующем запуске бота"
+            f"⚠️ Это изменение временное (до перезапуска бота)"
         )
         
-        logger.info(f"🎚️ Порог изменён и сохранён: {old_threshold} → {new_threshold}")
+        logger.info(f"🎚️ Порог изменён: {old_threshold} → {new_threshold}")
         
     except ValueError:
         await update.message.reply_text("❌ Неверный формат числа")
+
+# ====================== HEALTH CHECKS ======================
+async def check_google_sheets_health() -> Dict[str, Any]:
+    """Проверка доступности Google Sheets"""
+    try:
+        result = sheet.values().get(
+            spreadsheetId=SHEET_ID, 
+            range="General!A1:A1"
+        ).execute()
+        return {
+            "status": "✅ OK",
+            "response_time": "fast",
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error", 
+            "response_time": "N/A",
+            "error": str(e)
+        }
+
+async def check_groq_health() -> Dict[str, Any]:
+    """Проверка доступности Groq API"""
+    try:
+        start_time = time.time()
+        async with groq_with_timeout():
+            resp = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": "test"}],
+                    max_tokens=1,
+                    temperature=0.0,
+                ),
+                timeout=5
+            )
+        response_time = f"{(time.time() - start_time)*1000:.0f}ms"
+        return {
+            "status": "✅ OK",
+            "response_time": response_time,
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "response_time": "N/A",
+            "error": str(e)
+        }
+
+def check_chromadb_health() -> Dict[str, Any]:
+    """Проверка состояния ChromaDB"""
+    try:
+        general_count = collection_general.count() if collection_general else 0
+        technical_count = collection_technical.count() if collection_technical else 0
+        
+        return {
+            "status": "✅ OK",
+            "general_records": general_count,
+            "technical_records": technical_count,
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "general_records": 0,
+            "technical_records": 0,
+            "error": str(e)
+        }
+
+def check_embedding_models_health() -> Dict[str, Any]:
+    """Проверка состояния моделей эмбеддингов"""
+    try:
+        test_text = "тест"
+        general_emb = get_embedding_general(test_text)
+        technical_emb = get_embedding_technical(test_text)
+        
+        general_cache = embedding_cache_general.get_stats()
+        technical_cache = embedding_cache_technical.get_stats()
+        
+        return {
+            "status": "✅ OK",
+            "general_cache": f"{general_cache['size']}/{general_cache['maxsize']}",
+            "technical_cache": f"{technical_cache['size']}/{technical_cache['maxsize']}",
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "general_cache": "N/A",
+            "technical_cache": "N/A", 
+            "error": str(e)
+        }
+
+async def run_health_checks() -> Dict[str, Any]:
+    """Запуск всех проверок здоровья"""
+    logger.info("🔍 Запуск health checks...")
+    
+    sheets_task = asyncio.create_task(check_google_sheets_health())
+    groq_task = asyncio.create_task(check_groq_health())
+    
+    sheets_result = await sheets_task
+    groq_result = await groq_task
+    
+    chromadb_result = check_chromadb_health()
+    embedding_result = check_embedding_models_health()
+    
+    all_ok = all([
+        sheets_result["status"] == "✅ OK",
+        groq_result["status"] == "✅ OK", 
+        chromadb_result["status"] == "✅ OK",
+        embedding_result["status"] == "✅ OK"
+    ])
+    
+    overall_status = "✅ Все системы работают" if all_ok else "⚠️ Есть проблемы"
+    
+    return {
+        "overall": overall_status,
+        "google_sheets": sheets_result,
+        "groq": groq_result,
+        "chromadb": chromadb_result,
+        "embeddings": embedding_result
+    }
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда проверки здоровья системы"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    await update.message.reply_text("🔍 Проверяю состояние систем...")
+    
+    try:
+        health_results = await run_health_checks()
+        
+        message = (
+            f"🏥 **HEALTH CHECK**\n\n"
+            f"📊 Общий статус: {health_results['overall']}\n\n"
+            f"📋 **Google Sheets:**\n"
+            f"Статус: {health_results['google_sheets']['status']}\n"
+            f"Время ответа: {health_results['google_sheets']['response_time']}\n"
+            f"Ошибка: {health_results['google_sheets']['error'] or 'Нет'}\n\n"
+            f"🤖 **Groq API:**\n"
+            f"Статус: {health_results['groq']['status']}\n"
+            f"Время ответа: {health_results['groq']['response_time']}\n"
+            f"Ошибка: {health_results['groq']['error'] or 'Нет'}\n\n"
+            f"🗄️ **ChromaDB:**\n"
+            f"Статус: {health_results['chromadb']['status']}\n"
+            f"General записей: {health_results['chromadb']['general_records']}\n"
+            f"Technical записей: {health_results['chromadb']['technical_records']}\n"
+            f"Ошибка: {health_results['chromadb']['error'] or 'Нет'}\n\n"
+            f"🧠 **Модели эмбеддингов:**\n"
+            f"Статус: {health_results['embeddings']['status']}\n"
+            f"General кэш: {health_results['embeddings']['general_cache']}\n"
+            f"Technical кэш: {health_results['embeddings']['technical_cache']}\n"
+            f"Ошибка: {health_results['embeddings']['error'] or 'Нет'}"
+        )
+        
+        await update.message.reply_text(message, parse_mode="Markdown")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка health check: {e}")
+        await update.message.reply_text(f"❌ Ошибка проверки здоровья: {e}")
 
 # ====================== ОБРАБОТЧИК ОШИБОК ======================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -2507,7 +2077,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     stats["errors"] += 1
     save_stats()
     
-    # Пытаемся уведомить пользователя если возможно
     if update and isinstance(update, Update) and update.effective_chat:
         try:
             await context.bot.send_message(
@@ -2522,7 +2091,6 @@ async def shutdown(application: Application):
     """Корректное завершение работы бота"""
     logger.info("🛑 Начало корректного завершения работы...")
     
-    # Сохраняем все данные
     save_stats()
     save_adminlist()
     
@@ -2530,25 +2098,15 @@ async def shutdown(application: Application):
     logger.info("👋 Бот остановлен")
 
 # ====================== ЗАПУСК БОТА ======================
-
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
     
-    # Загружаем сохранённые данные
     adminlist = load_adminlist()
     logger.info(f"📋 Текущих админов в списке: {len(adminlist)}")
     load_stats()
     
-    # Загружаем alarm
     current_alarm = load_alarm()
-    
-    # Загружаем порог векторного поиска
-    saved_threshold = load_threshold()
-    if saved_threshold is not None:
-        #global VECTOR_THRESHOLD
-        VECTOR_THRESHOLD = saved_threshold
 
-    # Создаём приложение
     app = Application.builder()\
         .token(TELEGRAM_TOKEN)\
         .concurrent_updates(False)\
@@ -2556,7 +2114,6 @@ if __name__ == "__main__":
     
     # ============ ФИЛЬТРЫ СООБЩЕНИЙ ============
     
-    # Блокировка личных чатов для не-админов
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & 
         ~filters.COMMAND & 
@@ -2564,20 +2121,14 @@ if __name__ == "__main__":
         block_private
     ))
     
-    # Обработка текстовых сообщений
-    # В группах: от всех кроме adminlist
-    # В личке: только от ADMIN_IDS
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & (
-            # Личные чаты админов
             (filters.ChatType.PRIVATE & filters.User(user_id=ADMIN_IDS)) |
-            # Все группы
             (filters.ChatType.GROUPS | filters.ChatType.SUPERGROUP)
         ),
         handle_message
     ))
     
-    # Обработка сообщений с подписями (caption)
     app.add_handler(MessageHandler(
         filters.CAPTION & ~filters.COMMAND & (
             (filters.ChatType.PRIVATE & filters.User(user_id=ADMIN_IDS)) |
@@ -2606,7 +2157,6 @@ if __name__ == "__main__":
     
     # ============ ОБРАБОТЧИК КНОПОК ============
     app.add_handler(CallbackQueryHandler(handle_quick_access_callback))
-
     
     # ============ ОБРАБОТЧИК ОШИБОК ============
     app.add_error_handler(error_handler)
@@ -2617,11 +2167,6 @@ if __name__ == "__main__":
         await run_startup_test(context)
 
     app.job_queue.run_once(update_and_test, when=15)
-
-
-    
-    # Опционально: Автоматическое обновление базы каждые 6 часов
-    # app.job_queue.run_repeating(update_vector_db, interval=21600, first=15)
     
     # ============ ЗАПУСК ============
     logger.info("=" * 60)
@@ -2640,6 +2185,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("⌨️ Получен сигнал остановки (Ctrl+C)")
     finally:
-        # Корректное завершение
         import asyncio
         asyncio.run(shutdown(app))
