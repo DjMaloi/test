@@ -2543,9 +2543,9 @@ if __name__ == "__main__":
     current_alarm = load_alarm()
     
     # Загружаем порог векторного поиска
+    global VECTOR_THRESHOLD
     saved_threshold = load_threshold()
     if saved_threshold is not None:
-        global VECTOR_THRESHOLD
         VECTOR_THRESHOLD = saved_threshold
 
     # Создаём приложение
