@@ -9,6 +9,13 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 
 # Telegram imports
+import asyncio
+import logging
+import os
+import hashlib
+import time
+from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.error import TimedOut, NetworkError, RetryAfter
@@ -680,6 +687,172 @@ async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ ОШИБКА при автопроверке: {e}", exc_info=True)
 
 
+# ====================== HEALTH CHECKS ======================
+async def check_google_sheets_health() -> Dict[str, Any]:
+    """Проверка доступности Google Sheets"""
+    try:
+        result = sheet.values().get(
+            spreadsheetId=SHEET_ID, 
+            range="General!A1:A1"
+        ).execute()
+        return {
+            "status": "✅ OK",
+            "response_time": "fast",
+            "error": None
+        }
+    except googleapiclient.errors.HttpError as e:
+        return {
+            "status": "❌ HTTP Error", 
+            "response_time": "N/A",
+            "error": str(e)
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "response_time": "N/A", 
+            "error": str(e)
+        }
+
+async def check_groq_health() -> Dict[str, Any]:
+    """Проверка доступности Groq API"""
+    try:
+        start_time = time.time()
+        async with groq_with_timeout():
+            resp = await asyncio.wait_for(
+                groq_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[{"role": "user", "content": "test"}],
+                    max_tokens=1,
+                    temperature=0.0,
+                ),
+                timeout=5
+            )
+        response_time = f"{(time.time() - start_time)*1000:.0f}ms"
+        return {
+            "status": "✅ OK",
+            "response_time": response_time,
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "response_time": "N/A",
+            "error": str(e)
+        }
+
+def check_chromadb_health() -> Dict[str, Any]:
+    """Проверка состояния ChromaDB"""
+    try:
+        general_count = collection_general.count() if collection_general else 0
+        technical_count = collection_technical.count() if collection_technical else 0
+        
+        return {
+            "status": "✅ OK",
+            "general_records": general_count,
+            "technical_records": technical_count,
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "general_records": 0,
+            "technical_records": 0,
+            "error": str(e)
+        }
+
+def check_embedding_models_health() -> Dict[str, Any]:
+    """Проверка состояния моделей эмбеддингов"""
+    try:
+        # Тестовое эмбеддингирование
+        test_text = "тест"
+        general_emb = get_embedding_general(test_text)
+        technical_emb = get_embedding_technical(test_text)
+        
+        general_cache = get_embedding_general.cache_info()
+        technical_cache = get_embedding_technical.cache_info()
+        
+        return {
+            "status": "✅ OK",
+            "general_cache": f"{general_cache.currsize}/{general_cache.maxsize}",
+            "technical_cache": f"{technical_cache.currsize}/{technical_cache.maxsize}",
+            "error": None
+        }
+    except Exception as e:
+        return {
+            "status": "❌ Error",
+            "general_cache": "N/A",
+            "technical_cache": "N/A", 
+            "error": str(e)
+        }
+
+async def run_health_checks() -> Dict[str, Any]:
+    """Запуск всех проверок здоровья"""
+    logger.info("🔍 Запуск health checks...")
+    
+    # Параллельное выполнение проверок
+    sheets_task = asyncio.create_task(check_google_sheets_health())
+    groq_task = asyncio.create_task(check_groq_health())
+    
+    sheets_result = await sheets_task
+    groq_result = await groq_task
+    
+    chromadb_result = check_chromadb_health()
+    embedding_result = check_embedding_models_health()
+    
+    # Общий статус
+    all_ok = all([
+        sheets_result["status"] == "✅ OK",
+        groq_result["status"] == "✅ OK", 
+        chromadb_result["status"] == "✅ OK",
+        embedding_result["status"] == "✅ OK"
+    ])
+    
+    overall_status = "🟢 Все системы работают" if all_ok else "🟡 Есть проблемы"
+    
+    return {
+        "overall": overall_status,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "google_sheets": sheets_result,
+        "groq_api": groq_result,
+        "chromadb": chromadb_result,
+        "embedding_models": embedding_result
+    }
+
+async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда проверки здоровья системы"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    await update.message.reply_text("🔍 Проверяю состояние системы...")
+    
+    health_report = await run_health_checks()
+    
+    text = (
+        f"🏥 HEALTH CHECK\n\n"
+        f"Общий статус: {health_report['overall']}\n"
+        f"Время проверки: {health_report['timestamp']}\n\n"
+        f"📊 Google Sheets:\n"
+        f"  Статус: {health_report['google_sheets']['status']}\n"
+        f"  Время ответа: {health_report['google_sheets']['response_time']}\n"
+        f"  Ошибка: {health_report['google_sheets']['error'] or 'Нет'}\n\n"
+        f"🤖 Groq API:\n"
+        f"  Статус: {health_report['groq_api']['status']}\n"
+        f"  Время ответа: {health_report['groq_api']['response_time']}\n"
+        f"  Ошибка: {health_report['groq_api']['error'] or 'Нет'}\n\n"
+        f"🗄️ ChromaDB:\n"
+        f"  Статус: {health_report['chromadb']['status']}\n"
+        f"  General записей: {health_report['chromadb']['general_records']}\n"
+        f"  Technical записей: {health_report['chromadb']['technical_records']}\n"
+        f"  Ошибка: {health_report['chromadb']['error'] or 'Нет'}\n\n"
+        f"🧠 Модели эмбеддингов:\n"
+        f"  Статус: {health_report['embedding_models']['status']}\n"
+        f"  General кэш: {health_report['embedding_models']['general_cache']}\n"
+        f"  Technical кэш: {health_report['embedding_models']['technical_cache']}\n"
+        f"  Ошибка: {health_report['embedding_models']['error'] or 'Нет'}"
+    )
+    
+    await update.message.reply_text(text)
+
 # ====================== ОТПРАВКА СООБЩЕНИЙ ======================
 async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, reply_to_message_id: int = None):
 
@@ -1311,6 +1484,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pause — поставить бота на паузу\n"
         "/resume — возобновить работу\n"
         "/status — показать статус и статистику\n"
+        "/health — проверка здоровья системы\n"
         "/reload — перезагрузить базу знаний\n\n"
         "Управление кэшем:\n"
         "/clearcache — очистить кэш ответов\n\n"
@@ -1450,6 +1624,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", pause_bot))
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("clearcache", clear_cache))
     app.add_handler(CommandHandler("addadmin", add_admin_cmd))
     app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
