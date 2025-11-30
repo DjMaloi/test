@@ -29,7 +29,9 @@ from groq import AsyncGroq
 
 # ====================== КОНСТАНТЫ ======================
 GROQ_SEM = asyncio.Semaphore(3)
-VECTOR_THRESHOLD = 0.65
+#VECTOR_THRESHOLD = 0.65
+VECTOR_THRESHOLD = load_threshold()
+
 MAX_MESSAGE_LENGTH = 4000
 CACHE_SIZE = 2000
 CACHE_TTL = 7200
@@ -116,6 +118,7 @@ PAUSE_FILE = "/app/data/paused.flag"
 STATS_FILE = "/app/data/stats.json"
 ADMINLIST_FILE = "/app/data/adminlist.json"
 ALARM_FILE = "/app/data/alarm.txt"
+THRESHOLD_FILE = "/app/data/threshold.json"
 
 # ====================== ФУНКЦИИ ПАУЗЫ ======================
 def is_paused() -> bool:
@@ -222,6 +225,38 @@ def clear_alarm():
         pass
     except Exception as e:
         logger.error(f"❌ Ошибка удаления alarm: {e}")
+
+
+# ====================== УПРАВЛЕНИЕ ПОРОГОМ ======================
+def load_threshold() -> float:
+    """Загружает порог векторного поиска из файла"""
+    try:
+        if os.path.exists(THRESHOLD_FILE):
+            with open(THRESHOLD_FILE, "r") as f:
+                data = json.load(f)
+                threshold = data.get("threshold", 0.65)
+                if 0.0 <= threshold <= 1.0:
+                    logger.info(f"🎚️ Загружен порог вектора: {threshold}")
+                    return threshold
+                else:
+                    logger.warning(f"⚠️ Некорректный порог в файле: {threshold}, используем 0.65")
+        else:
+            logger.info("🎚️ Файл порога не найден, используем значение по умолчанию: 0.65")
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки порога: {e}")
+    
+    return 0.65  # значение по умолчанию
+
+def save_threshold(threshold: float):
+    """Сохраняет порог векторного поиска в файл"""
+    try:
+        os.makedirs(os.path.dirname(THRESHOLD_FILE), exist_ok=True)
+        with open(THRESHOLD_FILE, "w") as f:
+            json.dump({"threshold": threshold}, f, indent=2)
+        logger.info(f"🎚️ Порог сохранён: {threshold}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения порога: {e}")
+
 
 # ====================== СТАТИСТИКА ======================
 stats = {
@@ -1898,6 +1933,7 @@ async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         old_threshold = VECTOR_THRESHOLD
         VECTOR_THRESHOLD = new_threshold
+        save_threshold(new_threshold)
         
         await update.message.reply_text(
             f"✅ Порог изменён: {old_threshold} → {new_threshold}\n\n"
