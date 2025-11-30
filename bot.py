@@ -2545,6 +2545,7 @@ if __name__ == "__main__":
     # Загружаем порог векторного поиска
     saved_threshold = load_threshold()
     if saved_threshold is not None:
+        #global VECTOR_THRESHOLD
         VECTOR_THRESHOLD = saved_threshold
 
     # Создаём приложение
