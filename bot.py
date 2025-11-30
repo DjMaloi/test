@@ -687,6 +687,101 @@ async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ ОШИБКА при автопроверке: {e}", exc_info=True)
 
 
+# ====================== GRACEFUL DEGRADATION ======================
+async def robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
+    """
+    Надежный поиск с плавным снижением качества при проблемах
+    
+    Порядок попыток:
+    1. Кэш ответов
+    2. Поиск по ключевым словам  
+    3. Векторный поиск (General + Technical)
+    4. Groq fallback
+    5. Сообщение об ошибке
+    
+    Returns:
+        (answer, source, distance)
+    """
+    clean_text = preprocess(query)
+    
+    # Попытка 1: Кэш ответов
+    try:
+        cache_key = md5(clean_text.encode()).hexdigest()
+        if cache_key in response_cache:
+            stats["cached"] += 1
+            save_stats()
+            logger.info(f"💾 КЭШИРОВАННЫЙ ОТВЕТ (robust)")
+            return response_cache[cache_key], "cached", 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка кэша: {e}")
+    
+    # Попытка 2: Поиск по ключевым словам
+    try:
+        keyword_answer = await unified_keyword_search(clean_text)
+        if keyword_answer:
+            logger.info(f"🔑 КЛЮЧЕВОЙ ПОИСК (robust)")
+            return keyword_answer, "keyword", 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка поиска по ключевым словам: {e}")
+    
+    # Попытка 3: Векторный поиск General
+    try:
+        answer, dist, _ = await search_in_collection(collection_general, "general", clean_text)
+        if answer and dist < VECTOR_THRESHOLD:
+            # Проверка на несоответствие
+            if not is_mismatch(raw_text, answer):
+                stats["vector"] += 1
+                save_stats()
+                logger.info(f"🎯 ВЕКТОРНЫЙ ПОИСК General (robust) | dist={dist:.4f}")
+                return answer, "vector_general", dist
+            else:
+                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в General, пробуем Technical")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка векторного поиска General: {e}")
+    
+    # Попытка 4: Векторный поиск Technical
+    try:
+        answer, dist, _ = await search_in_collection(collection_technical, "technical", clean_text)
+        if answer and dist < VECTOR_THRESHOLD:
+            stats["vector"] += 1
+            save_stats()
+            logger.info(f"🎯 ВЕКТОРНЫЙ ПОИСК Technical (robust) | dist={dist:.4f}")
+            return answer, "vector_technical", dist
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка векторного поиска Technical: {e}")
+    
+    # Попытка 5: Groq fallback
+    try:
+        groq_answer = await fallback_groq(raw_text)
+        if groq_answer:
+            logger.info(f"🤖 GROQ FALLBACK (robust)")
+            return groq_answer, "groq_fallback", 1.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
+    
+    # Попытка 6: Ultimate fallback
+    logger.error(f"🚨 ВСЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ для запроса: '{query[:50]}...'")
+    stats["errors"] += 1
+    save_stats()
+    
+    return None, "error", 1.0
+
+async def notify_admins_about_problems(context: ContextTypes.DEFAULT_TYPE, problem_type: str, error_msg: str):
+    """Уведомляет админов о проблемах с сервисами"""
+    if not ADMIN_IDS:
+        return
+    
+    message = f"🚨 ПРОБЛЕМА С СЕРВИСАМИ\n\nТип: {problem_type}\nОшибка: {error_msg}\n\nВремя: {datetime.now().strftime('%H:%M:%S')}"
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=message
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось уведомить админа {admin_id}: {e}")
+
 # ====================== HEALTH CHECKS ======================
 async def check_google_sheets_health() -> Dict[str, Any]:
     """Проверка доступности Google Sheets"""
@@ -1058,14 +1153,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# ============ ЭТАП 1.5: Поиск по ключевым словам ============
-    best_answer = await unified_keyword_search(clean_text)
-    if best_answer:
-        source = "keyword"
-
-
-    
-    # ============ ALARM: отправка системного сообщения ============
+# ============ ALARM: отправка системного сообщения ============
     if current_alarm and chat_type in ["group", "supergroup"]:
         try:
             await context.bot.send_message(
@@ -1079,79 +1167,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Показываем "печатает", только если ответ НЕ из кэша
     await safe_typing(context.bot, update.effective_chat.id)
     
-    # ============ ЭТАП 2: Векторный поиск (General) ============
-    if not best_answer:
-        answer, dist, top_log = await search_in_collection(
-            collection_general,
-            "general",
-            clean_text
-        )
-        
-        if answer:
-            # Проверяем, не противоречит ли ответ вопросу
-            if is_mismatch(raw_text, answer):
-                mismatch_words = [w for w in CRITICAL_MISMATCHES.get("касса", []) if w in answer.lower()]
-                if not mismatch_words:
-                    mismatch_words = [w for w in CRITICAL_MISMATCHES.get("киоск", []) if w in answer.lower()]
-                word = mismatch_words[0] if mismatch_words else "неизвестный термин"
-                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ: вопрос про '{raw_text}' → но найден ответ с '{word}'")
-                answer = None  # игнорируем
-            else:
-                best_answer = answer
-                distance = dist
-                source = "vector_general"
-                stats["vector"] += 1
-                save_stats()
-            
-                preview = (answer or "").replace("\n", " ")[:200]
-                logger.info(
-                    f"🎯 VECTOR (General) ✓ | dist={dist:.4f} | user={user.id} | "
-                    f"→ \"{preview}\" | топ-3: {' | '.join(top_log[:3])}"
-                )
-        else:
-            best_dist = top_log[0].split("→")[0] if top_log else "N/A"
-            logger.info(
-                f"❌ VECTOR (General) ✗ | лучший dist={best_dist} | "
-                f"user={user.id} | топ-5: {' | '.join(top_log[:5])}"
-            )
+    # ============ ОСНОВНОЙ ПОИСК С GRACEFUL DEGRADATION ============
+    best_answer, source, distance = await robust_search(raw_text, clean_text)
     
-    # ============ ЭТАП 3: Векторный поиск (Technical) ============
-    if not best_answer:
-        answer, dist, top_log = await search_in_collection(
-            collection_technical,
-            "technical",
-            clean_text
+    # Если все методы провалились, уведомляем админов
+    if source == "error":
+        await notify_admins_about_problems(
+            context, 
+            "Поиск ответов", 
+            f"Все методы поиска провалились для запроса: '{raw_text[:50]}...'"
         )
-        
-        if answer:
-            best_answer = answer
-            distance = dist
-            source = "vector_technical"
-            stats["vector"] += 1
-            save_stats()
-            
-            preview = (answer or "").replace("\n", " ")[:200]
-            logger.info(
-                f"🎯 VECTOR (Technical) ✓ | dist={dist:.4f} | user={user.id} | "
-                f"→ \"{preview}\" | топ-3: {' | '.join(top_log[:3])}"
-            )
-        else:
-            best_dist = top_log[0].split("→")[0] if top_log else "N/A"
-            logger.info(
-                f"❌ VECTOR (Technical) ✗ | лучший dist={best_dist} | "
-                f"user={user.id} | топ-5: {' | '.join(top_log[:5])}"
-            )
-    
-    # ============ ЭТАП 4: Fallback через Groq ============
-    if not best_answer:
-        answer = await fallback_groq(raw_text)
-        
-        if answer:
-            best_answer = answer
-            source = "groq_fallback"
-            logger.info(f"🤖 GROQ FALLBACK ✓ | len={len(answer)} | user={user.id}")
-        else:
-            logger.info(f"🤷 НЕТ ОТВЕТА | user={user.id} | запрос=\"{raw_text[:100]}\"")
+        return
     
     # ============ ЭТАП 5: Улучшение ответа через Groq ============
     final_reply = best_answer
