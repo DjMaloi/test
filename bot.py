@@ -304,27 +304,231 @@ def save_stats():
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения статистики: {e}")
 
-# ====================== КЭШИРОВАНИЕ ======================
-response_cache = TTLCache(maxsize=CACHE_SIZE, ttl=CACHE_TTL)
+# ====================== ОПТИМИЗИРОВАННОЕ КЭШИРОВАНИЕ ======================
+import gc
+from threading import RLock
+from collections import OrderedDict
 
-# Кэширование эмбеддингов для ускорения
-@lru_cache(maxsize=1000)
+# Улучшенный LRU кэш с метриками
+class AdvancedLRUCache:
+    """
+    Продвинутый LRU кэш с метриками и автоматической очисткой
+    """
+    def __init__(self, maxsize: int = 1000, cleanup_ratio: float = 0.8):
+        self.maxsize = maxsize
+        self.cleanup_ratio = cleanup_ratio
+        self.cache = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+        self.lock = RLock()
+        
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                # Перемещаем в конец (LRU)
+                value = self.cache.pop(key)
+                self.cache[key] = value
+                self.hits += 1
+                return value
+            else:
+                self.misses += 1
+                return None
+    
+    def put(self, key, value):
+        with self.lock:
+            # Если ключ уже есть - обновляем
+            if key in self.cache:
+                self.cache.pop(key)
+            # Если достигли лимита - чистим
+            elif len(self.cache) >= self.maxsize:
+                self._cleanup()
+            
+            self.cache[key] = value
+    
+    def _cleanup(self):
+        """Удаляет старые элементы до cleanup_ratio от лимита"""
+        cleanup_size = int(self.maxsize * (1 - self.cleanup_ratio))
+        while len(self.cache) > cleanup_size:
+            self.cache.popitem(last=False)  # Удаляем самые старые
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.hits = 0
+            self.misses = 0
+    
+    def get_stats(self):
+        with self.lock:
+            total = self.hits + self.misses
+            hit_rate = (self.hits / total * 100) if total > 0 else 0
+            return {
+                "size": len(self.cache),
+                "maxsize": self.maxsize,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": f"{hit_rate:.1f}%"
+            }
+
+# Глобальные кэши с метриками
+embedding_cache_general = AdvancedLRUCache(maxsize=2000, cleanup_ratio=0.8)
+embedding_cache_technical = AdvancedLRUCache(maxsize=2000, cleanup_ratio=0.8)
+
+# Кэш ответов с метриками
+class ResponseCache:
+    """
+    Кэш ответов с TTL и метриками
+    """
+    def __init__(self, maxsize: int = 2000, ttl: int = 7200):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self.cache = {}
+        self.timestamps = {}
+        self.hits = 0
+        self.misses = 0
+        self.lock = RLock()
+    
+    def get(self, key):
+        with self.lock:
+            current_time = time.time()
+            
+            # Проверяем TTL
+            if key in self.timestamps:
+                if current_time - self.timestamps[key] > self.ttl:
+                    self._remove(key)
+                    self.misses += 1
+                    return None
+            
+            if key in self.cache:
+                self.hits += 1
+                return self.cache[key]
+            else:
+                self.misses += 1
+                return None
+    
+    def put(self, key, value):
+        with self.lock:
+            current_time = time.time()
+            
+            # Чистим старые записи
+            if len(self.cache) >= self.maxsize:
+                self._cleanup()
+            
+            self.cache[key] = value
+            self.timestamps[key] = current_time
+    
+    def _cleanup(self):
+        """Удаляет просроченные и самые старые записи"""
+        current_time = time.time()
+        
+        # Удаляем просроченные
+        expired_keys = [
+            key for key, ts in self.timestamps.items()
+            if current_time - ts > self.ttl
+        ]
+        for key in expired_keys:
+            self._remove(key)
+        
+        # Если все еще много - удаляем самые старые
+        if len(self.cache) >= self.maxsize:
+            # Сортируем по времени
+            sorted_items = sorted(
+                self.timestamps.items(), 
+                key=lambda x: x[1]
+            )
+            
+            # Удаляем 25% самых старых
+            cleanup_count = int(self.maxsize * 0.25)
+            for key, _ in sorted_items[:cleanup_count]:
+                self._remove(key)
+    
+    def _remove(self, key):
+        self.cache.pop(key, None)
+        self.timestamps.pop(key, None)
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.timestamps.clear()
+            self.hits = 0
+            self.misses = 0
+    
+    def get_stats(self):
+        with self.lock:
+            total = self.hits + self.misses
+            hit_rate = (self.hits / total * 100) if total > 0 else 0
+            return {
+                "size": len(self.cache),
+                "maxsize": self.maxsize,
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": f"{hit_rate:.1f}%",
+                "ttl": self.ttl
+            }
+
+# Заменяем старые кэши
+response_cache = ResponseCache(maxsize=CACHE_SIZE, ttl=CACHE_TTL)
+
+# Оптимизированные функции эмбеддингов
 def get_embedding_general(text: str) -> List[float]:
-    """Кэшированное получение эмбеддинга для General модели"""
+    """Оптимизированное получение эмбеддинга для General модели"""
+    cache_key = f"general_{text}"
+    
+    # Проверяем кэш
+    cached = embedding_cache_general.get(cache_key)
+    if cached is not None:
+        return cached
+    
+    # Генерируем новый эмбеддинг
     try:
-        return embedder_general.encode(text).tolist()
+        embedding = embedder_general.encode(text).tolist()
+        embedding_cache_general.put(cache_key, embedding)
+        return embedding
     except Exception as e:
         logger.error(f"❌ Ошибка эмбеддинга General: {e}")
         raise AIServiceError(f"General embedding error: {e}")
 
-@lru_cache(maxsize=1000)
 def get_embedding_technical(text: str) -> List[float]:
-    """Кэшированное получение эмбеддинга для Technical модели"""
+    """Оптимизированное получение эмбеддинга для Technical модели"""
+    cache_key = f"technical_{text}"
+    
+    # Проверяем кэш
+    cached = embedding_cache_technical.get(cache_key)
+    if cached is not None:
+        return cached
+    
+    # Генерируем новый эмбеддинг
     try:
-        return embedder_technical.encode(text).tolist()
+        embedding = embedder_technical.encode(text).tolist()
+        embedding_cache_technical.put(cache_key, embedding)
+        return embedding
     except Exception as e:
         logger.error(f"❌ Ошибка эмбеддинга Technical: {e}")
         raise AIServiceError(f"Technical embedding error: {e}")
+
+def get_cache_stats() -> Dict[str, Any]:
+    """Возвращает статистику всех кэшей"""
+    return {
+        "response_cache": response_cache.get_stats(),
+        "embedding_general": embedding_cache_general.get_stats(),
+        "embedding_technical": embedding_cache_technical.get_stats()
+    }
+
+def cleanup_caches():
+    """Очищает все кэши и вызывает garbage collector"""
+    logger.info("🧹 Начало очистки кэшей...")
+    
+    response_cache.clear()
+    embedding_cache_general.clear()
+    embedding_cache_technical.clear()
+    
+    # Вызываем сборщик мусора
+    collected = gc.collect()
+    
+    logger.info(f"🧹 Очистка завершена. Собрано объектов: {collected}")
+    return collected
+
+# ====================== КЭШИРОВАНИЕ ======================
+# Старые функции оставлены для совместимости, но используют новые кэши
 
 def preprocess(text: str) -> str:
     """Нормализует текст для поиска и кэширования"""
@@ -339,6 +543,242 @@ async def safe_typing(bot, chat_id):
         await bot.send_chat_action(chat_id=chat_id, action="typing")
     except Exception:
         pass  # Игнорируем ошибки индикатора
+
+# ====================== ОПТИМИЗАЦИЯ ПАРАЛЛЕЛИЗМА ======================
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+
+# Пул потоков для CPU-intensive операций
+thread_pool = ThreadPoolExecutor(max_workers=4)
+
+# Оптимизированный поиск с параллельными запросами
+async def parallel_vector_search(query: str, threshold: float = VECTOR_THRESHOLD) -> Tuple[Optional[str], str, float]:
+    """
+    Параллельный векторный поиск в обеих коллекциях
+    
+    Returns:
+        (best_answer, source_type, distance)
+    """
+    tasks = []
+    
+    # Создаем задачи для параллельного выполнения
+    if collection_general and collection_general.count() > 0:
+        task_general = asyncio.create_task(
+            search_in_collection(collection_general, "general", query, threshold)
+        )
+        tasks.append(("general", task_general))
+    
+    if collection_technical and collection_technical.count() > 0:
+        task_technical = asyncio.create_task(
+            search_in_collection(collection_technical, "technical", query, threshold)
+        )
+        tasks.append(("technical", task_technical))
+    
+    if not tasks:
+        return None, "none", 1.0
+    
+    # Ждем выполнения всех задач
+    results = []
+    for source_type, task in tasks:
+        try:
+            answer, distance, _ = await asyncio.wait_for(task, timeout=10)
+            if answer:
+                results.append((answer, source_type, distance))
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Таймаут векторного поиска в {source_type}")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
+    
+    # Выбираем лучший результат (минимальное расстояние)
+    if results:
+        results.sort(key=lambda x: x[2])  # Сортируем по distance
+        best_answer, best_source, best_distance = results[0]
+        logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
+        return best_answer, f"vector_{best_source}", best_distance
+    
+    return None, "none", 1.0
+
+# Оптимизированная работа с Google Sheets
+class GoogleSheetsPool:
+    """
+    Пул подключений к Google Sheets с кэшированием
+    """
+    def __init__(self, max_connections: int = 3):
+        self.max_connections = max_connections
+        self.semaphore = asyncio.Semaphore(max_connections)
+        self._cache = {}
+        self._cache_ttl = 300  # 5 минут кэширования
+        
+    async def get_range(self, range_name: str) -> List[List[str]]:
+        """Получает данные из диапазона с кэшированием"""
+        cache_key = f"range_{range_name}"
+        current_time = time.time()
+        
+        # Проверяем кэш
+        if cache_key in self._cache:
+            cached_data, cached_time = self._cache[cache_key]
+            if current_time - cached_time < self._cache_ttl:
+                logger.debug(f"📋 Используем кэш Google Sheets: {range_name}")
+                return cached_data
+        
+        # Загружаем данные
+        async with self.semaphore:
+            try:
+                loop = asyncio.get_event_loop()
+                
+                # Выполняем в потоке, так как googleapiclient синхронный
+                result = await loop.run_in_executor(
+                    thread_pool,
+                    lambda: sheet.values().get(
+                        spreadsheetId=SHEET_ID,
+                        range=range_name
+                    ).execute()
+                )
+                
+                data = result.get("values", [])
+                
+                # Кэшируем результат
+                self._cache[cache_key] = (data, current_time)
+                
+                # Чистим старые записи в кэше
+                if len(self._cache) > 20:
+                    self._cleanup_cache()
+                
+                logger.debug(f"📋 Загружено из Google Sheets: {range_name} ({len(data)} строк)")
+                return data
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка Google Sheets ({range_name}): {e}")
+                raise DatabaseError(f"Google Sheets error: {e}")
+    
+    def _cleanup_cache(self):
+        """Чистит старые записи в кэше"""
+        current_time = time.time()
+        expired_keys = [
+            key for key, (_, cached_time) in self._cache.items()
+            if current_time - cached_time > self._cache_ttl
+        ]
+        
+        for key in expired_keys:
+            del self._cache[key]
+    
+    def clear_cache(self):
+        """Очищает весь кэш"""
+        self._cache.clear()
+
+# Глобальный пул для Google Sheets
+sheets_pool = GoogleSheetsPool(max_connections=3)
+
+# Оптимизированный Groq клиент с пулом соединений
+class OptimizedGroqClient:
+    """
+    Оптимизированный клиент Groq с пулом сессий
+    """
+    def __init__(self, api_key: str, pool_size: int = 5):
+        self.api_key = api_key
+        self.pool_size = pool_size
+        self._session_pool = asyncio.Queue(maxsize=pool_size)
+        self._initialized = False
+        
+    async def _get_session(self):
+        """Получает сессию из пула или создает новую"""
+        if not self._initialized:
+            # Инициализируем пул сессиями
+            for _ in range(self.pool_size):
+                session = aiohttp.ClientSession()
+                await self._session_pool.put(session)
+            self._initialized = True
+        
+        return await self._session_pool.get()
+    
+    async def _return_session(self, session):
+        """Возвращает сессию в пул"""
+        try:
+            await self._session_pool.put(session)
+        except asyncio.QueueFull:
+            # Если пул полон - закрываем сессию
+            await session.close()
+    
+    async def close(self):
+        """Закрывает все сессии"""
+        while not self._session_pool.empty():
+            session = await self._session_pool.get()
+            await session.close()
+        self._initialized = False
+
+# Оптимизированная функция поиска по ключевым словам
+async def optimized_keyword_search(clean_text: str) -> Optional[str]:
+    """
+    Оптимизированный поиск по ключевым словам с параллельными запросами
+    """
+    tasks = []
+    
+    # Параллельно ищем в метаданных ChromaDB
+    async def search_in_metadata(collection, collection_name):
+        try:
+            results = collection.get(
+                where={"query": {"$eq": clean_text}},
+                include=["metadatas"]
+            )
+            if results["metadatas"]:
+                answer = results["metadatas"][0].get("answer")
+                if answer:
+                    stats["keyword"] += 1
+                    save_stats()
+                    logger.info(f"🔑 KEYWORD MATCH ({collection_name}) | query='{clean_text}'")
+                    return answer
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка поиска в метаданных {collection_name}: {e}")
+        return None
+    
+    # Задачи для поиска в метаданных
+    if collection_general:
+        tasks.append(search_in_metadata(collection_general, "General"))
+    
+    if collection_technical:
+        tasks.append(search_in_metadata(collection_technical, "Technical"))
+    
+    # Задача для поиска в Google Sheets (если ничего не найдено в метаданных)
+    async def search_in_sheets():
+        try:
+            # Параллельно загружаем оба диапазона
+            general_task = sheets_pool.get_range("General!A:B")
+            technical_task = sheets_pool.get_range("Technical!A:B")
+            
+            general_rows, technical_rows = await asyncio.gather(
+                general_task, technical_task
+            )
+            
+            all_rows = general_rows + technical_rows
+            
+            for row in all_rows:
+                if len(row) >= 2:
+                    keyword = row[0].strip().lower()
+                    answer = row[1].strip()
+                    
+                    # Простое вхождение подстроки
+                    if keyword in clean_text or clean_text in keyword:
+                        stats["keyword"] += 1
+                        save_stats()
+                        logger.info(f"🔑 KEYWORD MATCH (Sheets) | keyword=\"{keyword[:50]}\"")
+                        return answer
+                        
+        except Exception as e:
+            logger.error(f"❌ Ошибка поиска в Google Sheets: {e}")
+        
+        return None
+    
+    # Выполняем параллельный поиск
+    if tasks:
+        # Сначала ищем в метаданных
+        metadata_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in metadata_results:
+            if isinstance(result, str) and result:
+                return result
+    
+    # Если ничего не найдено - ищем в Google Sheets
+    return await search_in_sheets()
 
 # ====================== ВЕКТОРНЫЙ ПОИСК ======================
 async def search_in_collection(
@@ -974,6 +1414,74 @@ async def handle_quick_access_callback(update: Update, context: ContextTypes.DEF
     )
 
 # ====================== GRACEFUL DEGRADATION ======================
+async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
+    """
+    Оптимизированный надежный поиск с параллельными запросами
+    
+    Порядок попыток:
+    1. Кэш ответов
+    2. Параллельный поиск по ключевым словам  
+    3. Параллельный векторный поиск
+    4. Groq fallback
+    5. Сообщение об ошибке
+    
+    Returns:
+        (answer, source, distance)
+    """
+    clean_text = preprocess(query)
+    
+    # Попытка 1: Кэш ответов
+    try:
+        cache_key = md5(clean_text.encode()).hexdigest()
+        cached_answer = response_cache.get(cache_key)
+        if cached_answer:
+            stats["cached"] += 1
+            save_stats()
+            logger.info(f"💾 ОПТИМИЗИРОВАННЫЙ КЭШИРОВАННЫЙ ОТВЕТ")
+            return cached_answer, "cached", 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка кэша: {e}")
+    
+    # Попытка 2: Оптимизированный параллельный поиск по ключевым словам
+    try:
+        keyword_answer = await optimized_keyword_search(clean_text)
+        if keyword_answer:
+            logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
+            return keyword_answer, "keyword", 0.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка оптимизированного поиска по ключевым словам: {e}")
+    
+    # Попытка 3: Параллельный векторный поиск
+    try:
+        answer, source, distance = await parallel_vector_search(clean_text)
+        if answer and distance < VECTOR_THRESHOLD:
+            # Проверка на несоответствие
+            if not is_mismatch(raw_text, answer):
+                stats["vector"] += 1
+                save_stats()
+                logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ВЕКТОРНЫЙ ПОИСК | dist={distance:.4f}")
+                return answer, source, distance
+            else:
+                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка параллельного векторного поиска: {e}")
+    
+    # Попытка 4: Groq fallback
+    try:
+        groq_answer = await fallback_groq(raw_text)
+        if groq_answer:
+            logger.info(f"🤖 GROQ FALLBACK")
+            return groq_answer, "groq_fallback", 1.0
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
+    
+    # Попытка 5: Ultimate fallback
+    logger.error(f"🚨 ВСЕ ОПТИМИЗИРОВАННЫЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ для запроса: '{query[:50]}...'")
+    stats["errors"] += 1
+    save_stats()
+    
+    return None, "error", 1.0
+
 async def robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
     """
     Надежный поиск с плавным снижением качества при проблемах
@@ -1453,8 +1961,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Показываем "печатает", только если ответ НЕ из кэша
     await safe_typing(context.bot, update.effective_chat.id)
     
-    # ============ ОСНОВНОЙ ПОИСК С GRACEFUL DEGRADATION ============
-    best_answer, source, distance = await robust_search(raw_text, clean_text)
+    # ============ ОСНОВНОЙ ПОИСК С ОПТИМИЗАЦИЕЙ ============
+    best_answer, source, distance = await optimized_robust_search(raw_text, clean_text)
     
     # Если все методы провалились, уведомляем админов
     if source == "error":
@@ -1598,17 +2106,20 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     cache_usage = f"{len(response_cache)}/{CACHE_SIZE}"
     
-    # Получаем статистику кэша эмбеддингов
+    # Получаем статистику всех кэшей
     try:
-        from functools import lru_cache
-        general_cache_info = get_embedding_general.cache_info()
-        technical_cache_info = get_embedding_technical.cache_info()
+        cache_stats = get_cache_stats()
+        response_stats = cache_stats["response_cache"]
+        general_stats = cache_stats["embedding_general"]
+        technical_stats = cache_stats["embedding_technical"]
         
         embedding_cache = (
-            f"General: {general_cache_info.hits}/{general_cache_info.hits + general_cache_info.misses} "
-            f"({general_cache_info.currsize}/{general_cache_info.maxsize})\n"
-            f"  • Technical: {technical_cache_info.hits}/{technical_cache_info.hits + technical_cache_info.misses} "
-            f"({technical_cache_info.currsize}/{technical_cache_info.maxsize})"
+            f"📊 Ответы: {response_stats['size']}/{response_stats['maxsize']} "
+            f"(hit_rate={response_stats['hit_rate']})\n"
+            f"  • General: {general_stats['size']}/{general_stats['maxsize']} "
+            f"(hit_rate={general_stats['hit_rate']})\n"
+            f"  • Technical: {technical_stats['size']}/{technical_stats['maxsize']} "
+            f"(hit_rate={technical_stats['hit_rate']})"
         )
     except Exception:
         embedding_cache = "❌ Недоступно"
@@ -1649,14 +2160,36 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Очищает кэш ответов"""
+    """Очищает все кэши и оптимизирует память"""
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    old_size = len(response_cache)
-    response_cache.clear()
+    await update.message.reply_text("🧹 Начинаю очистку кэшей...")
     
-    await update.message.reply_text(f"🗑️ Кэш очищен! Удалено {old_size} записей")
+    # Сохраняем старые размеры
+    old_response_size = len(response_cache)
+    old_general_size = len(embedding_cache_general.cache)
+    old_technical_size = len(embedding_cache_technical.cache)
+    
+    # Очищаем все кэши
+    response_cache.clear()
+    embedding_cache_general.clear()
+    embedding_cache_technical.clear()
+    sheets_pool.clear_cache()
+    
+    # Вызываем garbage collector
+    collected = cleanup_caches()
+    
+    await update.message.reply_text(
+        f"🗑️ Все кэши очищены!\n\n"
+        f"📊 Удалено записей:\n"
+        f"  • Ответы: {old_response_size}\n"
+        f"  • General эмбеддинги: {old_general_size}\n"
+        f"  • Technical эмбеддинги: {old_technical_size}\n"
+        f"  • Google Sheets кэш: очищен\n\n"
+        f"🧹 Garbage collector: {collected} объектов\n"
+        f"✅ Память оптимизирована!"
+    )
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавляет администратора в adminlist"""
@@ -1859,6 +2392,48 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text)
 
+async def optimize_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оптимизирует память и производительность бота"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    await update.message.reply_text("🧠 Начинаю оптимизацию памяти...")
+    
+    try:
+        # 1. Очищаем старые кэши
+        old_stats = get_cache_stats()
+        
+        # 2. Выполняем garbage collection
+        collected = cleanup_caches()
+        
+        # 3. Очищаем старые записи в Google Sheets кэше
+        sheets_pool._cleanup_cache()
+        
+        # 4. Получаем новые статистики
+        new_stats = get_cache_stats()
+        
+        # 5. Информация о памяти процесс
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        message = (
+            f"🧠 Оптимизация памяти завершена!\n\n"
+            f"📊 Статистика кэшей:\n"
+            f"  • Ответы: {new_stats['response_cache']['size']}/{new_stats['response_cache']['maxsize']}\n"
+            f"  • General: {new_stats['embedding_general']['size']}/{new_stats['embedding_general']['maxsize']}\n"
+            f"  • Technical: {new_stats['embedding_technical']['size']}/{new_stats['embedding_technical']['maxsize']}\n\n"
+            f"🧹 Garbage collector: {collected} объектов\n"
+            f"💾 Использование памяти: {memory_mb:.1f} MB\n\n"
+            f"✅ Производительность оптимизирована!"
+        )
+        
+        await update.message.reply_text(message)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка оптимизации: {e}")
+
 async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Изменяет порог векторного поиска (для экспериментов)"""
     global VECTOR_THRESHOLD
@@ -1983,6 +2558,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
     app.add_handler(CommandHandler("clearcache", clear_cache))
+    app.add_handler(CommandHandler("optimize", optimize_memory))
     app.add_handler(CommandHandler("addadmin", add_admin_cmd))
     app.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
     app.add_handler(CommandHandler("adminlist", adminlist_cmd))
