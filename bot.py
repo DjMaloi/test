@@ -1964,6 +1964,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/status — показать статус и статистику\n"
         "/health — проверка здоровья системы\n"
         "/reload — перезагрузить базу знаний\n\n"
+        "/testquery вопрос - тест векторного поиска\n\n"
         "Управление кэшем:\n"
         "/clearcache — очистить кэш ответов\n"
         "/optimize — оптимизировать память\n\n"
