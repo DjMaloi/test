@@ -544,8 +544,8 @@ def preprocess(text: str) -> str:
     # Словарь: синоним → основной термин
     synonyms = {
         r'\bкд\b': 'касса доставки',                        # КД → касса доставки
-        r'\bкасса доставки\b': 'кд',           # касса доставки → кд
-        r'\bкасса ресторана\b': 'кр',      # касса ресторана → кр
+        #r'\bкасса доставки\b': 'кд',           # касса доставки → кд
+        #r'\bкасса ресторана\b': 'кр',      # касса ресторана → кр
         r'\bкр\b': 'касса ресторана',                    # КР → касса ресторана
         #r'\bксо\b': 'касса',                      # КСО → касса
         #r'\bсамообслуживани[еяю]\b': 'касса',     # самообслуживание → касса
@@ -758,12 +758,10 @@ async def search_in_collection(
         
         # Формируем лог для отладки
         top_log = []
-        for d, m in zip(distances, metadatas):
+        logger.info(f"🔍 ВЕКТОРНЫЙ ПОИСК: top-3 для '{query[:30]}...'")
+        for d, m in zip(distances[:3], metadatas[:3]):
             preview = (m.get("answer") or "").replace("\n", " ")[:60]
-            top_log.append(f"{d:.3f}→{preview}")
-            logger.info(f"🔍 ВЕКТОРНЫЙ ПОИСК: top-3 для '{query[:30]}...'")
-        for item in top_log[:3]:
-            logger.info(f"   → {item}")
+            logger.info(f"   → {d:.3f}→{preview}")
         
         # Ищем лучший результат ниже порога
         best_answer = None
@@ -781,9 +779,8 @@ async def search_in_collection(
 
 # Оптимизированный поиск с параллельными запросами
 async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[Optional[str], str, float]:
-    
     if threshold is None:
-        threshold = VECTOR_THRESHOLD  # ✅ Подставляем только при вызове
+        threshold = VECTOR_THRESHOLD
 
     """Параллельный векторный поиск в обеих коллекциях"""
     tasks = []
@@ -792,13 +789,13 @@ async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[O
         task_general = asyncio.create_task(
             search_in_collection(collection_general, "general", query, threshold)
         )
-        tasks.append(("general", task_general))
+        tasks.append(("vector_general", task_general))
     
     if collection_technical and collection_technical.count() > 0:
         task_technical = asyncio.create_task(
             search_in_collection(collection_technical, "technical", query, threshold)
         )
-        tasks.append(("technical", task_technical))
+        tasks.append(("vector_technical", task_technical))
     
     if not tasks:
         return None, "none", 1.0
@@ -807,7 +804,7 @@ async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[O
     for source_type, task in tasks:
         try:
             answer, distance, _ = await asyncio.wait_for(task, timeout=10)
-            if answer:
+            if answer and distance < threshold:  # ✅ Проверяем порог здесь
                 results.append((answer, source_type, distance))
         except asyncio.TimeoutError:
             logger.warning(f"⏱️ Таймаут векторного поиска в {source_type}")
@@ -817,11 +814,11 @@ async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[O
     if results:
         results.sort(key=lambda x: x[2])
         best_answer, best_source, best_distance = results[0]
-        logger.info(f"🔍 TOP-3 вектора: {top_log[:3]}")
         logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
-        return best_answer, f"vector_{best_source}", best_distance
+        return best_answer, best_source, best_distance
     
     return None, "none", 1.0
+
 
 # ====================== RATE LIMITING ======================
 user_requests = defaultdict(deque)
@@ -978,13 +975,14 @@ async def fallback_groq(question: str) -> Optional[str]:
     
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
 async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
-    """Обновляет векторную базу из Google Sheets с сохранением query в метаданных"""
+    """Обновляет векторную базу из Google Sheets с применением preprocess к вопросам"""
     global collection_general, collection_technical
     
     async with collection_lock:
         try:
-            logger.info("🔄 Начало обновления базы знаний из Google Sheets...")
-            
+            logger.info("🔄 Начинаю обновление базы знаний из Google Sheets...")
+
+            # Загрузка данных
             result_general = sheet.values().get(
                 spreadsheetId=SHEET_ID, 
                 range="General!A:B"
@@ -998,65 +996,84 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
             technical_rows = result_technical.get("values", [])
             
             logger.info(f"📥 Загружено: General={len(general_rows)}, Technical={len(technical_rows)}")
-            
+
+            # Удаляем старые коллекции
             for name in ["general_kb", "technical_kb"]:
                 try:
                     chroma_client.delete_collection(name)
                     logger.debug(f"🗑️ Удалена коллекция: {name}")
                 except Exception as e:
-                    logger.debug(f"🔍 Коллекция {name} не найдена или уже удалена: {e}")
-            
+                    logger.debug(f"🔍 Коллекция {name} не найдена: {e}")
+
+            # Создаём новые коллекции
             collection_general = chroma_client.create_collection("general_kb")
             collection_technical = chroma_client.create_collection("technical_kb")
             
+            # Обработка General
             if general_rows:
-                valid_rows = [row for row in general_rows if len(row) >= 2 and row[0].strip()]
-                
-                keys = [row[0].strip() for row in valid_rows]
-                answers = [row[1].strip() for row in valid_rows]
-                
-                embeddings = embedder_general.encode(keys).tolist()
-                
-                collection_general.add(
-                    ids=[f"general_{i}" for i in range(len(valid_rows))],
-                    documents=keys,
-                    metadatas=[
-                        {"query": keys[i], "answer": answers[i]} 
-                        for i in range(len(valid_rows))
-                    ],
-                    embeddings=embeddings
-                )
-                
-                logger.info(f"✅ General: добавлено {len(valid_rows)} пар (вопрос/ответ)")
+                valid_rows = [
+                    row for row in general_rows 
+                    if len(row) >= 2 and row[0].strip()
+                ]
+                if not valid_rows:
+                    logger.warning("🟡 General: нет валидных строк после фильтрации")
+                else:
+                    original_keys = [row[0].strip() for row in valid_rows]
+                    answers = [row[1].strip() for row in valid_rows]
+                    processed_keys = [preprocess(key) for key in original_keys]
+                    
+                    embeddings = embedder_general.encode(original_keys).tolist()
+                    
+                    collection_general.add(
+                        ids=[f"general_{i}" for i in range(len(valid_rows))],
+                        documents=original_keys,
+                        metadatas=[
+                            {"query": processed_keys[i], "answer": answers[i]} 
+                            for i in range(len(valid_rows))
+                        ],
+                        embeddings=embeddings
+                    )
+                    
+                    # Логируем пример
+                    logger.info(f"✅ General: добавлено {len(valid_rows)} пар")
+                    logger.debug(f"📄 Пример: '{original_keys[0]}' → '{processed_keys[0]}'")
             else:
                 logger.info("🟡 General: нет данных для загрузки")
-            
+
+            # Обработка Technical
             if technical_rows:
-                valid_rows = [row for row in technical_rows if len(row) >= 2 and row[0].strip()]
-                
-                keys = [row[0].strip() for row in valid_rows]
-                answers = [row[1].strip() for row in valid_rows]
-                
-                embeddings = embedder_technical.encode(keys).tolist()
-                
-                collection_technical.add(
-                    ids=[f"technical_{i}" for i in range(len(valid_rows))],
-                    documents=keys,
-                    metadatas=[
-                        {"query": keys[i], "answer": answers[i]} 
-                        for i in range(len(valid_rows))
-                    ],
-                    embeddings=embeddings
-                )
-                
-                logger.info(f"✅ Technical: добавлено {len(valid_rows)} пар (вопрос/ответ)")
+                valid_rows = [
+                    row for row in technical_rows 
+                    if len(row) >= 2 and row[0].strip()
+                ]
+                if not valid_rows:
+                    logger.warning("🟡 Technical: нет валидных строк после фильтрации")
+                else:
+                    original_keys = [row[0].strip() for row in valid_rows]
+                    answers = [row[1].strip() for row in valid_rows]
+                    processed_keys = [preprocess(key) for key in original_keys]
+                    
+                    embeddings = embedder_technical.encode(original_keys).tolist()
+                    
+                    collection_technical.add(
+                        ids=[f"technical_{i}" for i in range(len(valid_rows))],
+                        documents=original_keys,
+                        metadatas=[
+                            {"query": processed_keys[i], "answer": answers[i]} 
+                            for i in range(len(valid_rows))
+                        ],
+                        embeddings=embeddings
+                    )
+                    
+                    logger.info(f"✅ Technical: добавлено {len(valid_rows)} пар")
+                    logger.debug(f"📄 Пример: '{original_keys[0]}' → '{processed_keys[0]}'")
             else:
                 logger.info("🟡 Technical: нет данных для загрузки")
-            
+
             logger.info("🟢 Обновление векторной базы завершено успешно!")
             
         except Exception as e:
-            logger.error(f"❌ Критическая ошибка обновления базы: {e}", exc_info=True)
+            logger.error(f"❌ Критическая ошибка при обновлении базы: {e}", exc_info=True)
             stats["errors"] += 1
             save_stats()
 
@@ -2252,6 +2269,9 @@ async def shutdown(application: Application):
 if __name__ == "__main__":
     logger.info("🚀 Запуск бота...")
     
+    logger.info(f"🧪 ТЕСТ preprocess('кд'): '{preprocess('кд')}'")
+    logger.info(f"🧪 ТЕСТ preprocess('касса доставки'): '{preprocess('касса доставки')}'")
+
     VECTOR_THRESHOLD = load_threshold()
     
     adminlist = load_adminlist()
