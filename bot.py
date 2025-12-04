@@ -527,7 +527,18 @@ def cleanup_caches():
 # ====================== КЭШИРОВАНИЕ ======================
 def preprocess(text: str) -> str:
     """Нормализует текст для поиска и кэширования"""
+    # Удаление приветствий и вводных
+    greetings = [
+        "здравствуйте", "привет", "добрый день", "добрый вечер", 
+        "доброе утро", "приветствую", "хай", "hello"
+    ]
+
     text = text.lower()
+    
+    for g in greetings:
+        text = re.sub(rf"\b{g}\b", "", text)
+    
+    #удаление лишних символов
     text = re.sub(r'[^а-яa-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
@@ -677,7 +688,7 @@ async def search_in_collection(
     embedder_type: str,
     query: str,
     threshold: float = None,
-    n_results: int = 10
+    n_results: int = 15
 ) -> Tuple[Optional[str], float, List[str]]:
     if threshold is None:
         threshold = VECTOR_THRESHOLD  # ✅ Защита от None
@@ -763,6 +774,7 @@ async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[O
     if results:
         results.sort(key=lambda x: x[2])
         best_answer, best_source, best_distance = results[0]
+        logger.info(f"🔍 TOP-3 вектора: {top_log[:3]}")
         logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
         return best_answer, f"vector_{best_source}", best_distance
     
@@ -830,10 +842,14 @@ async def improve_with_groq(original_answer: str, question: str) -> Optional[str
     if "касса" in question.lower() and "киоск" in original_answer.lower():
         logger.warning("⚠️ Запрет улучшения: вопрос про 'кассу', но ответ содержит 'киоск'")
         return None
+    else:
+        logger.debug(f"✅ Улучшение разрешено: вопрос='{question}', ответ='{original_answer[:50]}...'")
 
     if "киоск" in question.lower() and "касса" in original_answer.lower():
         logger.warning("⚠️ Запрет улучшения: вопрос про 'киоск', но ответ содержит 'кассу'")
         return None
+    else:
+        logger.debug(f"✅ Улучшение разрешено: вопрос='{question}', ответ='{original_answer[:50]}...'")
 
     try:
         async with groq_with_timeout():
