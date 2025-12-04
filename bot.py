@@ -730,23 +730,17 @@ async def search_in_collection(
     threshold: float = None,
     n_results: int = 15
 ) -> Tuple[Optional[str], float, List[str]]:
+    """Универсальная функция векторного поиска с возвратом top_log"""
     if threshold is None:
-        threshold = VECTOR_THRESHOLD  # ✅ Защита от None
-    """Универсальная функция векторного поиска с кэшированием эмбеддингов"""
+        threshold = VECTOR_THRESHOLD
+    
     if not collection or collection.count() == 0:
         return None, 1.0, []
     
     try:
-        # Выбираем нужный эмбеддер и кэш
-        if embedder_type == "general":
-            embedder_func = get_embedding_general
-        else:
-            embedder_func = get_embedding_technical
-        
-        # Генерируем эмбеддинг с кэшированием
+        embedder_func = get_embedding_general if embedder_type == "general" else get_embedding_technical
         emb = embedder_func(query)
         
-        # Выполняем поиск
         results = collection.query(
             query_embeddings=[emb],
             n_results=n_results,
@@ -756,68 +750,69 @@ async def search_in_collection(
         distances = results["distances"][0]
         metadatas = results["metadatas"][0]
         
-        # Формируем лог для отладки
+        # Формируем top_log
         top_log = []
-        logger.info(f"🔍 ВЕКТОРНЫЙ ПОИСК: top-3 для '{query[:30]}...'")
-        for d, m in zip(distances[:3], metadatas[:3]):
+        for d, m in zip(distances, metadatas):
             preview = (m.get("answer") or "").replace("\n", " ")[:60]
-            logger.info(f"   → {d:.3f}→{preview}")
+            top_log.append(f"{d:.3f} → {preview}")
         
-        # Ищем лучший результат ниже порога
+        # Логируем
+        logger.info(f"🔍 ВЕКТОРНЫЙ ПОИСК: top-3 для '{query[:30]}...'")
+        for item in top_log[:3]:
+            logger.info(f"   → {item}")
+        
+        # Лучший результат
         best_answer = None
         best_distance = 1.0
-        
         if distances and distances[0] < threshold:
             best_answer = metadatas[0].get("answer")
             best_distance = distances[0]
         
-        return best_answer, best_distance, top_log
+        return best_answer, best_distance, top_log  # ✅ Возвращаем top_log
         
     except Exception as e:
         logger.error(f"❌ Ошибка векторного поиска: {e}", exc_info=True)
         return None, 1.0, []
 
+
 # Оптимизированный поиск с параллельными запросами
-async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[Optional[str], str, float]:
+async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[Optional[str], str, float, List[str]]:
+    """Параллельный векторный поиск с возвратом top_log"""
     if threshold is None:
         threshold = VECTOR_THRESHOLD
 
-    """Параллельный векторный поиск в обеих коллекциях"""
     tasks = []
-    
     if collection_general and collection_general.count() > 0:
-        task_general = asyncio.create_task(
+        tasks.append(("vector_general", asyncio.create_task(
             search_in_collection(collection_general, "general", query, threshold)
-        )
-        tasks.append(("vector_general", task_general))
-    
+        )))
     if collection_technical and collection_technical.count() > 0:
-        task_technical = asyncio.create_task(
+        tasks.append(("vector_technical", asyncio.create_task(
             search_in_collection(collection_technical, "technical", query, threshold)
-        )
-        tasks.append(("vector_technical", task_technical))
+        )))
     
     if not tasks:
-        return None, "none", 1.0
-    
+        return None, "none", 1.0, []
+
     results = []
+    all_top_logs = []  # Собираем все top_log
+
     for source_type, task in tasks:
         try:
-            answer, distance, _ = await asyncio.wait_for(task, timeout=10)
-            if answer and distance < threshold:  # ✅ Проверяем порог здесь
+            answer, distance, top_log = await asyncio.wait_for(task, timeout=10)
+            all_top_logs.extend([(source_type, item) for item in top_log])
+            if answer and distance < threshold:
                 results.append((answer, source_type, distance))
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Таймаут векторного поиска в {source_type}")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
-    
+
     if results:
         results.sort(key=lambda x: x[2])
         best_answer, best_source, best_distance = results[0]
         logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
-        return best_answer, best_source, best_distance
+        return best_answer, best_source, best_distance, all_top_logs
     
-    return None, "none", 1.0
+    return None, "none", 1.0, all_top_logs
 
 
 # ====================== RATE LIMITING ======================
@@ -1965,7 +1960,6 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
-    # Проверяем, есть ли сообщение и аргументы
     if not context.args:
         await update.message.reply_text("❌ Использование: /testquery <вопрос>")
         return
@@ -1973,12 +1967,10 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     clean = preprocess(query)
 
-    # Логируем
     logger.info(f"🔍 ТЕСТ: запрос='{query}', clean='{clean}'")
 
-    # Выполняем поиск
     try:
-        answer, source, distance = await parallel_vector_search(clean)
+        answer, source, distance, top_log = await parallel_vector_search(clean)
     except Exception as e:
         logger.error(f"❌ Ошибка в parallel_vector_search: {e}")
         await update.message.reply_text(f"❌ Ошибка поиска: {e}")
@@ -1998,11 +1990,18 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if answer:
         result_text += f"\n\n💬 Ответ:\n{answer}"
 
-    # Отправляем
+    if top_log:
+        top3 = sorted(top_log, key=lambda x: float(x[1].split()[0]))[:3]
+        result_text += f"\n\n📌 ТОП-3 НАЙДЕННЫХ ОТВЕТОВ:"
+        for _, item in top3:
+            result_text += f"\n→ {item}"
+
     try:
         await update.message.reply_text(result_text)
     except Exception as e:
         logger.error(f"❌ Не удалось отправить ответ: {e}")
+        await update.message.reply_text("❌ Ответ найден, но не удалось отправить (слишком длинный)")
+
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
