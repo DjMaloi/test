@@ -947,7 +947,7 @@ async def fallback_groq(question: str) -> Optional[str]:
             if not answer or answer.upper().startswith("НЕТ ДАННЫХ") or \
                answer.lower().startswith("не знаю") or len(answer) < 10:
                logger.debug(f"❌ Groq отказался отвечать: '{answer[:100]}'")
-                return None
+               return None
             
             return answer
             
