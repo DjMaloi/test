@@ -87,6 +87,7 @@ def is_mismatch(question: str, answer: str) -> bool:
         forbidden = ["касса", "онлайн-касса", "фискальный", "регистратор", "терминал оплаты"]
         for word in forbidden:
             if word in answer_lower:
+                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ: вопрос про 'киоск', но ответ содержит '{word}'")
                 return True
 
     return False
@@ -1926,15 +1927,27 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Тест векторного поиска: показывает, что находит бот по запросу"""
     if update.effective_user.id not in ADMIN_IDS:
         return
-    
-    query = " ".join(context.args)
-    if not query:
+
+    # Проверяем, есть ли сообщение и аргументы
+    if not context.args:
         await update.message.reply_text("❌ Использование: /testquery <вопрос>")
         return
-    
+
+    query = " ".join(context.args)
     clean = preprocess(query)
-    answer, source, distance = await parallel_vector_search(clean)
-    
+
+    # Логируем
+    logger.info(f"🔍 ТЕСТ: запрос='{query}', clean='{clean}'")
+
+    # Выполняем поиск
+    try:
+        answer, source, distance = await parallel_vector_search(clean)
+    except Exception as e:
+        logger.error(f"❌ Ошибка в parallel_vector_search: {e}")
+        await update.message.reply_text(f"❌ Ошибка поиска: {e}")
+        return
+
+    # Формируем ответ
     result_text = (
         f"🔍 ТЕСТ ЗАПРОСА\n\n"
         f"📥 Исходный: '{query}'\n"
@@ -1944,11 +1957,15 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📏 Расстояние: {distance:.4f}\n"
         f"🎚️ Порог: {VECTOR_THRESHOLD}"
     )
-    
+
     if answer:
         result_text += f"\n\n💬 Ответ:\n{answer}"
-    
-    await update.message.reply_text(result_text)
+
+    # Отправляем
+    try:
+        await update.message.reply_text(result_text)
+    except Exception as e:
+        logger.error(f"❌ Не удалось отправить ответ: {e}")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
