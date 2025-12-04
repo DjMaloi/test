@@ -1178,7 +1178,7 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
     
     # Попытка 3: Параллельный векторный поиск
     try:
-        answer, source, distance = await parallel_vector_search(clean_text)
+        answer, source, distance, _ = await parallel_vector_search(clean_text)  # ✅ Добавлено _
         if answer and distance < VECTOR_THRESHOLD:
             if not is_mismatch(raw_text, answer):
                 stats["vector"] += 1
@@ -1189,6 +1189,9 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
                 logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
     except Exception as e:
         logger.warning(f"⚠️ Ошибка параллельного векторного поиска: {e}")
+        logger.exception(e)  # 🔁 Добавь полный traceback для отладки
+
+
     
     # Попытка 4: Groq fallback
     try:
