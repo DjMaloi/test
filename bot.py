@@ -573,7 +573,10 @@ class GoogleSheetsPool:
             if current_time - cached_time < self._cache_ttl:
                 logger.debug(f"📋 Используем кэш Google Sheets: {range_name}")
                 return cached_data
-        
+            else:
+                logger.warning(f"⚠️ Используем УСТАРЕВШИЙ кэш для {range_name} (просрочен на {(current_time - cached_time):.0f}с)")
+                return cached_data  # ✅ Возвращаем даже если просрочен
+
         async with self.semaphore:
             try:
                 loop = asyncio.get_event_loop()
@@ -620,11 +623,15 @@ sheets_pool = GoogleSheetsPool(max_connections=3)
 
 # Оптимизированная функция поиска по ключевым словам
 async def optimized_keyword_search(clean_text: str) -> Optional[str]:
-    """Оптимизированный поиск по ключевым словам с параллельными запросами"""
+    """Оптимизированный поиск по ключевым словам с независимыми источниками"""
+    
+    # === 1. Поиск в метаданных ChromaDB ===
     tasks = []
     
     async def search_in_metadata(collection, collection_name):
         try:
+            if not collection:
+                return None
             results = collection.get(
                 where={"query": {"$eq": clean_text}},
                 include=["metadatas"]
@@ -634,7 +641,7 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
                 if answer:
                     stats["keyword"] += 1
                     save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH ({collection_name}) | query='{clean_text}'")
+                    logger.info(f"🔑 KEYWORD MATCH (ChromaDB) | query='{clean_text}'")
                     return answer
         except Exception as e:
             logger.warning(f"⚠️ Ошибка поиска в метаданных {collection_name}: {e}")
@@ -642,45 +649,57 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
     
     if collection_general:
         tasks.append(search_in_metadata(collection_general, "General"))
-    
     if collection_technical:
         tasks.append(search_in_metadata(collection_technical, "Technical"))
     
-    async def search_in_sheets():
-        try:
-            general_task = sheets_pool.get_range("General!A:B")
-            technical_task = sheets_pool.get_range("Technical!A:B")
-            
-            general_rows, technical_rows = await asyncio.gather(
-                general_task, technical_task
-            )
-            
-            all_rows = general_rows + technical_rows
-            
-            for row in all_rows:
-                if len(row) >= 2:
-                    keyword = row[0].strip().lower()
-                    answer = row[1].strip()
-                    
-                    if keyword in clean_text or clean_text in keyword:
-                        stats["keyword"] += 1
-                        save_stats()
-                        logger.info(f"🔑 KEYWORD MATCH (Sheets) | keyword=\"{keyword[:50]}\"")
-                        return answer
+    # Запускаем без ожидания Google Sheets
+    metadata_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Проверяем: найден ли ответ в ChromaDB?
+    for result in metadata_results:
+        if isinstance(result, Exception):
+            logger.warning(f"⚠️ Ошибка в поиске по метаданным: {result}")
+        elif result is not None:
+            return result  # ✅ Нашли — возвращаем сразу
+    
+    # === 2. Только если в ChromaDB не нашли — пытаемся Google Sheets (с fallback на кэш) ===
+    try:
+        general_task = sheets_pool.get_range("General!A:B")
+        technical_task = sheets_pool.get_range("Technical!A:B")
+        
+        general_rows, technical_rows = await asyncio.gather(
+            general_task, technical_task,
+            return_exceptions=True  # ✅ Не падаем при ошибке
+        )
+        
+        all_rows = []
+        
+        if isinstance(general_rows, list):
+            all_rows.extend(general_rows)
+        elif isinstance(general_rows, Exception):
+            logger.warning(f"⚠️ Google Sheets (General) недоступны: {general_rows}")
+        
+        if isinstance(technical_rows, list):
+            all_rows.extend(technical_rows)
+        elif isinstance(technical_rows, Exception):
+            logger.warning(f"⚠️ Google Sheets (Technical) недоступны: {technical_rows}")
+        
+        for row in all_rows:
+            if len(row) >= 2:
+                keyword = row[0].strip().lower()
+                answer = row[1].strip()
+                
+                if keyword in clean_text or clean_text in keyword:
+                    stats["keyword"] += 1
+                    save_stats()
+                    logger.info(f"🔑 KEYWORD MATCH (Sheets) | keyword=\"{keyword[:50]}\"")
+                    return answer
                         
-        except Exception as e:
-            logger.error(f"❌ Ошибка поиска в Google Sheets: {e}")
-        
-        return None
+    except Exception as e:
+        logger.error(f"❌ Фатальная ошибка поиска в Google Sheets: {e}")
     
-    if tasks:
-        metadata_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in metadata_results:
-            if isinstance(result, str) and result:
-                return result
-    
-    return await search_in_sheets()
+    return None
+
 
 # ====================== ВЕКТОРНЫЙ ПОИСК ======================
 async def search_in_collection(
