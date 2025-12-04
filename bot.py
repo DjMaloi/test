@@ -740,6 +740,9 @@ async def search_in_collection(
         for d, m in zip(distances, metadatas):
             preview = (m.get("answer") or "").replace("\n", " ")[:60]
             top_log.append(f"{d:.3f}→{preview}")
+            logger.info(f"🔍 ВЕКТОРНЫЙ ПОИСК: top-3 для '{query[:30]}...'")
+        for item in top_log[:3]:
+            logger.info(f"   → {item}")
         
         # Ищем лучший результат ниже порога
         best_answer = None
@@ -943,6 +946,7 @@ async def fallback_groq(question: str) -> Optional[str]:
             
             if not answer or answer.upper().startswith("НЕТ ДАННЫХ") or \
                answer.lower().startswith("не знаю") or len(answer) < 10:
+               logger.debug(f"❌ Groq отказался отвечать: '{answer[:100]}'")
                 return None
             
             return answer
@@ -950,7 +954,7 @@ async def fallback_groq(question: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"❌ Groq fallback ошибка: {e}")
         return None
-
+    
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
 async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
     """Обновляет векторную базу из Google Sheets с сохранением query в метаданных"""
@@ -1918,6 +1922,35 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тест векторного поиска: показывает, что находит бот по запросу"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("❌ Использование: /testquery <вопрос>")
+        return
+    
+    clean = preprocess(query)
+    answer, source, distance = await parallel_vector_search(clean)
+    
+    result_text = (
+        f"🔍 ТЕСТ ЗАПРОСА\n\n"
+        f"📥 Исходный: '{query}'\n"
+        f"🧹 Очищенный: '{clean}'\n\n"
+        f"🎯 Ответ найден: {'Да' if answer else 'Нет'}\n"
+        f"📊 Источник: {source}\n"
+        f"📏 Расстояние: {distance:.4f}\n"
+        f"🎚️ Порог: {VECTOR_THRESHOLD}"
+    )
+    
+    if answer:
+        result_text += f"\n\n💬 Ответ:\n{answer}"
+    
+    await update.message.reply_text(result_text)
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список команд"""
     if update.effective_user.id not in ADMIN_IDS:
@@ -2163,6 +2196,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+
+
+
 # ====================== GRACEFUL SHUTDOWN ======================
 async def shutdown(application: Application):
     """Корректное завершение работы бота"""
@@ -2231,6 +2267,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
+    app.add_handler(CommandHandler("testquery", testquery_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
     
