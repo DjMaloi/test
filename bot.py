@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -29,8 +30,7 @@ from groq import AsyncGroq
 
 # ====================== КОНСТАНТЫ ======================
 GROQ_SEM = asyncio.Semaphore(3)
-#VECTOR_THRESHOLD = 0.65
-#VECTOR_THRESHOLD = load_threshold()
+VECTOR_THRESHOLD = 0.65  # Значение по умолчанию, будет перезаписано при загрузке
 
 MAX_MESSAGE_LENGTH = 4000
 CACHE_SIZE = 2000
@@ -42,53 +42,21 @@ CRITICAL_MISMATCHES = {
 }
 
 
-# ====================== УПРАВЛЕНИЕ ПОРОГОМ ======================
-def load_threshold() -> float:
-    """Загружает порог векторного поиска из файла"""
-    try:
-        if os.path.exists(THRESHOLD_FILE):
-            with open(THRESHOLD_FILE, "r") as f:
-                data = json.load(f)
-                threshold = data.get("threshold", 0.65)
-                if 0.0 <= threshold <= 1.0:
-                    logger.info(f"🎚️ Загружен порог вектора: {threshold}")
-                    return threshold
-                else:
-                    logger.warning(f"⚠️ Некорректный порог в файле: {threshold}, используем 0.65")
-        else:
-            logger.info("🎚️ Файл порога не найден, используем значение по умолчанию: 0.65")
-    except Exception as e:
-        logger.error(f"❌ Ошибка загрузки порога: {e}")
-    
-    return 0.65  # значение по умолчанию
-
-def save_threshold(threshold: float):
-    """Сохраняет порог векторного поиска в файл"""
-    try:
-        os.makedirs(os.path.dirname(THRESHOLD_FILE), exist_ok=True)
-        with open(THRESHOLD_FILE, "w") as f:
-            json.dump({"threshold": threshold}, f, indent=2)
-        logger.info(f"🎚️ Порог сохранён: {threshold}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка сохранения порога: {e}")
-
 def is_mismatch(question: str, answer: str) -> bool:
-    """Проверяет, не противоречит ли ответ вопросу"""
+    """Проверяет, не противоречит ли ответ вопросу используя CRITICAL_MISMATCHES"""
     question_lower = question.lower()
     answer_lower = answer.lower()
 
-    if "касса" in question_lower:
-        forbidden = ["киоск", "КСО", "самообслуживания", "самообслуживани", "kiosk"]
-        for word in forbidden:
-            if word.lower() in answer_lower:
-                return True
-
-    if "киоск" in question_lower or "КСО" in question_lower or "самообслуживани" in question_lower:
-        forbidden = ["касса", "онлайн-касса", "фискальный", "регистратор", "терминал оплаты"]
-        for word in forbidden:
-            if word in answer_lower:
-                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ: вопрос про 'киоск', но ответ содержит '{word}'")
-                return True
+    # Проверяем каждую ключевую категорию из CRITICAL_MISMATCHES
+    for category, forbidden_terms in CRITICAL_MISMATCHES.items():
+        if category.lower() in question_lower:
+            for forbidden in forbidden_terms:
+                if forbidden.lower() in answer_lower:
+                    logger.warning(
+                        f"⚠️ НЕСООТВЕТСТВИЕ: вопрос про '{category}', "
+                        f"но ответ содержит '{forbidden}'"
+                    )
+                    return True
 
     return False
 
@@ -151,6 +119,36 @@ STATS_FILE = "/app/data/stats.json"
 ADMINLIST_FILE = "/app/data/adminlist.json"
 ALARM_FILE = "/app/data/alarm.txt"
 THRESHOLD_FILE = "/app/data/threshold.json"
+
+# ====================== УПРАВЛЕНИЕ ПОРОГОМ ======================
+def load_threshold() -> float:
+    """Загружает порог векторного поиска из файла"""
+    try:
+        if os.path.exists(THRESHOLD_FILE):
+            with open(THRESHOLD_FILE, "r") as f:
+                data = json.load(f)
+                threshold = data.get("threshold", 0.65)
+                if 0.0 <= threshold <= 1.0:
+                    logger.info(f"🎚️ Загружен порог вектора: {threshold}")
+                    return threshold
+                else:
+                    logger.warning(f"⚠️ Некорректный порог в файле: {threshold}, используем 0.65")
+        else:
+            logger.info("🎚️ Файл порога не найден, используем значение по умолчанию: 0.65")
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки порога: {e}")
+    
+    return 0.65  # значение по умолчанию
+
+def save_threshold(threshold: float):
+    """Сохраняет порог векторного поиска в файл"""
+    try:
+        os.makedirs(os.path.dirname(THRESHOLD_FILE), exist_ok=True)
+        with open(THRESHOLD_FILE, "w") as f:
+            json.dump({"threshold": threshold}, f, indent=2)
+        logger.info(f"🎚️ Порог сохранён: {threshold}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения порога: {e}")
 
 # ====================== ФУНКЦИИ ПАУЗЫ ======================
 def is_paused() -> bool:
@@ -268,8 +266,21 @@ stats = {
     "errors": 0,
     "no_answer": 0,
     "quality_good": 0,
-    "quality_bad": 0
+    "quality_bad": 0,
+    "response_times": [],  # Список времен ответа для расчета среднего
+    "last_error_alert": 0  # Время последнего алерта об ошибках
 }
+
+# Константы для алертов
+ERROR_ALERT_THRESHOLD = 0.1  # 10% ошибок от общего числа запросов
+ERROR_ALERT_MIN_REQUESTS = 20  # Минимум запросов для проверки
+ERROR_ALERT_COOLDOWN = 3600  # 1 час между алертами
+
+# Батчинг для оптимизации сохранения статистики
+_stats_dirty = False
+_stats_last_save = time.time()
+STATS_SAVE_INTERVAL = 30  # Сохранять минимум раз в 30 секунд
+STATS_SAVE_THRESHOLD = 10  # Или после 10 изменений
 
 def load_stats():
     """Загружает статистику из файла"""
@@ -279,15 +290,39 @@ def load_stats():
             with open(STATS_FILE, "r") as f:
                 loaded = json.load(f)
                 stats.update(loaded)
+                # Инициализируем отсутствующие поля
+                if "response_times" not in stats:
+                    stats["response_times"] = []
+                if "last_error_alert" not in stats:
+                    stats["last_error_alert"] = 0
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки статистики: {e}")
 
-def save_stats():
-    """Сохраняет статистику в файл"""
+def save_stats(force: bool = False):
+    """Сохраняет статистику в файл с батчингом"""
+    global _stats_dirty, _stats_last_save
+    
+    if not force:
+        _stats_dirty = True
+        now = time.time()
+        # Сохраняем только если прошло достаточно времени или много изменений
+        if (now - _stats_last_save < STATS_SAVE_INTERVAL and 
+            stats.get("_change_count", 0) < STATS_SAVE_THRESHOLD):
+            stats["_change_count"] = stats.get("_change_count", 0) + 1
+            return
+    
     try:
         os.makedirs(os.path.dirname(STATS_FILE), exist_ok=True)
+        # Удаляем служебные поля и ограничиваем response_times перед сохранением
+        stats_to_save = {k: v for k, v in stats.items() if not k.startswith("_")}
+        # Сохраняем только последние 100 времен ответа для экономии места
+        if "response_times" in stats_to_save and len(stats_to_save["response_times"]) > 100:
+            stats_to_save["response_times"] = stats_to_save["response_times"][-100:]
         with open(STATS_FILE, "w") as f:
-            json.dump(stats, f, indent=2)
+            json.dump(stats_to_save, f, indent=2)
+        _stats_dirty = False
+        _stats_last_save = time.time()
+        stats["_change_count"] = 0
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения статистики: {e}")
 
@@ -874,17 +909,12 @@ async def improve_with_groq(original_answer: str, question: str) -> Optional[str
 
     user_prompt = f"Исходный ответ:\n{original_answer}\n\nВопрос: {question}\n\nУлучшенный ответ:"
     
-    if "касса" in question.lower() and "киоск" in original_answer.lower():
-        logger.warning("⚠️ Запрет улучшения: вопрос про 'кассу', но ответ содержит 'киоск'")
+    # Используем единую функцию проверки несоответствий
+    if is_mismatch(question, original_answer):
+        logger.warning("⚠️ Запрет улучшения: обнаружено несоответствие терминов")
         return None
-    else:
-        logger.debug(f"✅ Улучшение разрешено: вопрос='{question}', ответ='{original_answer[:50]}...'")
-
-    if "киоск" in question.lower() and "касса" in original_answer.lower():
-        logger.warning("⚠️ Запрет улучшения: вопрос про 'киоск', но ответ содержит 'кассу'")
-        return None
-    else:
-        logger.debug(f"✅ Улучшение разрешено: вопрос='{question}', ответ='{original_answer[:50]}...'")
+    
+    logger.debug(f"✅ Улучшение разрешено: вопрос='{question[:50]}...', ответ='{original_answer[:50]}...'")
 
     try:
         async with groq_with_timeout():
@@ -1454,6 +1484,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_paused() and user_id not in ADMIN_IDS:
         return
     
+    # Проверка rate limiting (только для обычных пользователей)
+    if user_id not in ADMIN_IDS and is_rate_limited(user_id):
+        logger.warning(f"⏸️ Rate limit для user={user_id}")
+        try:
+            await update.message.reply_text(
+                "⏸️ Слишком много запросов. Пожалуйста, подождите немного."
+            )
+        except Exception:
+            pass
+        return
+    
     raw_text = (update.message.text or update.message.caption or "").strip()
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
@@ -1462,6 +1503,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = f"@{user.username}" if user.username else ""
     name = f"{user.first_name or ''} {user.last_name or ''}".strip()
     display_name = f"{name} {username}".strip() or "Без имени"
+    
+    # Начало отсчета времени ответа
+    start_time = time.time()
     
     logger.info(
         f"📨 ЗАПРОС | user={user.id} | {display_name} | "
@@ -1570,9 +1614,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = get_source_emoji(source)
     final_text_with_emoji = f"{final_reply}\n\n{emoji}"
 
+    response_time = time.time() - start_time
+    
     logger.info(
         f"📤 ОТПРАВКА | source={source} | dist={distance:.3f} | "
         f"len={len(final_reply)} | user={user.id} | "
+        f"time={response_time:.2f}s | "
         f"\"{final_reply[:100]}{'...' if len(final_reply) > 100 else ''}\""
     )
 
@@ -1586,6 +1633,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not success:
         stats["errors"] += 1
         save_stats()
+    
+    # Сохраняем время ответа для метрик (храним последние 1000)
+    if "response_times" not in stats:
+        stats["response_times"] = []
+    stats["response_times"].append(response_time)
+    if len(stats["response_times"]) > 1000:
+        stats["response_times"] = stats["response_times"][-1000:]
+    
+    # Логируем медленные ответы (>3 секунд)
+    if response_time > 3.0:
+        logger.warning(f"⚠️ Медленный ответ: {response_time:.2f}s для user={user.id}")
+    
+    # Проверяем порог ошибок и отправляем алерт при необходимости
+    await check_error_threshold(context)
+
+async def check_error_threshold(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет порог ошибок и отправляет алерт админам при превышении"""
+    if not ADMIN_IDS:
+        return
+    
+    total = stats.get("total", 0)
+    errors = stats.get("errors", 0)
+    
+    # Проверяем только если достаточно запросов
+    if total < ERROR_ALERT_MIN_REQUESTS:
+        return
+    
+    error_rate = errors / total if total > 0 else 0
+    
+    # Проверяем порог и кулдаун
+    current_time = time.time()
+    last_alert = stats.get("last_error_alert", 0)
+    
+    if error_rate >= ERROR_ALERT_THRESHOLD and (current_time - last_alert) >= ERROR_ALERT_COOLDOWN:
+        stats["last_error_alert"] = current_time
+        save_stats(force=True)
+        
+        message = (
+            f"🚨 ПРЕВЫШЕН ПОРОГ ОШИБОК\n\n"
+            f"📊 Статистика:\n"
+            f"• Всего запросов: {total}\n"
+            f"• Ошибок: {errors}\n"
+            f"• Процент ошибок: {error_rate * 100:.1f}%\n"
+            f"• Порог: {ERROR_ALERT_THRESHOLD * 100:.1f}%\n\n"
+            f"⏰ Время: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"⚠️ Рекомендуется проверить логи: /logs"
+        )
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=message
+                )
+                logger.warning(f"🚨 Отправлен алерт о превышении порога ошибок админу {admin_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Не удалось отправить алерт админу {admin_id}: {e}")
 
 async def notify_admins_about_problems(context: ContextTypes.DEFAULT_TYPE, problem_type: str, error_msg: str):
     """Уведомляет админов о проблемах с сервисами"""
@@ -2019,6 +2123,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/resume — возобновить работу\n"
         "/status — показать статус и статистику\n"
         "/health — проверка здоровья системы\n"
+        "/metrics — метрики производительности и времени ответа\n"
         "/reload — перезагрузить базу знаний\n\n"
         "/testquery вопрос - тест векторного поиска\n\n"
         "Управление кэшем:\n"
@@ -2033,8 +2138,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/adminlist — показать список\n\n"
         "/help — показать это меню\n\n"
         "Диагностика:\n"
-        "/logs — последние 200 строк лога\n\n"
+        "/logs — последние 200 строк лога\n"
+        "/metrics — метрики производительности и времени ответа\n"
         "/threshold <число> — установить порог векторного поиска (0.0–1.0)\n\n"
+        "🔔 **Алерты:**\n"
+        "Бот автоматически уведомляет админов при превышении порога ошибок (10%)\n"
+        "после минимум 20 запросов. Кулдаун между алертами: 1 час.\n\n"
         "💡 Админы из adminlist.json игнорируются ботом в группах"
     )
     
@@ -2236,6 +2345,75 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка health check: {e}")
         await update.message.reply_text(f"❌ Ошибка проверки здоровья: {e}")
 
+async def metrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра метрик производительности"""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    
+    total = stats.get("total", 0)
+    errors = stats.get("errors", 0)
+    response_times = stats.get("response_times", [])
+    
+    # Расчет метрик времени ответа
+    if response_times:
+        avg_time = sum(response_times) / len(response_times)
+        min_time = min(response_times)
+        max_time = max(response_times)
+        
+        # Медиана
+        sorted_times = sorted(response_times)
+        mid = len(sorted_times) // 2
+        median_time = sorted_times[mid] if len(sorted_times) % 2 else (sorted_times[mid-1] + sorted_times[mid]) / 2
+        
+        # Процентили
+        p95_idx = int(len(sorted_times) * 0.95)
+        p99_idx = int(len(sorted_times) * 0.99)
+        p95_time = sorted_times[p95_idx] if p95_idx < len(sorted_times) else sorted_times[-1]
+        p99_time = sorted_times[p99_idx] if p99_idx < len(sorted_times) else sorted_times[-1]
+        
+        # Медленные ответы (>3 сек)
+        slow_responses = sum(1 for t in response_times if t > 3.0)
+        slow_percent = (slow_responses / len(response_times)) * 100
+    else:
+        avg_time = min_time = max_time = median_time = p95_time = p99_time = 0.0
+        slow_responses = 0
+        slow_percent = 0.0
+    
+    # Процент ошибок
+    error_rate = (errors / total * 100) if total > 0 else 0.0
+    
+    # Статус алертов
+    alert_status = "🟢 Норма"
+    if total >= ERROR_ALERT_MIN_REQUESTS:
+        if error_rate >= ERROR_ALERT_THRESHOLD * 100:
+            alert_status = "🔴 Превышен порог"
+        elif error_rate >= ERROR_ALERT_THRESHOLD * 50:
+            alert_status = "🟡 Близко к порогу"
+    
+    message = (
+        f"📊 **МЕТРИКИ ПРОИЗВОДИТЕЛЬНОСТИ**\n\n"
+        f"📈 **Общая статистика:**\n"
+        f"• Всего запросов: {total}\n"
+        f"• Ошибок: {errors}\n"
+        f"• Процент ошибок: {error_rate:.2f}%\n"
+        f"• Статус алертов: {alert_status}\n\n"
+        f"⏱️ **Время ответа:**\n"
+        f"• Среднее: {avg_time:.3f}s\n"
+        f"• Медиана: {median_time:.3f}s\n"
+        f"• Минимум: {min_time:.3f}s\n"
+        f"• Максимум: {max_time:.3f}s\n"
+        f"• 95-й процентиль: {p95_time:.3f}s\n"
+        f"• 99-й процентиль: {p99_time:.3f}s\n"
+        f"• Медленных (>3s): {slow_responses} ({slow_percent:.1f}%)\n\n"
+        f"📋 **Настройки алертов:**\n"
+        f"• Порог ошибок: {ERROR_ALERT_THRESHOLD * 100:.1f}%\n"
+        f"• Минимум запросов: {ERROR_ALERT_MIN_REQUESTS}\n"
+        f"• Кулдаун: {ERROR_ALERT_COOLDOWN // 60} мин\n\n"
+        f"💡 Используйте /status для детальной статистики"
+    )
+    
+    await update.message.reply_text(message, parse_mode="Markdown")
+
 # ====================== ОБРАБОТЧИК ОШИБОК ======================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Глобальный обработчик ошибок"""
@@ -2261,7 +2439,7 @@ async def shutdown(application: Application):
     """Корректное завершение работы бота"""
     logger.info("🛑 Начало корректного завершения работы...")
     
-    save_stats()
+    save_stats(force=True)  # Принудительно сохраняем статистику
     save_adminlist()
     
     logger.info("💾 Все данные сохранены")
@@ -2319,6 +2497,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("resume", resume_bot))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("health", health_cmd))
+    app.add_handler(CommandHandler("metrics", metrics_cmd))
     app.add_handler(CommandHandler("clearcache", clear_cache))
     app.add_handler(CommandHandler("optimize", optimize_memory))
     app.add_handler(CommandHandler("addadmin", add_admin_cmd))
