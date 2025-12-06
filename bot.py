@@ -637,8 +637,10 @@ async def safe_typing(bot, chat_id, max_retries: int = 2):
 thread_pool = ThreadPoolExecutor(max_workers=4)
 
 # Оптимизированная работа с Google Sheets
+# Используется только при /reload для обновления базы знаний
+# Основной поиск работает только с ChromaDB (локальная база)
 class GoogleSheetsPool:
-    """Пул подключений к Google Sheets с кэшированием"""
+    """Пул подключений к Google Sheets с кэшированием (только для /reload)"""
     def __init__(self, max_connections: int = 3):
         self.max_connections = max_connections
         self.semaphore = asyncio.Semaphore(max_connections)
@@ -754,9 +756,9 @@ sheets_pool = GoogleSheetsPool(max_connections=3)
 
 # Оптимизированная функция поиска по ключевым словам
 async def optimized_keyword_search(clean_text: str) -> Optional[str]:
-    """Оптимизированный поиск по ключевым словам с независимыми источниками"""
+    """Быстрый поиск по ключевым словам только в ChromaDB (без запросов к Google Sheets)"""
     
-    # === 1. Поиск в метаданных ChromaDB ===
+    # Поиск в метаданных ChromaDB - локальная база, очень быстрая
     tasks = []
     
     async def search_in_metadata(collection, collection_name):
@@ -783,52 +785,21 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
     if collection_technical:
         tasks.append(search_in_metadata(collection_technical, "Technical"))
     
-    # Запускаем без ожидания Google Sheets
+    if not tasks:
+        return None
+    
+    # Параллельный поиск в обеих коллекциях
     metadata_results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Проверяем: найден ли ответ в ChromaDB?
+    # Проверяем результаты
     for result in metadata_results:
         if isinstance(result, Exception):
             logger.warning(f"⚠️ Ошибка в поиске по метаданным: {result}")
         elif result is not None:
             return result  # ✅ Нашли — возвращаем сразу
     
-    # === 2. Только если в ChromaDB не нашли — пытаемся Google Sheets (с fallback на кэш) ===
-    try:
-        general_task = sheets_pool.get_range("General!A:B")
-        technical_task = sheets_pool.get_range("Technical!A:B")
-        
-        general_rows, technical_rows = await asyncio.gather(
-            general_task, technical_task,
-            return_exceptions=True  # ✅ Не падаем при ошибке
-        )
-        
-        all_rows = []
-        
-        if isinstance(general_rows, list):
-            all_rows.extend(general_rows)
-        elif isinstance(general_rows, Exception):
-            logger.warning(f"⚠️ Google Sheets (General) недоступны: {general_rows}")
-        
-        if isinstance(technical_rows, list):
-            all_rows.extend(technical_rows)
-        elif isinstance(technical_rows, Exception):
-            logger.warning(f"⚠️ Google Sheets (Technical) недоступны: {technical_rows}")
-        
-        for row in all_rows:
-            if len(row) >= 2:
-                keyword = row[0].strip().lower()
-                answer = row[1].strip()
-                
-                if keyword in clean_text or clean_text in keyword:
-                    stats["keyword"] += 1
-                    save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH (Sheets) | keyword=\"{keyword[:50]}\"")
-                    return answer
-                        
-    except Exception as e:
-        logger.error(f"❌ Фатальная ошибка поиска в Google Sheets: {e}")
-    
+    # Не найдено в ChromaDB
+    # Google Sheets используются только при /reload для обновления базы
     return None
 
 
@@ -909,10 +880,13 @@ async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[O
 
     for source_type, task in tasks:
         try:
-            answer, distance, top_log = await asyncio.wait_for(task, timeout=10)
+            # Уменьшаем таймаут до 5 секунд для более быстрого ответа
+            answer, distance, top_log = await asyncio.wait_for(task, timeout=5.0)
             all_top_logs.extend([(source_type, item) for item in top_log])
             if answer and distance < threshold:
                 results.append((answer, source_type, distance))
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Таймаут векторного поиска в {source_type} (5s)")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
 
@@ -1075,7 +1049,12 @@ async def fallback_groq(question: str) -> Optional[str]:
     
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
 async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
-    """Обновляет векторную базу из Google Sheets с применением preprocess к вопросам"""
+    """Обновляет векторную базу из Google Sheets с применением preprocess к вопросам.
+    
+    ⚠️ ВАЖНО: Это единственное место, где используются запросы к Google Sheets.
+    Основной поиск работает только с ChromaDB (локальная база, быстрая).
+    Google Sheets используются только при /reload для синхронизации данных.
+    """
     global collection_general, collection_technical
     
     async with collection_lock:
@@ -1278,45 +1257,62 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
         search_timing["cache"] = time.time() - t0
         logger.warning(f"⚠️ Ошибка кэша: {e}")
     
-    # Попытка 2: Оптимизированный параллельный поиск по ключевым словам
+    # Попытка 2 и 3: Параллельный поиск по ключевым словам И векторный поиск одновременно
+    # Это ускоряет поиск - не ждем завершения одного перед началом другого
     t0 = time.time()
-    try:
-        keyword_answer = await optimized_keyword_search(clean_text)
-        search_timing["keyword"] = time.time() - t0
-        if keyword_answer:
-            logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
-            return keyword_answer, "keyword", 0.0
-    except Exception as e:
-        search_timing["keyword"] = time.time() - t0
-        logger.warning(f"⚠️ Ошибка оптимизированного поиска по ключевым словам: {e}")
+    keyword_task = asyncio.create_task(optimized_keyword_search(clean_text))
+    vector_task = asyncio.create_task(parallel_vector_search(clean_text))
     
-    # Попытка 3: Параллельный векторный поиск
-    t0 = time.time()
+    # Ждем оба с общим таймаутом 8 секунд
     try:
-        answer, source, distance, _ = await parallel_vector_search(clean_text)  # ✅ Добавлено _
+        results = await asyncio.wait_for(
+            asyncio.gather(keyword_task, vector_task, return_exceptions=True),
+            timeout=8.0
+        )
+        keyword_result, vector_result = results
+        search_timing["keyword"] = time.time() - t0
+        
+        # Проверяем результат ключевого поиска
+        if not isinstance(keyword_result, Exception) and keyword_result:
+            logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
+            return keyword_result, "keyword", 0.0
+        
+        # Проверяем результат векторного поиска
+        if not isinstance(vector_result, Exception):
+            vector_answer, vector_source, vector_distance, _ = vector_result
+            if vector_answer and vector_distance < VECTOR_THRESHOLD:
+                if not is_mismatch(raw_text, vector_answer):
+                    stats["vector"] += 1
+                    save_stats()
+                    search_timing["vector"] = time.time() - t0
+                    logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ВЕКТОРНЫЙ ПОИСК | dist={vector_distance:.4f}")
+                    return vector_answer, vector_source, vector_distance
+                else:
+                    logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
+    except asyncio.TimeoutError:
+        search_timing["keyword"] = time.time() - t0
         search_timing["vector"] = time.time() - t0
-        if answer and distance < VECTOR_THRESHOLD:
-            if not is_mismatch(raw_text, answer):
-                stats["vector"] += 1
-                save_stats()
-                logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ВЕКТОРНЫЙ ПОИСК | dist={distance:.4f}")
-                return answer, source, distance
-            else:
-                logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
+        logger.warning(f"⏱️ Таймаут параллельного поиска (8s), переходим к Groq fallback")
     except Exception as e:
+        search_timing["keyword"] = time.time() - t0
         search_timing["vector"] = time.time() - t0
-        logger.warning(f"⚠️ Ошибка параллельного векторного поиска: {e}")
-        logger.exception(e)  # 🔁 Добавь полный traceback для отладки
+        logger.warning(f"⚠️ Ошибка параллельного поиска: {e}")
 
     
-    # Попытка 4: Groq fallback
+    # Попытка 4: Groq fallback (с таймаутом 5 секунд)
     t0 = time.time()
     try:
-        groq_answer = await fallback_groq(raw_text)
+        groq_answer = await asyncio.wait_for(
+            fallback_groq(raw_text),
+            timeout=5.0
+        )
         search_timing["groq_fallback"] = time.time() - t0
         if groq_answer:
             logger.info(f"🤖 GROQ FALLBACK")
             return groq_answer, "groq_fallback", 1.0
+    except asyncio.TimeoutError:
+        search_timing["groq_fallback"] = time.time() - t0
+        logger.warning(f"⏱️ Таймаут Groq fallback (5s)")
     except Exception as e:
         search_timing["groq_fallback"] = time.time() - t0
         logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
@@ -1662,7 +1658,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ============ ОСНОВНОЙ ПОИСК С ОПТИМИЗАЦИЕЙ ============
     t0 = time.time()
-    best_answer, source, distance = await optimized_robust_search(raw_text, clean_text)
+    try:
+        # Общий таймаут для поиска - максимум 12 секунд
+        best_answer, source, distance = await asyncio.wait_for(
+            optimized_robust_search(raw_text, clean_text),
+            timeout=12.0
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"🚨 ТАЙМАУТ ПОИСКА: превышен лимит 12s")
+        best_answer, source, distance = None, "error", 1.0
+        stats["errors"] += 1
+        save_stats()
     timing_breakdown["search"] = time.time() - t0
     
     if source == "error":
@@ -1775,8 +1781,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Breakdown: {breakdown_str if breakdown_str else 'N/A'}"
         )
     
-    # Критически медленные ответы (>10 секунд) - отправляем алерт админам
-    if response_time > 10.0:
+    # Критически медленные ответы (>15 секунд) - отправляем алерт админам
+    # Увеличен порог, так как поиск теперь оптимизирован с таймаутами
+    if response_time > 15.0:
         logger.error(
             f"🚨 КРИТИЧЕСКИ МЕДЛЕННЫЙ ОТВЕТ: {response_time:.2f}s для user={user.id} | "
             f"Breakdown: {breakdown_str if breakdown_str else 'N/A'}"
