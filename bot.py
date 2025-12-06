@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -268,7 +267,9 @@ stats = {
     "quality_good": 0,
     "quality_bad": 0,
     "response_times": [],  # Список времен ответа для расчета среднего
-    "last_error_alert": 0  # Время последнего алерта об ошибках
+    "last_error_alert": 0,  # Время последнего алерта об ошибках
+    "ssl_errors": 0,  # Счетчик SSL ошибок Google Sheets
+    "typing_timeouts": 0  # Счетчик таймаутов индикатора "печатает"
 }
 
 # Константы для алертов
@@ -295,6 +296,10 @@ def load_stats():
                     stats["response_times"] = []
                 if "last_error_alert" not in stats:
                     stats["last_error_alert"] = 0
+                if "ssl_errors" not in stats:
+                    stats["ssl_errors"] = 0
+                if "typing_timeouts" not in stats:
+                    stats["typing_timeouts"] = 0
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки статистики: {e}")
 
@@ -599,12 +604,33 @@ def preprocess(text: str) -> str:
     return text.strip()
 
 
-async def safe_typing(bot, chat_id):
-    """Безопасно отправляет индикатор "печатает" """
-    try:
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-    except Exception as e:
-        logger.error(f"❌ Ошибка индикатора 'печатает': {e}")
+async def safe_typing(bot, chat_id, max_retries: int = 2):
+    """Безопасно отправляет индикатор "печатает" с retry и таймаутом"""
+    for attempt in range(max_retries):
+        try:
+            await asyncio.wait_for(
+                bot.send_chat_action(chat_id=chat_id, action="typing"),
+                timeout=3.0  # Таймаут 3 секунды
+            )
+            return  # Успешно отправлено
+        except TimedOut:
+            if attempt < max_retries - 1:
+                logger.debug(f"⏱️ Таймаут индикатора 'печатает' (попытка {attempt + 1}/{max_retries})")
+                await asyncio.sleep(0.5)  # Короткая задержка перед повтором
+            else:
+                stats["typing_timeouts"] = stats.get("typing_timeouts", 0) + 1
+                logger.warning(f"⚠️ Не удалось отправить индикатор 'печатает' после {max_retries} попыток")
+        except (NetworkError, RetryAfter) as e:
+            if attempt < max_retries - 1:
+                wait_time = getattr(e, 'retry_after', 1) + 0.5
+                logger.debug(f"🌐 Сетевая ошибка индикатора, ждём {wait_time:.1f}с")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.warning(f"⚠️ Сетевая ошибка индикатора 'печатает': {e}")
+        except Exception as e:
+            # Для других ошибок не повторяем
+            logger.debug(f"⚠️ Ошибка индикатора 'печатает': {e}")
+            return
 
 # ====================== ОПТИМИЗАЦИЯ ПАРАЛЛЕЛИЗМА ======================
 # Пул потоков для CPU-intensive операций
@@ -634,30 +660,79 @@ class GoogleSheetsPool:
                 return cached_data  # ✅ Возвращаем даже если просрочен
 
         async with self.semaphore:
-            try:
-                loop = asyncio.get_event_loop()
-                
-                result = await loop.run_in_executor(
-                    thread_pool,
-                    lambda: sheet.values().get(
-                        spreadsheetId=SHEET_ID,
-                        range=range_name
-                    ).execute()
-                )
-                
-                data = result.get("values", [])
-                
-                self._cache[cache_key] = (data, current_time)
-                
-                if len(self._cache) > 20:
-                    self._cleanup_cache()
-                
-                logger.debug(f"📋 Загружено из Google Sheets: {range_name} ({len(data)} строк)")
-                return data
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка Google Sheets ({range_name}): {e}")
-                raise Exception(f"Google Sheets error: {e}")
+            # Retry для SSL и сетевых ошибок
+            max_retries = 3
+            last_error = None
+            
+            for attempt in range(max_retries):
+                try:
+                    loop = asyncio.get_event_loop()
+                    
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            thread_pool,
+                            lambda: sheet.values().get(
+                                spreadsheetId=SHEET_ID,
+                                range=range_name
+                            ).execute()
+                        ),
+                        timeout=15.0  # Таймаут 15 секунд
+                    )
+                    
+                    data = result.get("values", [])
+                    
+                    self._cache[cache_key] = (data, current_time)
+                    
+                    if len(self._cache) > 20:
+                        self._cleanup_cache()
+                    
+                    logger.debug(f"📋 Загружено из Google Sheets: {range_name} ({len(data)} строк)")
+                    return data
+                    
+                except asyncio.TimeoutError:
+                    last_error = "Timeout"
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # Экспоненциальная задержка: 2, 4, 6 сек
+                        logger.warning(f"⏱️ Таймаут Google Sheets ({range_name}), попытка {attempt + 1}/{max_retries}, ждём {wait_time}с")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error(f"❌ Таймаут Google Sheets ({range_name}) после {max_retries} попыток")
+                except Exception as e:
+                    error_str = str(e)
+                    last_error = error_str
+                    
+                    # Проверяем тип ошибки
+                    is_ssl_error = "SSL" in error_str or "ssl" in error_str.lower() or "_ssl.c" in error_str
+                    is_network_error = "network" in error_str.lower() or "connection" in error_str.lower()
+                    
+                    if (is_ssl_error or is_network_error) and attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2  # Экспоненциальная задержка
+                        error_type = "SSL" if is_ssl_error else "Network"
+                        if is_ssl_error:
+                            stats["ssl_errors"] = stats.get("ssl_errors", 0) + 1
+                        logger.warning(
+                            f"🌐 {error_type} ошибка Google Sheets ({range_name}), "
+                            f"попытка {attempt + 1}/{max_retries}, ждём {wait_time}с: {error_str[:100]}"
+                        )
+                        await asyncio.sleep(wait_time)
+                    else:
+                        # Для других ошибок или последней попытки - логируем и пробрасываем
+                        logger.error(f"❌ Ошибка Google Sheets ({range_name}): {error_str}")
+                        if attempt == max_retries - 1:
+                            # На последней попытке возвращаем кэш если есть
+                            if cache_key in self._cache:
+                                cached_data, _ = self._cache[cache_key]
+                                logger.warning(f"⚠️ Используем кэш из-за ошибки: {range_name}")
+                                return cached_data
+                        raise Exception(f"Google Sheets error: {error_str}")
+            
+            # Если все попытки исчерпаны и нет кэша
+            if cache_key in self._cache:
+                cached_data, _ = self._cache[cache_key]
+                logger.warning(f"⚠️ Используем устаревший кэш после всех попыток: {range_name}")
+                return cached_data
+            
+            raise Exception(f"Google Sheets error after {max_retries} attempts: {last_error}")
     
     def _cleanup_cache(self):
         """Чистит старые записи в кэше"""
