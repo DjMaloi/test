@@ -1258,32 +1258,43 @@ async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, 
 # ====================== ОПТИМИЗИРОВАННЫЙ ПОИСК ======================
 async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
     """Оптимизированный надежный поиск с параллельными запросами"""
+    search_start = time.time()
+    search_timing = {}
+    
     clean_text = preprocess(query)
     
     # Попытка 1: Кэш ответов
+    t0 = time.time()
     try:
         cache_key = md5(clean_text.encode()).hexdigest()
         cached_answer = response_cache.get(cache_key)
+        search_timing["cache"] = time.time() - t0
         if cached_answer:
             stats["cached"] += 1
             save_stats()
             logger.info(f"💾 ОПТИМИЗИРОВАННЫЙ КЭШИРОВАННЫЙ ОТВЕТ")
             return cached_answer, "cached", 0.0
     except Exception as e:
+        search_timing["cache"] = time.time() - t0
         logger.warning(f"⚠️ Ошибка кэша: {e}")
     
     # Попытка 2: Оптимизированный параллельный поиск по ключевым словам
+    t0 = time.time()
     try:
         keyword_answer = await optimized_keyword_search(clean_text)
+        search_timing["keyword"] = time.time() - t0
         if keyword_answer:
             logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
             return keyword_answer, "keyword", 0.0
     except Exception as e:
+        search_timing["keyword"] = time.time() - t0
         logger.warning(f"⚠️ Ошибка оптимизированного поиска по ключевым словам: {e}")
     
     # Попытка 3: Параллельный векторный поиск
+    t0 = time.time()
     try:
         answer, source, distance, _ = await parallel_vector_search(clean_text)  # ✅ Добавлено _
+        search_timing["vector"] = time.time() - t0
         if answer and distance < VECTOR_THRESHOLD:
             if not is_mismatch(raw_text, answer):
                 stats["vector"] += 1
@@ -1293,21 +1304,35 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
             else:
                 logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
     except Exception as e:
+        search_timing["vector"] = time.time() - t0
         logger.warning(f"⚠️ Ошибка параллельного векторного поиска: {e}")
         logger.exception(e)  # 🔁 Добавь полный traceback для отладки
 
-
     
     # Попытка 4: Groq fallback
+    t0 = time.time()
     try:
         groq_answer = await fallback_groq(raw_text)
+        search_timing["groq_fallback"] = time.time() - t0
         if groq_answer:
             logger.info(f"🤖 GROQ FALLBACK")
             return groq_answer, "groq_fallback", 1.0
     except Exception as e:
+        search_timing["groq_fallback"] = time.time() - t0
         logger.warning(f"⚠️ Ошибка Groq fallback: {e}")
     
-    logger.error(f"🚨 ВСЕ ОПТИМИЗИРОВАННЫЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ для запроса: '{query[:50]}...'")
+    total_search_time = time.time() - search_start
+    search_breakdown = " | ".join([
+        f"{k}={v:.2f}s" for k, v in sorted(search_timing.items(), key=lambda x: x[1], reverse=True)
+        if v > 0.1
+    ])
+    
+    logger.error(
+        f"🚨 ВСЕ МЕТОДЫ ПОИСКА ПРОВАЛИЛИСЬ | "
+        f"total={total_search_time:.2f}s | "
+        f"Breakdown: {search_breakdown if search_breakdown else 'N/A'} | "
+        f"запрос: '{query[:50]}...'"
+    )
     stats["errors"] += 1
     save_stats()
     
@@ -1581,6 +1606,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Начало отсчета времени ответа
     start_time = time.time()
+    timing_breakdown = {}  # Детальное логирование времени на каждом этапе
     
     logger.info(
         f"📨 ЗАПРОС | user={user.id} | {display_name} | "
@@ -1591,25 +1617,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_stats()
     
     # Проверка кэша — отвечаем мгновенно, без "печатает"
+    t0 = time.time()
     clean_text = preprocess(raw_text)
     cache_key = md5(clean_text.encode()).hexdigest()
+    timing_breakdown["preprocess"] = time.time() - t0
     
     # Проверяем кэш через метод get()
+    t0 = time.time()
     cached_answer = response_cache.get(cache_key)
+    timing_breakdown["cache_check"] = time.time() - t0
+    
     if cached_answer is not None:
         stats["cached"] += 1
         save_stats()
         logger.info(f"💾 КЭШИРОВАННЫЙ ОТВЕТ для user={user.id}")
-    
+        
         emoji = get_source_emoji("cached")
         final_text = f"{cached_answer}\n\n{emoji}"
-    
+        
+        t0 = time.time()
         await send_long_message(
             context.bot, 
             update.effective_chat.id, 
             final_text,
             reply_to_message_id=update.message.message_id
         )
+        timing_breakdown["send_message"] = time.time() - t0
         return
 
     # ============ ALARM: отправка системного сообщения ============
@@ -1623,10 +1656,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"❌ Не удалось отправить alarm: {e}")
 
+    t0 = time.time()
     await safe_typing(context.bot, update.effective_chat.id)
+    timing_breakdown["typing"] = time.time() - t0
     
     # ============ ОСНОВНОЙ ПОИСК С ОПТИМИЗАЦИЕЙ ============
+    t0 = time.time()
     best_answer, source, distance = await optimized_robust_search(raw_text, clean_text)
+    timing_breakdown["search"] = time.time() - t0
     
     if source == "error":
         await notify_admins_about_problems(
@@ -1638,9 +1675,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ============ ЭТАП 5: Улучшение ответа через Groq ============
     final_reply = best_answer
+    timing_breakdown["groq_improve"] = 0.0
     
     if best_answer and source in ["vector_general", "vector_technical", "keyword"] and len(best_answer) < 1200:
+        t0 = time.time()
         improved = await improve_with_groq(best_answer, raw_text)
+        timing_breakdown["groq_improve"] = time.time() - t0
         
         if improved:
             final_reply = improved
@@ -1689,25 +1729,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = get_source_emoji(source)
     final_text_with_emoji = f"{final_reply}\n\n{emoji}"
 
-    response_time = time.time() - start_time
-    
-    logger.info(
-        f"📤 ОТПРАВКА | source={source} | dist={distance:.3f} | "
-        f"len={len(final_reply)} | user={user.id} | "
-        f"time={response_time:.2f}s | "
-        f"\"{final_reply[:100]}{'...' if len(final_reply) > 100 else ''}\""
-    )
-
+    # Отправка сообщения
+    t0 = time.time()
     success = await send_long_message(
         context.bot, 
         update.effective_chat.id, 
         final_text_with_emoji,
         reply_to_message_id=update.message.message_id
     )
+    timing_breakdown["send_message"] = time.time() - t0
     
     if not success:
         stats["errors"] += 1
         save_stats()
+    
+    # Общее время ответа
+    response_time = time.time() - start_time
+    
+    # Формируем строку breakdown времени
+    breakdown_str = " | ".join([
+        f"{k}={v:.2f}s" for k, v in sorted(timing_breakdown.items(), key=lambda x: x[1], reverse=True)
+        if v > 0.1  # Показываем только этапы >0.1 сек
+    ])
+    
+    logger.info(
+        f"📤 ОТПРАВКА | source={source} | dist={distance:.3f} | "
+        f"len={len(final_reply)} | user={user.id} | "
+        f"time={response_time:.2f}s"
+    )
+    
+    if breakdown_str:
+        logger.info(f"⏱️ TIMING BREAKDOWN: {breakdown_str}")
     
     # Сохраняем время ответа для метрик (храним последние 1000)
     if "response_times" not in stats:
@@ -1716,9 +1768,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(stats["response_times"]) > 1000:
         stats["response_times"] = stats["response_times"][-1000:]
     
-    # Логируем медленные ответы (>3 секунд)
+    # Логируем медленные ответы с детальным breakdown
     if response_time > 3.0:
-        logger.warning(f"⚠️ Медленный ответ: {response_time:.2f}s для user={user.id}")
+        logger.warning(
+            f"⚠️ Медленный ответ: {response_time:.2f}s для user={user.id} | "
+            f"Breakdown: {breakdown_str if breakdown_str else 'N/A'}"
+        )
+    
+    # Критически медленные ответы (>10 секунд) - отправляем алерт админам
+    if response_time > 10.0:
+        logger.error(
+            f"🚨 КРИТИЧЕСКИ МЕДЛЕННЫЙ ОТВЕТ: {response_time:.2f}s для user={user.id} | "
+            f"Breakdown: {breakdown_str if breakdown_str else 'N/A'}"
+        )
+        await notify_admins_about_problems(
+            context,
+            "Медленный ответ",
+            f"Время ответа: {response_time:.2f}s\n"
+            f"User: {user.id}\n"
+            f"Запрос: {raw_text[:100]}\n"
+            f"Breakdown: {breakdown_str if breakdown_str else 'N/A'}"
+        )
     
     # Проверяем порог ошибок и отправляем алерт при необходимости
     await check_error_threshold(context)
