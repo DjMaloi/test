@@ -1417,8 +1417,8 @@ async def show_problem_category_selection(context: ContextTypes.DEFAULT_TYPE, ch
     
     keyboard = [
         [
-            InlineKeyboardButton("🖥️ КИОСК", callback_data="problem_kiosk"),
-            InlineKeyboardButton("💳 КАССА", callback_data="problem_cash")
+            InlineKeyboardButton("🖥️ КИОСК", url="https://t.me/astra_carry_bot"),
+            InlineKeyboardButton("💳 КАССА ККТ", callback_data="problem_cash")
         ],
         [
             InlineKeyboardButton("📺 ТВ-БОРД", callback_data="problem_tv"),
@@ -1426,11 +1426,19 @@ async def show_problem_category_selection(context: ContextTypes.DEFAULT_TYPE, ch
         ],
         [
             InlineKeyboardButton("🏷️ ПРИНТЕР ЭТИКЕТОК", callback_data="problem_label_printer"),
-            InlineKeyboardButton("💻 КОМПЬЮТЕР", callback_data="problem_computer")
+            InlineKeyboardButton("💻 КОМПЬЮТЕР_МОНОБЛОК", callback_data="problem_computer")
         ],
         [
             InlineKeyboardButton("🖨️ ПРИНТЕР А4", callback_data="problem_a4_printer"),
-            InlineKeyboardButton("📶 FREE WIFI", callback_data="problem_wifi")
+            InlineKeyboardButton("📶 DODO PIZZA FREE", callback_data="problem_wifi")
+        ]
+        [
+            InlineKeyboardButton("🔊 ЗВУК_МУЗЫКА", callback_data="problem_sound"),
+            InlineKeyboardButton("🔎 СКАНЕР ШТРИХКОДА", callback_data="problem_scanner")
+        ]
+        [
+            InlineKeyboardButton("🔔 УВЕДОМЛЕНИЯ_ОЛЕНЬКА", callback_data="problem_notice"),
+            InlineKeyboardButton("❓ ДРУГОЕ", callback_data="problem_other")
         ]
     ]
     
@@ -1481,9 +1489,26 @@ async def handle_problem_category_callback(update: Update, context: ContextTypes
             "keywords": ["принтер а4", "принтер обычный", "печать на обычном принтере", "а4"]
         },
         "problem_wifi": {
-            "name": "FREE WIFI",
+            "name": "DODO PIZZA FREE",
             "keywords": ["free wifi", "бесплатный wifi", "гостевой wifi", "wifi для гостей", "hot wifi", "wifi для клиентов"]
+        },
+        "problem_sound": {
+            "name": "ЗВУК МУЗЫКА",
+            "keywords": ["музыка в зале", "музыка на кухне", "нет звука в зале", "нет звука на кухне"]
+        },
+        "problem_scanner": {
+            "name": "СКАНЕР ШТРИХКОДА",
+            "keywords": ["подключить сканер", "не работает сканер", "как подключить сканер"]
+        },
+        "problem_notice": {
+            "name": "УВЕДОМЛЕНИЕ",
+            "keywords": ["уведомления на кухне", "не работает Оленька", "не работает сервис уведомлений"]
+        },
+        "problem_other": {
+            "name": "ДРУГОЕ",
+            "keywords": ["модераторы и администраторы группы", "другое"]
         }
+
     }
     
     category_data = category_map.get(query.data)
