@@ -1431,11 +1431,11 @@ async def show_problem_category_selection(context: ContextTypes.DEFAULT_TYPE, ch
         [
             InlineKeyboardButton("🖨️ ПРИНТЕР А4", callback_data="problem_a4_printer"),
             InlineKeyboardButton("📶 DODO PIZZA FREE", callback_data="problem_wifi")
-        ]
+        ],
         [
             InlineKeyboardButton("🔊 ЗВУК_МУЗЫКА", callback_data="problem_sound"),
             InlineKeyboardButton("🔎 СКАНЕР ШТРИХКОДА", callback_data="problem_scanner")
-        ]
+        ],
         [
             InlineKeyboardButton("🔔 УВЕДОМЛЕНИЯ_ОЛЕНЬКА", callback_data="problem_notice"),
             InlineKeyboardButton("❓ ДРУГОЕ", callback_data="problem_other")
@@ -2938,3 +2938,4 @@ if __name__ == "__main__":
     finally:
         import asyncio
         asyncio.run(shutdown(app))
+
