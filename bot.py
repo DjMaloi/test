@@ -1852,6 +1852,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats["total"] += 1
     save_stats()
     
+    # Отправляем Alarm сразу, до кэша. Убрали проверку chat_type для работы в ЛС.
+    if current_alarm: 
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"🔔 {current_alarm}",
+                disable_notification=True
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось отправить alarm: {e}")
+    
     # Проверка кэша — отвечаем мгновенно, без "печатает"
     t0 = time.time()
     clean_text = preprocess(raw_text)
@@ -1882,15 +1893,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ============ ALARM: отправка системного сообщения ============
-    if current_alarm and chat_type in ["group", "supergroup"]:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"🔔 {current_alarm}",
-                disable_notification=True
-            )
-        except Exception as e:
-            logger.error(f"❌ Не удалось отправить alarm: {e}")
+    #if current_alarm and chat_type in ["group", "supergroup"]:
+    #    try:
+    #        await context.bot.send_message(
+    #            chat_id=update.effective_chat.id,
+    #            text=f"🔔 {current_alarm}",
+    #            disable_notification=True
+    #        )
+    #    except Exception as e:
+    #        logger.error(f"❌ Не удалось отправить alarm: {e}")
 
     t0 = time.time()
     await safe_typing(context.bot, update.effective_chat.id)
