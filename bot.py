@@ -2377,8 +2377,11 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
+    # Используем effective_message вместо message
+    message_obj = update.effective_message
+    
     if not context.args:
-        await update.message.reply_text('❌ Использование: /addalarm "Текст сообщения"')
+        await message_obj.reply_text('❌ Использование: /addalarm "Текст сообщения"')
         return
 
     raw_text = " ".join(context.args)
@@ -2390,14 +2393,14 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = raw_text
 
     if not text.strip():
-        await update.message.reply_text("❌ Текст сообщения пуст!")
+        await message_obj.reply_text("❌ Текст сообщения пуст!")
         return
 
     global current_alarm
     current_alarm = text.strip()
     save_alarm(current_alarm)
 
-    await update.message.reply_text(
+    await message_obj.reply_text(
         f"📢 Alarm установлен:\n\n{current_alarm}\n\n"
         "✅ Бот будет показывать это при каждом сообщении."
     )
@@ -2409,13 +2412,13 @@ async def delalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global current_alarm
     if current_alarm is None:
-        await update.message.reply_text("🔇 Нет активного alarm для удаления.")
+        await update.effective_message.reply_text("🔇 Нет активного alarm для удаления.")
         return
 
     clear_alarm()
     current_alarm = None
 
-    await update.message.reply_text("✅ Alarm удалён.")
+    await update.effective_message.reply_text("✅ Alarm удалён.")
 
 async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет последние 200 строк лога"""
@@ -2938,4 +2941,3 @@ if __name__ == "__main__":
     finally:
         import asyncio
         asyncio.run(shutdown(app))
-
