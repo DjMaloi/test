@@ -756,15 +756,15 @@ sheets_pool = GoogleSheetsPool(max_connections=3)
 
 # Оптимизированная функция поиска по ключевым словам
 async def optimized_keyword_search(clean_text: str) -> Optional[str]:
-    """Быстрый поиск по ключевым словам только в ChromaDB (без запросов к Google Sheets)"""
-    
-    # Поиск в метаданных ChromaDB - локальная база, очень быстрая
-    tasks = []
-    
-    async def search_in_metadata(collection, collection_name):
+    """Быстрый поиск по ключевым словам — с поддержкой частичного вхождения"""
+    if not clean_text:
+        return None
+
+    # Сначала — точное совпадение (быстро и как раньше)
+    for coll_name, collection in [("General", collection_general), ("Technical", collection_technical)]:
+        if not collection or collection.count() == 0:
+            continue
         try:
-            if not collection:
-                return None
             results = collection.get(
                 where={"query": {"$eq": clean_text}},
                 include=["metadatas"]
@@ -774,32 +774,35 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
                 if answer:
                     stats["keyword"] += 1
                     save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH (ChromaDB) | query='{clean_text}'")
+                    logger.info(f"🔑 KEYWORD MATCH (exact) | query='{clean_text}'")
                     return answer
         except Exception as e:
-            logger.warning(f"⚠️ Ошибка поиска в метаданных {collection_name}: {e}")
-        return None
-    
-    if collection_general:
-        tasks.append(search_in_metadata(collection_general, "General"))
-    if collection_technical:
-        tasks.append(search_in_metadata(collection_technical, "Technical"))
-    
-    if not tasks:
-        return None
-    
-    # Параллельный поиск в обеих коллекциях
-    metadata_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Проверяем результаты
-    for result in metadata_results:
-        if isinstance(result, Exception):
-            logger.warning(f"⚠️ Ошибка в поиске по метаданным: {result}")
-        elif result is not None:
-            return result  # ✅ Нашли — возвращаем сразу
-    
-    # Не найдено в ChromaDB
-    # Google Sheets используются только при /reload для обновления базы
+            logger.warning(f"⚠️ Ошибка поиска в {coll_name}: {e}")
+
+    # Если точного нет — ищем по вхождению: база → запрос
+    # Например: если в базе "терминал не работает", а в запросе "уфа-9 терминал не работает"
+    for coll_name, collection in [("General", collection_general), ("Technical", collection_technical)]:
+        if not collection or collection.count() == 0:
+            continue
+        try:
+            # Получаем все ключи (ограничим 1000 на случай большой базы)
+            results = collection.get(include=["metadatas"], limit=1000)
+            metadatas = results.get("metadatas", [])
+            for meta in metadatas:
+                key = meta.get("query", "").strip()
+                if not key:
+                    continue
+                # Проверяем: ключ из базы есть в запросе?
+                if key in clean_text:
+                    answer = meta.get("answer")
+                    if answer:
+                        stats["keyword"] += 1
+                        save_stats()
+                        logger.info(f"🔑 KEYWORD MATCH (partial) | '{key}' in '{clean_text}'")
+                        return answer
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка частичного поиска в {coll_name}: {e}")
+
     return None
 
 
