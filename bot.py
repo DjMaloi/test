@@ -589,7 +589,7 @@ def preprocess(text: str) -> str:
         r'\bкр\b': 'касса ресторана',                    # КР → касса ресторана
         #r'\bксо\b': 'касса',                      # КСО → касса
         #r'\bсамообслуживани[еяю]\b': 'касса',     # самообслуживание → касса
-        #r'\bтерминал самообслуживания\b': 'касса',
+        r'\bтерминал оплаты\b': 'пин-пад',
         r'\bфискальный регистратор\b': 'фн',
         r'\bонлайн-касса\b': 'касса',
     }
@@ -1462,7 +1462,7 @@ async def handle_problem_category_callback(update: Update, context: ContextTypes
     category_map = {
         "problem_kiosk": {
             "name": "КИОСК",
-            "keywords": ["киоск", "ксо", "самообслуживание", "терминал самообслуживания"]
+            "keywords": ["киоск", "ксо", "самообслуживание"]
         },
         "problem_cash": {
             "name": "КАССА",
@@ -2952,3 +2952,4 @@ if __name__ == "__main__":
     finally:
         import asyncio
         asyncio.run(shutdown(app))
+
