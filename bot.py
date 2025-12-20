@@ -2473,52 +2473,158 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Тест векторного поиска: показывает, что находит бот по запросу"""
+    """Тест поиска: показывает результаты ключевого и векторного поиска
+    Поддержка: /testquery <вопрос> [--verbose|-v] [--nocache]"""
     if update.effective_user.id not in ADMIN_IDS:
         return
 
     if not context.args:
-        await update.message.reply_text("❌ Использование: /testquery <вопрос>")
+        await update.message.reply_text("❌ Использование: /testquery <вопрос> [--verbose|-v]")
         return
 
-    query = " ".join(context.args)
+    # Разбираем аргументы
+    args = " ".join(context.args)
+    verbose = '--verbose' in args or '-v' in args
+    nocache = '--nocache' in args
+
+    # Убираем флаги из текста вопроса
+    query = re.sub(r'\s*--verbose\s*', ' ', args)
+    query = re.sub(r'\s*-v\s*', ' ', query)
+    query = re.sub(r'\s*--nocache\s*', ' ', query)
+    query = query.strip()
+
     clean = preprocess(query)
+    logger.info(f"🔍 ТЕСТ ПОИСКА: raw='{query}', clean='{clean}', verbose={verbose}")
 
-    logger.info(f"🔍 ТЕСТ: запрос='{query}', clean='{clean}'")
+    # === 1. Ключевой поиск ===
+    keyword_answer = None
+    keyword_source = None
+    keyword_time = 0.0
 
     try:
-        answer, source, distance, top_log = await parallel_vector_search(clean)
+        start_t = time.time()
+        for coll_name, collection in [("General", collection_general), ("Technical", collection_technical)]:
+            if not collection:
+                continue
+            results = collection.get(
+                where={"query": {"$eq": clean}},
+                include=["metadatas"]
+            )
+            if results["metadatas"]:
+                keyword_answer = results["metadatas"][0].get("answer")
+                keyword_source = coll_name
+                break
+        keyword_time = time.time() - start_t
     except Exception as e:
-        logger.error(f"❌ Ошибка в parallel_vector_search: {e}")
-        await update.message.reply_text(f"❌ Ошибка поиска: {e}")
-        return
+        logger.error(f"❌ Ошибка ключевого поиска: {e}")
+        keyword_answer = f"⚠️ {e}"
 
-    # Формируем ответ
-    result_text = (
-        f"🔍 ТЕСТ ЗАПРОСА\n\n"
-        f"📥 Исходный: '{query}'\n"
-        f"🧹 Очищенный: '{clean}'\n\n"
-        f"🎯 Ответ найден: {'Да' if answer else 'Нет'}\n"
-        f"📊 Источник: {source}\n"
-        f"📏 Расстояние: {distance:.4f}\n"
-        f"🎚️ Порог: {VECTOR_THRESHOLD}"
-    )
+    # === 2. Векторный поиск ===
+    vector_answer = None
+    vector_source = "none"
+    vector_distance = 1.0
+    top_log = []
+    vector_time = 0.0
 
-    if answer:
-        result_text += f"\n\n💬 Ответ:\n{answer}"
+    try:
+        start_t = time.time()
+        vector_answer, vector_source, vector_distance, top_log = await parallel_vector_search(clean)
+        vector_time = time.time() - start_t
+    except Exception as e:
+        logger.error(f"❌ Ошибка векторного поиска: {e}")
+        vector_answer, vector_source, vector_distance, top_log = None, "error", 1.0, []
 
-    if top_log:
+    # === Формируем ответ ===
+    result_lines = [
+        f"🔍 <b>ТЕСТ ЗАПРОСА</b>\n"
+        f"{'='*40}\n\n"
+        f"📥 <b>Исходный:</b> <code>{query}</code>\n"
+        f"🧹 <b>Очищенный:</b> <code>{clean}</code>\n"
+        f"🎚️ <b>Порог:</b> {VECTOR_THRESHOLD}\n"
+        f"⏱️ <b>База:</b> {'загружена' if (collection_general or collection_technical) else 'не загружена'}\n"
+    ]
+
+    if nocache:
+        result_lines.append("🚫 <b>Кэш ответов</b>: отключён (--nocache)\n")
+    if verbose:
+        result_lines.append(f"🧠 <b>Модель General</b>: ai-forever/sbert_large_nlu_ru\n")
+        result_lines.append(f"🔧 <b>Модель Technical</b>: all-MiniLM-L6-v2\n\n")
+
+    # ——— Ключевой поиск ———
+    result_lines.append("🔑 <b>КЛЮЧЕВОЙ ПОИСК</b>")
+    if isinstance(keyword_answer, str) and keyword_answer.startswith("⚠️"):
+        result_lines.append(f"❌ <b>Ошибка:</b> {keyword_answer}")
+    elif keyword_answer:
+        result_lines.append(f"✅ <b>Найден в</b>: {keyword_source}")
+        if verbose:
+            result_lines.append(f"💬 <b>Ответ:</b> {keyword_answer[:200]}{'...' if len(keyword_answer) > 200 else ''}")
+    else:
+        result_lines.append("❌ Не найдено")
+    result_lines.append(f"⏱️ <b>Время:</b> {keyword_time*1000:.1f} мс\n")
+
+    # ——— Векторный поиск ———
+    result_lines.append("🎯 <b>ВЕКТОРНЫЙ ПОИСК</b>")
+    if vector_source == "error":
+        result_lines.append("❌ Ошибка выполнения")
+    elif vector_answer and vector_distance < VECTOR_THRESHOLD:
+        result_lines.append(f"✅ <b>Найден:</b> {vector_source}")
+        result_lines.append(f"📏 <b>Расстояние:</b> {vector_distance:.4f}")
+        if verbose:
+            result_lines.append(f"💬 <b>Ответ:</b> {vector_answer[:200]}{'...' if len(vector_answer) > 200 else ''}")
+    else:
+        result_lines.append("❌ Не прошёл по порогу")
+        result_lines.append(f"📏 <b>Лучшее расстояние:</b> {vector_distance:.4f}")
+    result_lines.append(f"⏱️ <b>Время:</b> {vector_time*1000:.1f} мс\n")
+
+    # ——— ТОП-3 ———
+    if top_log and (verbose or len([l for l in top_log if float(l[1].split()[0]) < VECTOR_THRESHOLD]) > 0):
         top3 = sorted(top_log, key=lambda x: float(x[1].split()[0]))[:3]
-        result_text += f"\n\n📌 ТОП-3 НАЙДЕННЫХ ОТВЕТОВ:"
-        for _, item in top3:
-            result_text += f"\n→ {item}"
+        result_lines.append("📌 <b>ТОП-3 РЕЗУЛЬТАТА</b>")
+        for i, (_, item) in enumerate(top3, 1):
+            dist = item.split()[0]
+            preview = " ".join(item.split()[2:])[:60]
+            status = "✅" if float(dist) < VECTOR_THRESHOLD else "❌"
+            result_lines.append(f"{i}. {status} <code>{dist}</code> → {preview}")
+        result_lines.append("")
+
+    # ——— Кэш ———
+    if verbose:
+        cache_key = md5(clean.encode()).hexdigest()
+        cached = response_cache.get(cache_key)
+        result_lines.append(f"💾 <b>КЭШ ОТВЕТОВ</b>")
+        if cached:
+            result_lines.append(f"✅ Есть в кэше ({len(cached)} симв.)")
+        else:
+            result_lines.append(f"❌ Нет в кэше")
+        result_lines.append("")
+
+    # ——— Рекомендации ———
+    result_lines.append("💡 <b>РЕКОМЕНДАЦИИ</b>")
+    if keyword_answer or (vector_answer and vector_distance < VECTOR_THRESHOLD):
+        result_lines.append("• ✅ Ответ будет найден и показан пользователю")
+    else:
+        result_lines.append("• ❌ Ответ не найден — сработает Groq fallback")
+        result_lines.append("• Проверьте: написание, наличие в таблице, выполнен ли /reload")
+    result_lines.append("")
+
+    if verbose:
+        result_lines.append("ℹ️ <b>ПОДСКАЗКИ</b>")
+        result_lines.append("• <code>--verbose</code> или <code>-v</code> — больше деталей")
+        result_lines.append("• <code>--nocache</code> — игнорировать кэш при поиске")
+        result_lines.append("• <code>/reload</code> — перезагрузить базу из Google Sheets")
+
+    # Собираем текст
+    result_text = "".join(result_lines)
+
+    # Обрезаем при необходимости
+    if len(result_text) > 3800:
+        result_text = result_text[:3700] + "\n\n⚠️ <b>Результат обрезан из-за длины.</b>"
 
     try:
-        await update.message.reply_text(result_text)
+        await update.message.reply_text(result_text, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"❌ Не удалось отправить ответ: {e}")
-        await update.message.reply_text("❌ Ответ найден, но не удалось отправить (слишком длинный)")
-
+        logger.error(f"❌ Не удалось отправить результат теста: {e}")
+        await update.message.reply_text("❌ Ответ слишком длинный для отправки.")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2952,4 +3058,3 @@ if __name__ == "__main__":
     finally:
         import asyncio
         asyncio.run(shutdown(app))
-
