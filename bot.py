@@ -2644,7 +2644,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/health — проверка здоровья системы\n"
         "/metrics — метрики производительности и времени ответа\n"
         "/reload — перезагрузить базу знаний\n\n"
-        "/testquery вопрос - тест векторного поиска\n\n"
+        "/testquery вопрос --verbose или -v — больше деталей• --nocache — игнорировать кэш при поиск\n\n"
         "Управление кэшем:\n"
         "/clearcache — очистить кэш ответов\n"
         "/optimize — оптимизировать память\n\n"
