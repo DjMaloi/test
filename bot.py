@@ -2430,6 +2430,9 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message_obj = update.effective_message
     raw_text = " ".join(context.args) if context.args else ""
+    if not raw_text and message_obj.caption:
+        raw_text = message_obj.caption
+
     match = re.search(r'"([^"]+)"', raw_text)
     text = match.group(1) if match else raw_text
     photo_file_id = None
@@ -3070,6 +3073,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
     app.add_handler(CommandHandler("testquery", testquery_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.Caption & filters.Regex(r'^/addalarm(?:@[^\s]+)?'), addalarm_cmd))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
     
     # ============ ОБРАБОТЧИК КНОПОК ============
