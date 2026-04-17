@@ -1812,6 +1812,9 @@ def get_contextual_prompt(query_type: str) -> str:
 # ====================== ОСНОВНОЙ ОБРАБОТЧИК ======================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главная функция обработки сообщений"""
+    if not update.effective_user or not update.effective_chat:
+        return
+
     user_id = update.effective_user.id
     chat_type = update.effective_chat.type
 
@@ -2425,11 +2428,11 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Устанавливает alarm-сообщение, которое бот будет выводить при каждом сообщении"""
-    if update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
         return
 
     message_obj = update.effective_message
-    if not message_obj:
+    if not message_obj or not update.effective_chat:
         return
 
     raw_text = " ".join(context.args) if context.args else ""
@@ -2437,9 +2440,9 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_text = message_obj.caption
 
     raw_text = raw_text.strip()
-    if raw_text.lower().startswith("/addalarm"):
-        raw_text = re.sub(r'^/addalarm(?:@\S+)?\s*', '', raw_text, flags=re.IGNORECASE).strip()
-    elif message_obj.photo and not context.args:
+    if message_obj.caption and message_obj.caption.strip().lower().startswith("/addalarm"):
+        raw_text = re.sub(r'^/addalarm(?:@\S+)?\s*', '', raw_text or message_obj.caption, flags=re.IGNORECASE).strip()
+    elif message_obj.caption:
         return
 
     match = re.search(r'"([^"]+)"', raw_text)
@@ -3085,7 +3088,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
     app.add_handler(CommandHandler("testquery", testquery_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO & filters.Caption, addalarm_cmd))
+    app.add_handler(MessageHandler(filters.CAPTION & filters.User(user_id=ADMIN_IDS), addalarm_cmd))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
     
     # ============ ОБРАБОТЧИК КНОПОК ============
