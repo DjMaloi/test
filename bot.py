@@ -3089,7 +3089,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("testquery", testquery_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.CAPTION & filters.Regex(re.compile(r'^/addalarm(?:@\S+)?', re.IGNORECASE)) & filters.User(user_id=ADMIN_IDS),
+        filters.PHOTO & filters.CAPTION & filters.User(user_id=ADMIN_IDS),
         addalarm_cmd
     ))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
