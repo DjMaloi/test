@@ -1919,7 +1919,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.bot, 
             update.effective_chat.id, 
             final_text,
-            reply_to_message_id=update.message.message_id
+            reply_to_message_id=(update.effective_message or update.message).message_id
         )
         timing_breakdown["send_message"] = time.time() - t0
         return
@@ -1963,7 +1963,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         # Показываем пользователю сообщение с кнопками выбора категории проблемы
-        await show_problem_category_selection(context, update.effective_chat.id, update.message.message_id)
+        await show_problem_category_selection(context, update.effective_chat.id, (update.effective_message or update.message).message_id)
         return
     
     # ============ ЭТАП 5: Улучшение ответа через Groq ============
@@ -2006,7 +2006,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.bot, 
             update.effective_chat.id, 
             fallback_text,
-            reply_to_message_id=update.message.message_id
+            reply_to_message_id=(update.effective_message or update.message).message_id
         )
         
         await context.bot.send_message(
@@ -2028,7 +2028,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.bot, 
         update.effective_chat.id, 
         final_text_with_emoji,
-        reply_to_message_id=update.message.message_id
+        reply_to_message_id=(update.effective_message or update.message).message_id
     )
     timing_breakdown["send_message"] = time.time() - t0
     
@@ -2156,7 +2156,7 @@ async def block_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📞 Связаться с поддержкой", url="https://t.me/alexeymaloi")]
     ])
     
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         "⚠️ Бот не отвечает в личных сообщениях.\n"
         "Используйте бота в группе или обратитесь напрямую:",
         reply_markup=keyboard
@@ -2168,9 +2168,9 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    await update.message.reply_text("🔄 Начинаю перезагрузку базы...")
+    await (update.effective_message or update.message).reply_text("🔄 Начинаю перезагрузку базы...")
     await update_vector_db()
-    await update.message.reply_text("✅ База знаний обновлена!")
+    await (update.effective_message or update.message).reply_text("✅ База знаний обновлена!")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ставит бота на паузу"""
@@ -2178,7 +2178,7 @@ async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     set_paused(True)
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         "⏸️ Бот на паузе\n"
         "Обычные пользователи не получают ответы"
     )
@@ -2189,7 +2189,7 @@ async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     set_paused(False)
-    await update.message.reply_text("▶️ Бот возобновил работу!")
+    await (update.effective_message or update.message).reply_text("▶️ Бот возобновил работу!")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает статус и статистику бота"""
@@ -2264,14 +2264,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  {alarm_display}\n"
     )
 
-    await update.message.reply_text(text)
+    await (update.effective_message or update.message).reply_text(text)
 
 async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Очищает все кэши и оптимизирует память"""
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    await update.message.reply_text("🧹 Начинаю очистку кэшей...")
+    await (update.effective_message or update.message).reply_text("🧹 Начинаю очистку кэшей...")
     
     # Получаем размеры кэшей через методы get_stats()
     try:
@@ -2299,7 +2299,7 @@ async def clear_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     collected = cleanup_caches()
     
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         f"🗑️ Все кэши очищены!\n\n"
         f"📊 Удалено записей:\n"
         f"  • Ответы: {old_response_size}\n"
@@ -2315,7 +2315,7 @@ async def optimize_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    await update.message.reply_text("🧠 Начинаю оптимизацию памяти...")
+    await (update.effective_message or update.message).reply_text("🧠 Начинаю оптимизацию памяти...")
     
     try:
         old_stats = get_cache_stats()
@@ -2342,10 +2342,10 @@ async def optimize_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Производительность оптимизирована!"
         )
         
-        await update.message.reply_text(message)
+        await (update.effective_message or update.message).reply_text(message)
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка оптимизации: {e}")
+        await (update.effective_message or update.message).reply_text(f"❌ Ошибка оптимизации: {e}")
 
 async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавляет администратора в adminlist"""
@@ -2353,7 +2353,7 @@ async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "❌ Использование: /addadmin <user_id>\n"
             "Пример: /addadmin 123456789"
         )
@@ -2361,7 +2361,7 @@ async def add_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_id = int(context.args[0])
     add_admin(user_id)
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         f"✅ Пользователь {user_id} добавлен в список администраторов\n"
         f"Теперь он игнорируется ботом в группах"
     )
@@ -2372,7 +2372,7 @@ async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "❌ Использование: /removeadmin <user_id>\n"
             "Пример: /removeadmin 123456789"
         )
@@ -2381,11 +2381,11 @@ async def remove_admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(context.args[0])
     
     if user_id not in adminlist:
-        await update.message.reply_text(f"⚠️ Пользователь {user_id} не в списке")
+        await (update.effective_message or update.message).reply_text(f"⚠️ Пользователь {user_id} не в списке")
         return
     
     remove_admin(user_id)
-    await update.message.reply_text(f"✅ Пользователь {user_id} удалён из списка администраторов")
+    await (update.effective_message or update.message).reply_text(f"✅ Пользователь {user_id} удалён из списка администраторов")
 
 async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список администраторов с никнеймами"""
@@ -2393,7 +2393,7 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not adminlist:
-        await update.message.reply_text("📋 Список администраторов пуст")
+        await (update.effective_message or update.message).reply_text("📋 Список администраторов пуст")
         return
     
     try:
@@ -2417,11 +2417,11 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 admin_info.append(f"  • {user_id} (⚠️ Ошибка)")
         
         message = f"👨‍💼 АДМИНИСТРАТОРЫ ({len(adminlist)}):\n\n" + "\n".join(admin_info)
-        await update.message.reply_text(message)
+        await (update.effective_message or update.message).reply_text(message)
         
     except Exception as e:
         logger.error(f"❌ adminlist_cmd error: {e}")
-        await update.message.reply_text(f"⚠️ Системная ошибка: {str(e)}")
+        await (update.effective_message or update.message).reply_text(f"⚠️ Системная ошибка: {str(e)}")
 
 async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Устанавливает alarm-сообщение, которое бот будет выводить при каждом сообщении"""
@@ -2486,7 +2486,7 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         if not os.path.exists(LOG_FILE):
-            await update.message.reply_text("❌ Лог-файл не найден")
+            await (update.effective_message or update.message).reply_text("❌ Лог-файл не найден")
             return
         
         with open(LOG_FILE, "r", encoding="utf-8") as f:
@@ -2498,13 +2498,13 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(log_text) > 4000:
             log_text = "...\n" + log_text[-3900:]
         
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"📋 ПОСЛЕДНИЕ {len(last_lines)} СТРОК ЛОГА:\n\n{log_text}"
         )
         
     except Exception as e:
         logger.error(f"❌ Ошибка чтения логов: {e}")
-        await update.message.reply_text(f"⚠️ Ошибка: {e}")
+        await (update.effective_message or update.message).reply_text(f"⚠️ Ошибка: {e}")
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start - показывает приветствие и кнопки быстрого доступа"""
@@ -2514,7 +2514,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     welcome_text = get_adaptive_context_message(chat_type, user_name)
     
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         text=welcome_text,
         reply_markup=get_quick_access_keyboard(chat_type),
         parse_mode="Markdown"
@@ -2527,7 +2527,7 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await update.message.reply_text("❌ Использование: /testquery <вопрос> [--verbose|-v]")
+        await (update.effective_message or update.message).reply_text("❌ Использование: /testquery <вопрос> [--verbose|-v]")
         return
 
     # Разбираем аргументы
@@ -2669,10 +2669,10 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text = result_text[:3700] + "\n\n⚠️ <b>Результат обрезан из-за длины.</b>"
 
     try:
-        await update.message.reply_text(result_text, parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text(result_text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"❌ Не удалось отправить результат теста: {e}")
-        await update.message.reply_text("❌ Ответ слишком длинный для отправки.")
+        await (update.effective_message or update.message).reply_text("❌ Ответ слишком длинный для отправки.")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2712,7 +2712,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 Админы из adminlist.json игнорируются ботом в группах"
     )
     
-    await update.message.reply_text(text)
+    message_obj = update.effective_message
+    if not message_obj:
+        return
+    await message_obj.reply_text(text)
 
 async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Изменяет порог векторного поиска (для экспериментов)"""
@@ -2722,7 +2725,7 @@ async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args or not context.args[0].replace(".", "").isdigit():
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"❌ Использование: /threshold <значение>\n"
             f"Текущий порог: {VECTOR_THRESHOLD}\n"
             f"Рекомендуемый диапазон: 0.5-0.8"
@@ -2733,14 +2736,14 @@ async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_threshold = float(context.args[0])
         
         if not 0.0 <= new_threshold <= 1.0:
-            await update.message.reply_text("❌ Порог должен быть от 0.0 до 1.0")
+            await (update.effective_message or update.message).reply_text("❌ Порог должен быть от 0.0 до 1.0")
             return
         
         old_threshold = VECTOR_THRESHOLD
         VECTOR_THRESHOLD = new_threshold
         save_threshold(new_threshold)
         
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"✅ Порог изменён: {old_threshold} → {new_threshold}\n\n"
             f"⚠️ Это изменение временное (до перезапуска бота)"
         )
@@ -2748,7 +2751,7 @@ async def set_threshold_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"🎚️ Порог изменён: {old_threshold} → {new_threshold}")
         
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат числа")
+        await (update.effective_message or update.message).reply_text("❌ Неверный формат числа")
 
 # ====================== HEALTH CHECKS ======================
 async def check_google_sheets_health() -> Dict[str, Any]:
@@ -2876,7 +2879,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     
-    await update.message.reply_text("🔍 Проверяю состояние систем...")
+    await (update.effective_message or update.message).reply_text("🔍 Проверяю состояние систем...")
     
     try:
         health_results = await run_health_checks()
@@ -2904,11 +2907,11 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Ошибка: {health_results['embeddings']['error'] or 'Нет'}"
         )
         
-        await update.message.reply_text(message, parse_mode="Markdown")
+        await (update.effective_message or update.message).reply_text(message, parse_mode="Markdown")
         
     except Exception as e:
         logger.error(f"❌ Ошибка health check: {e}")
-        await update.message.reply_text(f"❌ Ошибка проверки здоровья: {e}")
+        await (update.effective_message or update.message).reply_text(f"❌ Ошибка проверки здоровья: {e}")
 
 async def metrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для просмотра метрик производительности"""
@@ -2977,7 +2980,7 @@ async def metrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💡 Используйте /status для детальной статистики"
     )
     
-    await update.message.reply_text(message, parse_mode="Markdown")
+    await (update.effective_message or update.message).reply_text(message, parse_mode="Markdown")
 
 # ====================== ОБРАБОТЧИК ОШИБОК ======================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
