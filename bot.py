@@ -2056,7 +2056,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     # Проверяем порог ошибок и отправляем алерт при необходимости
-    await check_error_threshold(context)
+   # await check_error_threshold(context)
 
 async def check_error_threshold(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет порог ошибок и отправляет алерт админам при превышении"""
