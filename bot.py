@@ -2431,7 +2431,7 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
         return
 
-    message_obj = update.effective_message
+    message_obj = update.effective_message or update.message
     if not message_obj or not update.effective_chat:
         return
 
@@ -2442,7 +2442,7 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = raw_text.strip()
     if message_obj.caption and message_obj.caption.strip().lower().startswith("/addalarm"):
         raw_text = re.sub(r'^/addalarm(?:@\S+)?\s*', '', raw_text or message_obj.caption, flags=re.IGNORECASE).strip()
-    elif message_obj.caption:
+    elif not context.args:
         return
 
     match = re.search(r'"([^"]+)"', raw_text)
@@ -3088,7 +3088,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("threshold", set_threshold_cmd))
     app.add_handler(CommandHandler("testquery", testquery_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
-    app.add_handler(MessageHandler(filters.CAPTION & filters.User(user_id=ADMIN_IDS), addalarm_cmd))
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.CAPTION & filters.Regex(r'^/addalarm(?:@\S+)?', flags=re.IGNORECASE) & filters.User(user_id=ADMIN_IDS),
+        addalarm_cmd
+    ))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
     
     # ============ ОБРАБОТЧИК КНОПОК ============
