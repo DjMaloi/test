@@ -1838,14 +1838,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in ADMIN_IDS and is_rate_limited(user_id):
         logger.warning(f"⏸️ Rate limit для user={user_id}")
         try:
-            await update.message.reply_text(
-                "⏸️ Слишком много запросов. Пожалуйста, подождите немного."
-            )
+            message_obj = update.effective_message
+            if message_obj:
+                await message_obj.reply_text(
+                    "⏸️ Слишком много запросов. Пожалуйста, подождите немного."
+                )
         except Exception:
             pass
         return
     
-    raw_text = (update.message.text or update.message.caption or "").strip()
+    message_obj = update.effective_message
+    if not message_obj:
+        return
+
+    raw_text = (message_obj.text or message_obj.caption or "").strip()
     if not raw_text or raw_text.startswith("/") or len(raw_text) > 1500:
         return
     
