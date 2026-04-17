@@ -167,7 +167,7 @@ def set_paused(state: bool):
             pass
 
 # ====================== УПРАВЛЕНИЕ АДМИНАМИ ======================
-current_alarm: Optional[str] = None
+current_alarm: Optional[Dict[str, Optional[str]]] = None
 adminlist = set()
 
 def load_adminlist() -> set:
@@ -222,26 +222,37 @@ def remove_admin(user_id: int):
     logger.info(f"➖ Пользователь {user_id} удалён из adminlist")
 
 # ====================== ALARM СИСТЕМА ======================
-def load_alarm() -> Optional[str]:
-    """Загружает текст alarm из файла"""
+def load_alarm() -> Optional[Dict[str, Optional[str]]]:
+    """Загружает alarm из файла"""
     try:
         if os.path.exists(ALARM_FILE):
             with open(ALARM_FILE, "r", encoding="utf-8") as f:
                 content = f.read().strip()
-                if content:
-                    logger.info(f"🔊 Загружен alarm: {content[:100]}{'...' if len(content) > 100 else ''}")
-                    return content
+                if not content:
+                    return None
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    logger.info(f"🔊 Загружен legacy alarm: {content[:100]}{'...' if len(content) > 100 else ''}")
+                    return {"text": content, "photo_file_id": None}
+
+                if isinstance(data, dict):
+                    text = data.get("text", "") or ""
+                    photo_file_id = data.get("photo_file_id")
+                    logger.info(f"🔊 Загружен alarm: {text[:100]}{'...' if len(text) > 100 else ''} photo={bool(photo_file_id)}")
+                    return {"text": text, "photo_file_id": photo_file_id}
+                logger.warning("⚠️ Неверный формат alarm-файла, сбрасываем")
     except Exception as e:
         logger.error(f"❌ Ошибка загрузки alarm: {e}")
     return None
 
-def save_alarm(text: str):
-    """Сохраняет текст alarm в файл"""
+def save_alarm(alarm: Dict[str, Optional[str]]):
+    """Сохраняет alarm в файл"""
     try:
         os.makedirs(os.path.dirname(ALARM_FILE), exist_ok=True)
         with open(ALARM_FILE, "w", encoding="utf-8") as f:
-            f.write(text)
-        logger.info(f"📢 Alarm сохранён: {text[:100]}{'...' if len(text) > 100 else ''}")
+            json.dump(alarm, f, ensure_ascii=False, indent=2)
+        logger.info(f"📢 Alarm сохранён: {alarm.get('text', '')[:100]}{'...' if len(alarm.get('text', '') or '') > 100 else ''} photo={bool(alarm.get('photo_file_id'))}")
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения alarm: {e}")
 
@@ -1856,13 +1867,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_stats()
     
     # Отправляем Alarm сразу, до кэша. Убрали проверку chat_type для работы в ЛС.
-    if current_alarm: 
+    if current_alarm:
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"🔔 {current_alarm}",
-                disable_notification=True
-            )
+            caption = f"🔔 {current_alarm.get('text', '')}".strip()
+            if not caption:
+                caption = "🔔"
+
+            if current_alarm.get("photo_file_id"):
+                await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=current_alarm["photo_file_id"],
+                    caption=caption,
+                    disable_notification=True
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=caption,
+                    disable_notification=True
+                )
         except Exception as e:
             logger.error(f"❌ Не удалось отправить alarm: {e}")
     
@@ -2203,6 +2226,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     efficiency = ((stats['cached'] + stats['keyword']) / total * 100) if total > 0 else 0
     
+    alarm_display = "❌ Не установлено"
+    if current_alarm:
+        alarm_text = current_alarm.get("text", "") or ""
+        preview = "Фото" if not alarm_text else alarm_text[:50] + ("..." if len(alarm_text) > 50 else "")
+        if current_alarm.get("photo_file_id"):
+            preview += " 📷"
+        alarm_display = f"✅ Активно: {preview}"
+
     text = (
         f"📊 СТАТУС БОТА\n\n"
         f"Состояние: {paused}\n"
@@ -2224,7 +2255,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  • Эмбеддинги:\n"
         f"    {embedding_cache}\n\n"
         f"🔔 Alarm-уведомление:\n"
-        f"  {'✅ Активно: ' + current_alarm[:50] + '...' if current_alarm and len(current_alarm) > 50 else current_alarm if current_alarm else '❌ Не установлено'}\n"
+        f"  {alarm_display}\n"
     )
 
     await update.message.reply_text(text)
@@ -2391,33 +2422,38 @@ async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
-    # Используем effective_message вместо message
     message_obj = update.effective_message
-    
-    if not context.args:
-        await message_obj.reply_text('❌ Использование: /addalarm "Текст сообщения"')
-        return
-
-    raw_text = " ".join(context.args)
-    import re
+    raw_text = " ".join(context.args) if context.args else ""
     match = re.search(r'"([^"]+)"', raw_text)
-    if match:
-        text = match.group(1)
-    else:
-        text = raw_text
+    text = match.group(1) if match else raw_text
+    photo_file_id = None
 
-    if not text.strip():
-        await message_obj.reply_text("❌ Текст сообщения пуст!")
+    if message_obj.photo:
+        photo_file_id = message_obj.photo[-1].file_id
+    elif message_obj.reply_to_message and message_obj.reply_to_message.photo:
+        photo_file_id = message_obj.reply_to_message.photo[-1].file_id
+
+    if not text.strip() and not photo_file_id:
+        await message_obj.reply_text('❌ Использование: /addalarm "Текст сообщения" (дополнительно можно прикрепить фото)')
         return
+
+    alarm_data = {
+        "text": text.strip(),
+        "photo_file_id": photo_file_id
+    }
 
     global current_alarm
-    current_alarm = text.strip()
+    current_alarm = alarm_data
     save_alarm(current_alarm)
 
-    await message_obj.reply_text(
-        f"📢 Alarm установлен:\n\n{current_alarm}\n\n"
-        "✅ Бот будет показывать это при каждом сообщении."
-    )
+    response = "📢 Alarm установлен:\n\n"
+    if current_alarm["text"]:
+        response += f"{current_alarm['text']}\n\n"
+    if current_alarm["photo_file_id"]:
+        response += "📷 Фото сохранено и будет отправляться вместе с уведомлением.\n\n"
+    response += "✅ Бот будет показывать это при каждом сообщении."
+
+    await message_obj.reply_text(response)
 
 async def delalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаляет текущий alarm"""
@@ -2650,6 +2686,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/optimize — оптимизировать память\n\n"
         "Управление уведомлениями:\n"
         "/addalarm \"текст\" — установить уведомление при каждом сообщении\n"
+        "   Можно прикрепить фото к команде, чтобы alarm отправлялся с картинкой.\n"
         "/delalarm — удалить уведомление\n\n"
         "Управление администраторами:\n"
         "/addadmin [user_id] — добавить в adminlist\n"
