@@ -207,6 +207,12 @@ def is_admin_special(user_id: int) -> bool:
     """Проверяет, является ли пользователь специальным администратором"""
     return user_id in adminlist
 
+
+def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором либо из константы, либо из adminlist"""
+    return user_id in ADMIN_IDS or user_id in adminlist
+
+
 def add_admin(user_id: int):
     """Добавляет пользователя в список администраторов"""
     global adminlist
@@ -2428,20 +2434,21 @@ async def adminlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def addalarm_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Устанавливает alarm-сообщение, которое бот будет выводить при каждом сообщении"""
-    if not update.effective_user or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_user or not is_admin(update.effective_user.id):
         return
 
     message_obj = update.effective_message or update.message
     if not message_obj or not update.effective_chat:
         return
 
+    caption_text = message_obj.caption.strip() if message_obj.caption else ""
     raw_text = " ".join(context.args) if context.args else ""
-    if not raw_text and message_obj.caption:
-        raw_text = message_obj.caption
+    if not raw_text and caption_text:
+        raw_text = caption_text
 
     raw_text = raw_text.strip()
-    if message_obj.caption and message_obj.caption.strip().lower().startswith("/addalarm"):
-        raw_text = re.sub(r'^/addalarm(?:@\S+)?\s*', '', raw_text or message_obj.caption, flags=re.IGNORECASE).strip()
+    if caption_text and re.match(r'^/addalarm(?:@\S+)?\b', caption_text, flags=re.IGNORECASE):
+        raw_text = re.sub(r'^/addalarm(?:@\S+)?\s*', '', raw_text or caption_text, flags=re.IGNORECASE).strip()
     elif not context.args:
         return
 
@@ -3089,7 +3096,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("testquery", testquery_cmd))
     app.add_handler(CommandHandler("addalarm", addalarm_cmd))
     app.add_handler(MessageHandler(
-        filters.PHOTO & filters.CAPTION & filters.User(user_id=ADMIN_IDS),
+        filters.PHOTO & filters.CAPTION,
         addalarm_cmd
     ))
     app.add_handler(CommandHandler("delalarm", delalarm_cmd))
