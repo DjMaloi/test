@@ -26,6 +26,10 @@ from cachetools import TTLCache
 from sentence_transformers import SentenceTransformer
 import chromadb
 from groq import AsyncGroq
+try:
+    import pymorphy2
+except Exception:
+    pymorphy2 = None
 
 # ====================== КОНСТАНТЫ ======================
 GROQ_SEM = asyncio.Semaphore(3)
@@ -34,6 +38,8 @@ VECTOR_THRESHOLD = 0.65  # Значение по умолчанию, будет 
 MAX_MESSAGE_LENGTH = 4000
 CACHE_SIZE = 2000
 CACHE_TTL = 7200
+morph_analyzer = None
+_morph_unavailable_logged = False
 
 CRITICAL_MISMATCHES = {
     "касса": ["киоск", "КСО", "сканер", "принтер чеков", "терминал самообслуживания"],
@@ -75,6 +81,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+if pymorphy2 is not None:
+    try:
+        morph_analyzer = pymorphy2.MorphAnalyzer()
+        logger.info("✓ Pymorphy2 инициализирован")
+    except Exception as e:
+        morph_analyzer = None
+        logger.warning(f"⚠️ Не удалось инициализировать Pymorphy2: {e}")
 
 # ====================== CONFIG ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -276,6 +290,11 @@ stats = {
 ERROR_ALERT_THRESHOLD = 0.1  # 10% ошибок от общего числа запросов
 ERROR_ALERT_MIN_REQUESTS = 20  # Минимум запросов для проверки
 ERROR_ALERT_COOLDOWN = 3600  # 1 час между алертами
+PROBLEM_ALERT_DEDUP_WINDOW = 300  # 5 минут для подавления дублей проблемных алертов
+PROBLEM_ALERT_MAX_ERROR_LEN = 280  # Ограничение длины текста ошибки в алерте
+
+# Память для дедупликации алертов о проблемах сервисов
+problem_alert_state = {}
 
 # Батчинг для оптимизации сохранения статистики
 _stats_dirty = False
@@ -568,7 +587,8 @@ def cleanup_caches():
 # ====================== КЭШИРОВАНИЕ ======================
 
 def preprocess(text: str) -> str:
-    """Нормализует текст для поиска и кэширования, заменяя синонимы"""
+    """Нормализует текст для поиска и кэширования, включая лемматизацию RU."""
+    global _morph_unavailable_logged
     # Приводим к нижнему регистру
     text = text.lower()
 
@@ -600,8 +620,29 @@ def preprocess(text: str) -> str:
     # Удаление лишних символов
     text = re.sub(r'[^а-яa-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text)
-    
-    return text.strip()
+
+    text = text.strip()
+    if not text:
+        return ""
+
+    # Лемматизация русских слов: "кассы/кассу/касса" -> "касса"
+    # Для латиницы и чисел оставляем исходные токены.
+    if morph_analyzer is not None:
+        lemmas = []
+        for token in text.split():
+            if re.fullmatch(r"[а-яё]+", token):
+                try:
+                    lemmas.append(morph_analyzer.parse(token)[0].normal_form)
+                except Exception:
+                    lemmas.append(token)
+            else:
+                lemmas.append(token)
+        text = " ".join(lemmas)
+    elif not _morph_unavailable_logged:
+        logger.warning("⚠️ Pymorphy2 недоступен: preprocess работает без лемматизации")
+        _morph_unavailable_logged = True
+
+    return text
 
 
 async def safe_typing(bot, chat_id, max_retries: int = 2):
@@ -658,8 +699,12 @@ class GoogleSheetsPool:
                 logger.debug(f"📋 Используем кэш Google Sheets: {range_name}")
                 return cached_data
             else:
-                logger.warning(f"⚠️ Используем УСТАРЕВШИЙ кэш для {range_name} (просрочен на {(current_time - cached_time):.0f}с)")
-                return cached_data  # ✅ Возвращаем даже если просрочен
+                # Кэш просрочен: сначала пробуем обновить из Google Sheets.
+                # К просроченному кэшу откатываемся только при ошибке загрузки.
+                logger.info(
+                    f"♻️ Кэш {range_name} просрочен на {(current_time - cached_time):.0f}с, "
+                    "пытаемся обновить из Google Sheets"
+                )
 
         async with self.semaphore:
             # Retry для SSL и сетевых ошибок
@@ -706,10 +751,20 @@ class GoogleSheetsPool:
                     # Проверяем тип ошибки
                     is_ssl_error = "SSL" in error_str or "ssl" in error_str.lower() or "_ssl.c" in error_str
                     is_network_error = "network" in error_str.lower() or "connection" in error_str.lower()
+                    is_transport_error = (
+                        "NoneType' object has no attribute 'close'" in error_str
+                        or "invalid literal for int() with base 16" in error_str
+                        or "RemoteDisconnected" in error_str
+                    )
                     
-                    if (is_ssl_error or is_network_error) and attempt < max_retries - 1:
+                    if attempt < max_retries - 1:
                         wait_time = (attempt + 1) * 2  # Экспоненциальная задержка
-                        error_type = "SSL" if is_ssl_error else "Network"
+                        if is_ssl_error:
+                            error_type = "SSL"
+                        elif is_network_error or is_transport_error:
+                            error_type = "Network"
+                        else:
+                            error_type = "Unexpected"
                         if is_ssl_error:
                             stats["ssl_errors"] = stats.get("ssl_errors", 0) + 1
                         logger.warning(
@@ -718,14 +773,13 @@ class GoogleSheetsPool:
                         )
                         await asyncio.sleep(wait_time)
                     else:
-                        # Для других ошибок или последней попытки - логируем и пробрасываем
+                        # На последней попытке - логируем и пробрасываем
                         logger.error(f"❌ Ошибка Google Sheets ({range_name}): {error_str}")
-                        if attempt == max_retries - 1:
-                            # На последней попытке возвращаем кэш если есть
-                            if cache_key in self._cache:
-                                cached_data, _ = self._cache[cache_key]
-                                logger.warning(f"⚠️ Используем кэш из-за ошибки: {range_name}")
-                                return cached_data
+                        # На последней попытке возвращаем кэш если есть
+                        if cache_key in self._cache:
+                            cached_data, _ = self._cache[cache_key]
+                            logger.warning(f"⚠️ Используем кэш из-за ошибки: {range_name}")
+                            return cached_data
                         raise Exception(f"Google Sheets error: {error_str}")
             
             # Если все попытки исчерпаны и нет кэша
@@ -754,54 +808,94 @@ class GoogleSheetsPool:
 # Глобальный пул для Google Sheets
 sheets_pool = GoogleSheetsPool(max_connections=3)
 
+# Индексы для быстрого keyword-поиска (обновляются при /reload)
+KEYWORD_TOKEN_OVERLAP_THRESHOLD = 0.6
+keyword_exact_general: Dict[str, str] = {}
+keyword_exact_technical: Dict[str, str] = {}
+keyword_token_general: List[Tuple[set, str, str]] = []
+keyword_token_technical: List[Tuple[set, str, str]] = []
+
+def build_keyword_indexes(valid_rows: List[List[str]]) -> Tuple[Dict[str, str], List[Tuple[set, str, str]]]:
+    """Строит in-memory индексы для keyword-поиска по валидным строкам."""
+    exact_index: Dict[str, str] = {}
+    token_index: List[Tuple[set, str, str]] = []
+    seen_queries = set()
+
+    for row in valid_rows:
+        query = preprocess(row[0].strip())
+        answer = row[1].strip()
+        if not query or not answer:
+            continue
+        exact_index[query] = answer
+        if query in seen_queries:
+            continue
+        seen_queries.add(query)
+        token_index.append((set(query.split()), query, answer))
+
+    return exact_index, token_index
+
+def build_keyword_indexes_from_collection(collection) -> Tuple[Dict[str, str], List[Tuple[set, str, str]]]:
+    """Строит keyword-индекс из существующей Chroma-коллекции."""
+    if not collection:
+        return {}, []
+    try:
+        results = collection.get(include=["metadatas"], limit=2000)
+        metadatas = results.get("metadatas", [])
+        rows = []
+        for meta in metadatas:
+            query = meta.get("query", "").strip()
+            answer = meta.get("answer", "").strip()
+            if query and answer:
+                rows.append([query, answer])
+        return build_keyword_indexes(rows)
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось построить keyword-индекс из коллекции: {e}")
+        return {}, []
+
 # Оптимизированная функция поиска по ключевым словам
 async def optimized_keyword_search(clean_text: str) -> Optional[str]:
-    """Быстрый поиск по ключевым словам — с поддержкой частичного вхождения"""
+    """Быстрый поиск по in-memory индексу: exact + token-overlap."""
     if not clean_text:
         return None
 
-    # Сначала — точное совпадение (быстро и как раньше)
-    for coll_name, collection in [("General", collection_general), ("Technical", collection_technical)]:
-        if not collection or collection.count() == 0:
-            continue
-        try:
-            results = collection.get(
-                where={"query": {"$eq": clean_text}},
-                include=["metadatas"]
-            )
-            if results["metadatas"]:
-                answer = results["metadatas"][0].get("answer")
-                if answer:
-                    stats["keyword"] += 1
-                    save_stats()
-                    logger.info(f"🔑 KEYWORD MATCH (exact) | query='{clean_text}'")
-                    return answer
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка поиска в {coll_name}: {e}")
+    combined_exact = {}
+    combined_exact.update(keyword_exact_general)
+    combined_exact.update(keyword_exact_technical)
 
-    # Если точного нет — ищем по вхождению: база → запрос
-    # Например: если в базе "терминал не работает", а в запросе "уфа-9 терминал не работает"
-    for coll_name, collection in [("General", collection_general), ("Technical", collection_technical)]:
-        if not collection or collection.count() == 0:
+    # 1) exact match
+    answer = combined_exact.get(clean_text)
+    if answer:
+        stats["keyword"] += 1
+        save_stats()
+        logger.info(f"🔑 KEYWORD MATCH (exact/index) | query='{clean_text}'")
+        return answer
+
+    # 2) token-overlap match
+    query_tokens = set(clean_text.split())
+    if not query_tokens:
+        return None
+
+    best_match = None  # (score, key_len, query, answer)
+    for key_tokens, key_query, key_answer in keyword_token_general + keyword_token_technical:
+        if not key_tokens:
             continue
-        try:
-            # Получаем все ключи (ограничим 1000 на случай большой базы)
-            results = collection.get(include=["metadatas"], limit=1000)
-            metadatas = results.get("metadatas", [])
-            for meta in metadatas:
-                key = meta.get("query", "").strip()
-                if not key:
-                    continue
-                # Проверяем: ключ из базы есть в запросе?
-                if key in clean_text:
-                    answer = meta.get("answer")
-                    if answer:
-                        stats["keyword"] += 1
-                        save_stats()
-                        logger.info(f"🔑 KEYWORD MATCH (partial) | '{key}' in '{clean_text}'")
-                        return answer
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка частичного поиска в {coll_name}: {e}")
+        common = len(query_tokens & key_tokens)
+        if common == 0:
+            continue
+        overlap = common / len(key_tokens)
+        is_subset = key_tokens.issubset(query_tokens)
+        if not is_subset and overlap < KEYWORD_TOKEN_OVERLAP_THRESHOLD:
+            continue
+        candidate = (overlap, len(key_tokens), key_query, key_answer)
+        if best_match is None or (candidate[0], candidate[1]) > (best_match[0], best_match[1]):
+            best_match = candidate
+
+    if best_match:
+        _, _, matched_query, matched_answer = best_match
+        stats["keyword"] += 1
+        save_stats()
+        logger.info(f"🔑 KEYWORD MATCH (token/index) | '{matched_query}' ~ '{clean_text}'")
+        return matched_answer
 
     return None
 
@@ -1051,7 +1145,7 @@ async def fallback_groq(question: str) -> Optional[str]:
         return None
     
 # ====================== ОБНОВЛЕНИЕ БАЗЫ ======================
-async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
+async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None) -> bool:
     """Обновляет векторную базу из Google Sheets с применением preprocess к вопросам.
     
     ⚠️ ВАЖНО: Это единственное место, где используются запросы к Google Sheets.
@@ -1059,105 +1153,123 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None):
     Google Sheets используются только при /reload для синхронизации данных.
     """
     global collection_general, collection_technical
+    global keyword_exact_general, keyword_exact_technical, keyword_token_general, keyword_token_technical
     
     async with collection_lock:
         try:
             logger.info("🔄 Начинаю обновление базы знаний из Google Sheets...")
 
-            # Загрузка данных
-            result_general = sheet.values().get(
-                spreadsheetId=SHEET_ID, 
-                range="General!A:B"
-            ).execute()
-            general_rows = result_general.get("values", [])
-            
-            result_technical = sheet.values().get(
-                spreadsheetId=SHEET_ID, 
-                range="Technical!A:B"
-            ).execute()
-            technical_rows = result_technical.get("values", [])
+            # Неблокирующая загрузка данных через пул/Executor
+            results = await asyncio.gather(
+                sheets_pool.get_range("General!A:B"),
+                sheets_pool.get_range("Technical!A:B"),
+                return_exceptions=True,
+            )
+            general_result, technical_result = results
+
+            if isinstance(general_result, Exception) or isinstance(technical_result, Exception):
+                if isinstance(general_result, Exception):
+                    logger.error(f"❌ Ошибка загрузки General!A:B: {general_result}")
+                if isinstance(technical_result, Exception):
+                    logger.error(f"❌ Ошибка загрузки Technical!A:B: {technical_result}")
+                raise Exception("Не удалось безопасно загрузить все диапазоны Google Sheets")
+
+            general_rows = general_result
+            technical_rows = technical_result
             
             logger.info(f"📥 Загружено: General={len(general_rows)}, Technical={len(technical_rows)}")
+            valid_general_rows = [
+                row for row in general_rows
+                if len(row) >= 2 and row[0].strip()
+            ] if general_rows else []
+            valid_technical_rows = [
+                row for row in technical_rows
+                if len(row) >= 2 and row[0].strip()
+            ] if technical_rows else []
 
-            # Удаляем старые коллекции
-            for name in ["general_kb", "technical_kb"]:
+            # Обновляем только те коллекции, для которых есть валидные новые данные.
+            # Это защищает от затирания рабочей базы при пустом/битом диапазоне.
+            if valid_general_rows:
                 try:
-                    chroma_client.delete_collection(name)
-                    logger.debug(f"🗑️ Удалена коллекция: {name}")
+                    chroma_client.delete_collection("general_kb")
+                    logger.debug("🗑️ Удалена коллекция: general_kb")
                 except Exception as e:
-                    logger.debug(f"🔍 Коллекция {name} не найдена: {e}")
+                    logger.debug(f"🔍 Коллекция general_kb не найдена: {e}")
 
-            # Создаём новые коллекции
-            collection_general = chroma_client.create_collection("general_kb")
-            collection_technical = chroma_client.create_collection("technical_kb")
-            
-            # Обработка General
-            if general_rows:
-                valid_rows = [
-                    row for row in general_rows 
-                    if len(row) >= 2 and row[0].strip()
-                ]
-                if not valid_rows:
-                    logger.warning("🟡 General: нет валидных строк после фильтрации")
-                else:
-                    original_keys = [row[0].strip() for row in valid_rows]
-                    answers = [row[1].strip() for row in valid_rows]
-                    processed_keys = [preprocess(key) for key in original_keys]
-                    
-                    embeddings = embedder_general.encode(original_keys).tolist()
-                    
-                    collection_general.add(
-                        ids=[f"general_{i}" for i in range(len(valid_rows))],
-                        documents=original_keys,
-                        metadatas=[
-                            {"query": processed_keys[i], "answer": answers[i]} 
-                            for i in range(len(valid_rows))
-                        ],
-                        embeddings=embeddings
-                    )
-                    
-                    # Логируем пример
-                    logger.info(f"✅ General: добавлено {len(valid_rows)} пар")
-                    logger.debug(f"📄 Пример: '{original_keys[0]}' → '{processed_keys[0]}'")
-            else:
-                logger.info("🟡 General: нет данных для загрузки")
+                collection_general = chroma_client.create_collection("general_kb")
+                original_keys = [row[0].strip() for row in valid_general_rows]
+                answers = [row[1].strip() for row in valid_general_rows]
+                processed_keys = [preprocess(key) for key in original_keys]
+                embeddings = embedder_general.encode(original_keys).tolist()
 
-            # Обработка Technical
-            if technical_rows:
-                valid_rows = [
-                    row for row in technical_rows 
-                    if len(row) >= 2 and row[0].strip()
-                ]
-                if not valid_rows:
-                    logger.warning("🟡 Technical: нет валидных строк после фильтрации")
-                else:
-                    original_keys = [row[0].strip() for row in valid_rows]
-                    answers = [row[1].strip() for row in valid_rows]
-                    processed_keys = [preprocess(key) for key in original_keys]
-                    
-                    embeddings = embedder_technical.encode(original_keys).tolist()
-                    
-                    collection_technical.add(
-                        ids=[f"technical_{i}" for i in range(len(valid_rows))],
-                        documents=original_keys,
-                        metadatas=[
-                            {"query": processed_keys[i], "answer": answers[i]} 
-                            for i in range(len(valid_rows))
-                        ],
-                        embeddings=embeddings
-                    )
-                    
-                    logger.info(f"✅ Technical: добавлено {len(valid_rows)} пар")
-                    logger.debug(f"📄 Пример: '{original_keys[0]}' → '{processed_keys[0]}'")
+                collection_general.add(
+                    ids=[f"general_{i}" for i in range(len(valid_general_rows))],
+                    documents=original_keys,
+                    metadatas=[
+                        {"query": processed_keys[i], "answer": answers[i]}
+                        for i in range(len(valid_general_rows))
+                    ],
+                    embeddings=embeddings
+                )
+                keyword_exact_general, keyword_token_general = build_keyword_indexes(valid_general_rows)
+                logger.info(f"✅ General: добавлено {len(valid_general_rows)} пар")
+                logger.debug(f"📄 Пример: '{original_keys[0]}' → '{processed_keys[0]}'")
             else:
-                logger.info("🟡 Technical: нет данных для загрузки")
+                logger.warning("🟡 General: новые валидные строки отсутствуют, сохраняем текущую коллекцию без изменений")
+                try:
+                    collection_general = chroma_client.get_collection("general_kb")
+                    keyword_exact_general, keyword_token_general = build_keyword_indexes_from_collection(collection_general)
+                except Exception:
+                    collection_general = None
+                    keyword_exact_general, keyword_token_general = {}, []
+
+            if valid_technical_rows:
+                try:
+                    chroma_client.delete_collection("technical_kb")
+                    logger.debug("🗑️ Удалена коллекция: technical_kb")
+                except Exception as e:
+                    logger.debug(f"🔍 Коллекция technical_kb не найдена: {e}")
+
+                collection_technical = chroma_client.create_collection("technical_kb")
+                original_keys = [row[0].strip() for row in valid_technical_rows]
+                answers = [row[1].strip() for row in valid_technical_rows]
+                processed_keys = [preprocess(key) for key in original_keys]
+                embeddings = embedder_technical.encode(original_keys).tolist()
+
+                collection_technical.add(
+                    ids=[f"technical_{i}" for i in range(len(valid_technical_rows))],
+                    documents=original_keys,
+                    metadatas=[
+                        {"query": processed_keys[i], "answer": answers[i]}
+                        for i in range(len(valid_technical_rows))
+                    ],
+                    embeddings=embeddings
+                )
+                keyword_exact_technical, keyword_token_technical = build_keyword_indexes(valid_technical_rows)
+                logger.info(f"✅ Technical: добавлено {len(valid_technical_rows)} пар")
+                logger.debug(f"📄 Пример: '{original_keys[0]}' → '{processed_keys[0]}'")
+            else:
+                logger.warning("🟡 Technical: новые валидные строки отсутствуют, сохраняем текущую коллекцию без изменений")
+                try:
+                    collection_technical = chroma_client.get_collection("technical_kb")
+                    keyword_exact_technical, keyword_token_technical = build_keyword_indexes_from_collection(collection_technical)
+                except Exception:
+                    collection_technical = None
+                    keyword_exact_technical, keyword_token_technical = {}, []
+
+            logger.info(
+                f"🧠 Keyword индекс: exact={len(keyword_exact_general) + len(keyword_exact_technical)}, "
+                f"token={len(keyword_token_general) + len(keyword_token_technical)}"
+            )
 
             logger.info("🟢 Обновление векторной базы завершено успешно!")
+            return True
             
         except Exception as e:
             logger.error(f"❌ Критическая ошибка при обновлении базы: {e}", exc_info=True)
             stats["errors"] += 1
             save_stats()
+            return False
 
 def get_source_emoji(source: str) -> str:
     """Возвращает смайлик в зависимости от источника ответа"""
@@ -1174,20 +1286,44 @@ def get_source_emoji(source: str) -> str:
 async def run_startup_test(context: ContextTypes.DEFAULT_TYPE):
     """Запускает автопроверку ключевого поиска при старте"""
     logger.info("🧪 Запуск автопроверки ключевого поиска...")
+    global collection_general, collection_technical
 
     test_query = "как дела"
     clean_test = preprocess(test_query)
 
     try:
-        results = collection_general.get(
-            where={"query": {"$eq": clean_test}},
-            include=["metadatas"]
-        )
+        # Если reload не удался, пробуем подключить уже существующие коллекции из Chroma.
+        if collection_general is None:
+            try:
+                collection_general = chroma_client.get_collection("general_kb")
+            except Exception:
+                collection_general = None
+        if collection_technical is None:
+            try:
+                collection_technical = chroma_client.get_collection("technical_kb")
+            except Exception:
+                collection_technical = None
+
+        has_general = collection_general is not None and collection_general.count() > 0
+        has_technical = collection_technical is not None and collection_technical.count() > 0
+        if not has_general and not has_technical:
+            logger.warning("⚠️ Автотест пропущен: коллекции KB недоступны или пусты после reload")
+            return
+
+        results = {"metadatas": []}
+        if has_general:
+            results = collection_general.get(
+                where={"query": {"$eq": clean_test}},
+                include=["metadatas"]
+            )
 
         if results["metadatas"]:
             answer = results["metadatas"][0]["answer"]
             logger.info(f"✅ УСПЕШНЫЙ ТЕСТ: найдено в General → '{answer}'")
         else:
+            if not has_technical:
+                logger.warning("⚠️ Technical коллекция недоступна/пустая, проверка Technical пропущена")
+                return
             results = collection_technical.get(
                 where={"query": {"$eq": clean_test}},
                 include=["metadatas"]
@@ -1915,7 +2051,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Общий таймаут для поиска - максимум 12 секунд
         best_answer, source, distance = await asyncio.wait_for(
-            optimized_robust_search(raw_text, clean_text),
+            # Передаем исходный текст вторым аргументом для корректного Groq fallback
+            optimized_robust_search(raw_text, raw_text),
             timeout=12.0
         )
     except asyncio.TimeoutError:
@@ -2105,8 +2242,41 @@ async def notify_admins_about_problems(context: ContextTypes.DEFAULT_TYPE, probl
     """Уведомляет админов о проблемах с сервисами"""
     if not ADMIN_IDS:
         return
-    
-    message = f"🚨 ПРОБЛЕМА С СЕРВИСАМИ\n\nТип: {problem_type}\nОшибка: {error_msg}\n\nВремя: {time.strftime('%H:%M:%S')}"
+
+    now = time.time()
+    compact_error = " ".join(str(error_msg).split())
+    if len(compact_error) > PROBLEM_ALERT_MAX_ERROR_LEN:
+        compact_error = compact_error[:PROBLEM_ALERT_MAX_ERROR_LEN] + "..."
+
+    alert_key = f"{problem_type}|{compact_error[:160]}"
+    state = problem_alert_state.get(alert_key, {"last_ts": 0.0, "suppressed": 0})
+
+    if now - state["last_ts"] < PROBLEM_ALERT_DEDUP_WINDOW:
+        state["suppressed"] += 1
+        problem_alert_state[alert_key] = state
+        logger.warning(
+            f"🔕 Подавлен дубль алерта '{problem_type}' "
+            f"(x{state['suppressed']}, окно {PROBLEM_ALERT_DEDUP_WINDOW}s)"
+        )
+        return
+
+    suppressed_count = state["suppressed"]
+    problem_alert_state[alert_key] = {"last_ts": now, "suppressed": 0}
+
+    total = stats.get("total", 0)
+    errors = stats.get("errors", 0)
+    repeat_info = (
+        f"\nПовторы за {PROBLEM_ALERT_DEDUP_WINDOW}s: {suppressed_count}"
+        if suppressed_count > 0 else ""
+    )
+
+    message = (
+        "🚨 ПРОБЛЕМА С СЕРВИСАМИ\n\n"
+        f"Тип: {problem_type}\n"
+        f"Ошибка: {compact_error}{repeat_info}\n\n"
+        f"Статистика: ошибок={errors}, всего={total}\n"
+        f"Время: {time.strftime('%H:%M:%S')}"
+    )
     
     for admin_id in ADMIN_IDS:
         try:
@@ -2138,18 +2308,31 @@ async def reload_kb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Перезагрузка базы знаний"""
     if update.effective_user.id not in ADMIN_IDS:
         return
-    
-    await update.message.reply_text("🔄 Начинаю перезагрузку базы...")
-    await update_vector_db()
-    await update.message.reply_text("✅ База знаний обновлена!")
+
+    message = update.effective_message
+    if message is None:
+        logger.warning("⚠️ /reload вызван без сообщения для ответа")
+        return
+
+    await message.reply_text("🔄 Начинаю перезагрузку базы...")
+    success = await update_vector_db()
+    if success:
+        await message.reply_text("✅ База знаний обновлена!")
+    else:
+        await message.reply_text("❌ Обновление базы завершилось с ошибкой. Проверьте логи (/logs).")
 
 async def pause_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ставит бота на паузу"""
     if update.effective_user.id not in ADMIN_IDS:
         return
-    
+
     set_paused(True)
-    await update.message.reply_text(
+    message = update.effective_message
+    if message is None:
+        logger.warning("⚠️ /pause вызван без сообщения для ответа")
+        return
+
+    await message.reply_text(
         "⏸️ Бот на паузе\n"
         "Обычные пользователи не получают ответы"
     )
@@ -2158,9 +2341,13 @@ async def resume_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Снимает бота с паузы"""
     if update.effective_user.id not in ADMIN_IDS:
         return
-    
+
     set_paused(False)
-    await update.message.reply_text("▶️ Бот возобновил работу!")
+    message = update.effective_message
+    if message is None:
+        logger.warning("⚠️ /resume вызван без сообщения для ответа")
+        return
+    await message.reply_text("▶️ Бот возобновил работу!")
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает статус и статистику бота"""
@@ -2829,13 +3016,18 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда проверки здоровья системы"""
     if update.effective_user.id not in ADMIN_IDS:
         return
-    
-    await update.message.reply_text("🔍 Проверяю состояние систем...")
+
+    reply_message = update.effective_message
+    if reply_message is None:
+        logger.warning("⚠️ /health вызван без сообщения для ответа")
+        return
+
+    await reply_message.reply_text("🔍 Проверяю состояние систем...")
     
     try:
         health_results = await run_health_checks()
         
-        message = (
+        health_text = (
             f"🏥 **HEALTH CHECK**\n\n"
             f"📊 Общий статус: {health_results['overall']}\n\n"
             f"📋 **Google Sheets:**\n"
@@ -2858,11 +3050,11 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Ошибка: {health_results['embeddings']['error'] or 'Нет'}"
         )
         
-        await update.message.reply_text(message, parse_mode="Markdown")
+        await reply_message.reply_text(health_text, parse_mode="Markdown")
         
     except Exception as e:
         logger.error(f"❌ Ошибка health check: {e}")
-        await update.message.reply_text(f"❌ Ошибка проверки здоровья: {e}")
+        await reply_message.reply_text(f"❌ Ошибка проверки здоровья: {e}")
 
 async def metrics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда для просмотра метрик производительности"""
