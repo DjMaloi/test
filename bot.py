@@ -2,20 +2,22 @@ import os
 import re
 import json
 import logging
+import unicodedata
 import asyncio
 import time
 import gc
+import inspect
 from hashlib import md5
 from typing import Optional, Tuple, List, Dict, Any
 from contextlib import asynccontextmanager
 from threading import RLock
-from collections import OrderedDict, defaultdict, deque
+from collections import OrderedDict, defaultdict, deque, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 
 # Telegram imports
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
-from telegram.error import TimedOut, NetworkError, RetryAfter
+from telegram.error import TimedOut, NetworkError, RetryAfter, BadRequest
 
 # Google Sheets
 from googleapiclient.discovery import build
@@ -26,6 +28,17 @@ from cachetools import TTLCache
 from sentence_transformers import SentenceTransformer
 import chromadb
 from groq import AsyncGroq
+
+# Совместимость pymorphy2 с Python 3.12+
+if not hasattr(inspect, "getargspec"):
+    ArgSpec = namedtuple("ArgSpec", ["args", "varargs", "keywords", "defaults"])
+
+    def _getargspec(func):
+        spec = inspect.getfullargspec(func)
+        return ArgSpec(spec.args, spec.varargs, spec.varkw, spec.defaults)
+
+    inspect.getargspec = _getargspec
+
 try:
     import pymorphy2
 except Exception:
@@ -35,7 +48,26 @@ except Exception:
 GROQ_SEM = asyncio.Semaphore(3)
 VECTOR_THRESHOLD = 0.65  # Значение по умолчанию, будет перезаписано при загрузке
 
+# Векторный поиск: отсекаем «ближайшего из плохих», если топ-1 и топ-2 слишком близки (Chroma: меньше distance = лучше).
+VECTOR_CONFIDENCE_MARGIN = float(os.getenv("VECTOR_CONFIDENCE_MARGIN", "0.038"))
+# Потолок расстояния для основного вектора (Chroma: меньше = лучше). Для sbert типичные «хорошие» попадания ~0.35–0.85.
+VECTOR_AUTO_MAX_DISTANCE = float(os.getenv("VECTOR_AUTO_MAX_DISTANCE", "0.82"))
+# Groq-улучшение только при достаточно сильном векторном совпадении (иначе шумит по слабому топу).
+VECTOR_GROQ_IMPROVE_MAX_DIST = float(os.getenv("VECTOR_GROQ_IMPROVE_MAX_DIST", "0.58"))
+# Длинные сообщения: дополнительные короткие варианты запроса для эмбеддинга.
+VECTOR_QUERY_MIN_LEN_FOR_SPLIT = int(os.getenv("VECTOR_QUERY_MIN_LEN_FOR_SPLIT", "140"))
+# Альтернативный «кусок» запроса: проверка, что тот же ответ есть в топ-K по полному тексту (антиспуф).
+VECTOR_ALT_FULL_QUERY_TOPK = int(os.getenv("VECTOR_ALT_FULL_QUERY_TOPK", "25"))
+# Отдельный жёсткий потолок для проверки альтернативных кусков по полному тексту (ниже, чем основной auto_max).
+VECTOR_ALT_FULL_QUERY_MAX_DIST = float(os.getenv("VECTOR_ALT_FULL_QUERY_MAX_DIST", "0.62"))
+
 MAX_MESSAGE_LENGTH = 4000
+TELEGRAM_CAPTION_MAX = 1024  # лимит подписи к фото
+# Прямые ссылки на изображения в ответе — будут отправлены как send_photo
+IMAGE_URL_IN_TEXT_RE = re.compile(
+    r'https?://[^\s<>"\'\)\]]+?\.(?:jpg|jpeg|png|gif|webp)(?:\?[^\s<>"\'\)\]]*)?',
+    re.IGNORECASE,
+)
 CACHE_SIZE = 2000
 CACHE_TTL = 7200
 morph_analyzer = None
@@ -64,6 +96,24 @@ def is_mismatch(question: str, answer: str) -> bool:
                     return True
 
     return False
+
+
+def vector_query_candidates(raw_text: str) -> List[str]:
+    """Варианты текста для эмбеддинга: полный запрос + куски по предложениям для длинных сообщений."""
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return []
+    candidates = [raw_text]
+    if len(raw_text) < VECTOR_QUERY_MIN_LEN_FOR_SPLIT:
+        return candidates
+    parts = re.split(r"(?<=[.!?])\s+|\n+", raw_text)
+    chunks = [p.strip() for p in parts if len(p.strip()) >= 18]
+    chunks.sort(key=len, reverse=True)
+    for c in chunks[:2]:
+        if c not in candidates:
+            candidates.append(c)
+    return candidates[:3]
+
 
 # ====================== LOGGING ======================
 LOG_FILE = "/app/data/bot.log"
@@ -589,6 +639,11 @@ def cleanup_caches():
 def preprocess(text: str) -> str:
     """Нормализует текст для поиска и кэширования, включая лемматизацию RU."""
     global _morph_unavailable_logged
+    if text is None:
+        return ""
+    # Единый вид символов (как в Google Sheets / Telegram): убираем «тихие» расхождения ключей
+    text = unicodedata.normalize("NFKC", str(text))
+    text = text.replace("\u00a0", " ").replace("\u200b", "").replace("\ufeff", "")
     # Приводим к нижнему регистру
     text = text.lower()
 
@@ -809,7 +864,10 @@ class GoogleSheetsPool:
 sheets_pool = GoogleSheetsPool(max_connections=3)
 
 # Индексы для быстрого keyword-поиска (обновляются при /reload)
-KEYWORD_TOKEN_OVERLAP_THRESHOLD = 0.6
+KEYWORD_TOKEN_OVERLAP_THRESHOLD = 0.75
+KEYWORD_MIN_COMMON_TOKENS = 2
+KEYWORD_MIN_KEY_TOKENS = 2
+KEYWORD_MIN_QUERY_COVERAGE = 0.34
 keyword_exact_general: Dict[str, str] = {}
 keyword_exact_technical: Dict[str, str] = {}
 keyword_token_general: List[Tuple[set, str, str]] = []
@@ -834,6 +892,27 @@ def build_keyword_indexes(valid_rows: List[List[str]]) -> Tuple[Dict[str, str], 
 
     return exact_index, token_index
 
+
+def build_keyword_indexes_from_processed_pairs(
+    pairs: List[Tuple[str, str]],
+) -> Tuple[Dict[str, str], List[Tuple[set, str, str]]]:
+    """Индекс по уже нормализованным ключам (метаданные Chroma) — без повторного preprocess."""
+    exact_index: Dict[str, str] = {}
+    token_index: List[Tuple[set, str, str]] = []
+    seen_queries = set()
+    for query, answer in pairs:
+        query = query.strip()
+        answer = answer.strip()
+        if not query or not answer:
+            continue
+        exact_index[query] = answer
+        if query in seen_queries:
+            continue
+        seen_queries.add(query)
+        token_index.append((set(query.split()), query, answer))
+    return exact_index, token_index
+
+
 def build_keyword_indexes_from_collection(collection) -> Tuple[Dict[str, str], List[Tuple[set, str, str]]]:
     """Строит keyword-индекс из существующей Chroma-коллекции."""
     if not collection:
@@ -841,13 +920,13 @@ def build_keyword_indexes_from_collection(collection) -> Tuple[Dict[str, str], L
     try:
         results = collection.get(include=["metadatas"], limit=2000)
         metadatas = results.get("metadatas", [])
-        rows = []
+        pairs: List[Tuple[str, str]] = []
         for meta in metadatas:
             query = meta.get("query", "").strip()
             answer = meta.get("answer", "").strip()
             if query and answer:
-                rows.append([query, answer])
-        return build_keyword_indexes(rows)
+                pairs.append((query, answer))
+        return build_keyword_indexes_from_processed_pairs(pairs)
     except Exception as e:
         logger.warning(f"⚠️ Не удалось построить keyword-индекс из коллекции: {e}")
         return {}, []
@@ -870,31 +949,43 @@ async def optimized_keyword_search(clean_text: str) -> Optional[str]:
         logger.info(f"🔑 KEYWORD MATCH (exact/index) | query='{clean_text}'")
         return answer
 
-    # 2) token-overlap match
+    # 2) token-overlap match (более строгий для уменьшения ложных срабатываний)
     query_tokens = set(clean_text.split())
     if not query_tokens:
         return None
 
-    best_match = None  # (score, key_len, query, answer)
+    best_match = None  # (score, common, key_len, query, answer)
     for key_tokens, key_query, key_answer in keyword_token_general + keyword_token_technical:
-        if not key_tokens:
+        if not key_tokens or len(key_tokens) < KEYWORD_MIN_KEY_TOKENS:
             continue
-        common = len(query_tokens & key_tokens)
-        if common == 0:
+        common_tokens = query_tokens & key_tokens
+        common = len(common_tokens)
+        if common < KEYWORD_MIN_COMMON_TOKENS:
             continue
-        overlap = common / len(key_tokens)
+
+        overlap = common / len(key_tokens)  # покрытие ключа
+        query_coverage = common / len(query_tokens)  # покрытие пользовательского запроса
         is_subset = key_tokens.issubset(query_tokens)
+
         if not is_subset and overlap < KEYWORD_TOKEN_OVERLAP_THRESHOLD:
             continue
-        candidate = (overlap, len(key_tokens), key_query, key_answer)
-        if best_match is None or (candidate[0], candidate[1]) > (best_match[0], best_match[1]):
+        if query_coverage < KEYWORD_MIN_QUERY_COVERAGE:
+            continue
+
+        # Взвешиваем покрытие ключа выше покрытия запроса.
+        score = overlap * 0.7 + query_coverage * 0.3
+        candidate = (score, common, len(key_tokens), key_query, key_answer)
+        if best_match is None or (candidate[0], candidate[1], candidate[2]) > (best_match[0], best_match[1], best_match[2]):
             best_match = candidate
 
     if best_match:
-        _, _, matched_query, matched_answer = best_match
+        score, common, _, matched_query, matched_answer = best_match
         stats["keyword"] += 1
         save_stats()
-        logger.info(f"🔑 KEYWORD MATCH (token/index) | '{matched_query}' ~ '{clean_text}'")
+        logger.info(
+            f"🔑 KEYWORD MATCH (token/index) | score={score:.3f} | common={common} | "
+            f"'{matched_query}' ~ '{clean_text}'"
+        )
         return matched_answer
 
     return None
@@ -939,61 +1030,201 @@ async def search_in_collection(
         for item in top_log[:3]:
             logger.info(f"   → {item}")
         
-        # Лучший результат
+        # Лучший результат с проверкой «уверенности» и жёстким потолком расстояния
         best_answer = None
-        best_distance = 1.0
-        if distances and distances[0] < threshold:
-            best_answer = metadatas[0].get("answer")
-            best_distance = distances[0]
-        
-        return best_answer, best_distance, top_log  # ✅ Возвращаем top_log
+        best_distance = distances[0] if distances else 1.0
+        effective_ceiling = min(threshold, VECTOR_AUTO_MAX_DISTANCE)
+
+        if distances:
+            margin = None
+            if len(distances) >= 2:
+                margin = distances[1] - distances[0]
+                if margin < VECTOR_CONFIDENCE_MARGIN:
+                    logger.warning(
+                        f"⚠️ Вектор [{embedder_type}]: мало отличие топ-1 от топ-2 "
+                        f"(margin={margin:.4f} < {VECTOR_CONFIDENCE_MARGIN}; "
+                        f"d1={distances[0]:.4f}, d2={distances[1]:.4f}) — принимаем ближайший (топ-1)"
+                    )
+
+            passes_ceiling = distances[0] < effective_ceiling
+            if not passes_ceiling:
+                logger.warning(
+                    f"⚠️ Вектор [{embedder_type}]: отклонено по потолку "
+                    f"d={distances[0]:.4f} >= effective_ceiling={effective_ceiling:.4f} "
+                    f"(threshold={threshold}, auto_max={VECTOR_AUTO_MAX_DISTANCE})"
+                )
+
+            if passes_ceiling and distances[0] < threshold:
+                best_answer = metadatas[0].get("answer")
+                best_distance = distances[0]
+            else:
+                best_answer = None
+
+        return best_answer, best_distance, top_log
         
     except Exception as e:
         logger.error(f"❌ Ошибка векторного поиска: {e}", exc_info=True)
         return None, 1.0, []
 
 
+async def vector_answer_in_full_query_topk(
+    full_user_query: str,
+    candidate_answer: str,
+    vector_source: str,
+) -> bool:
+    """Альтернатива по «куску» допустима только если по полному сообщению та же карточка
+    даёт достаточно близкое расстояние (как при обычном автоответе из вектора).
+
+    Одного попадания ответа в топ-K при плохом d (~0.8) недостаточно — иначе ложный
+    матч по короткому фрагменту (низкий d у другого документа) всё равно проходит."""
+    fq = (full_user_query or "").strip()
+    cand = (candidate_answer or "").strip()
+    if not fq or not cand:
+        return False
+    embedder_type = (
+        "general"
+        if vector_source == "vector_general"
+        else ("technical" if vector_source == "vector_technical" else "")
+    )
+    if not embedder_type:
+        return False
+    collection = collection_general if embedder_type == "general" else collection_technical
+    if not collection or collection.count() == 0:
+        return False
+    n = min(max(VECTOR_ALT_FULL_QUERY_TOPK, 35), collection.count())
+    alt_ceiling = min(VECTOR_THRESHOLD, VECTOR_ALT_FULL_QUERY_MAX_DIST)
+    try:
+        embedder_func = get_embedding_general if embedder_type == "general" else get_embedding_technical
+        emb = embedder_func(full_user_query)
+        results = collection.query(
+            query_embeddings=[emb],
+            n_results=n,
+            include=["metadatas", "distances"],
+        )
+        distances = results["distances"][0]
+        metadatas = results["metadatas"][0]
+        for d, m in zip(distances, metadatas):
+            if (m.get("answer") or "").strip() != cand:
+                continue
+            # По полному тексту карточка должна быть не хуже отдельного «строгого» потолка (не путать с основным auto_max).
+            if d < alt_ceiling and d < VECTOR_THRESHOLD:
+                return True
+            return False
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️ vector_answer_in_full_query_topk: {e}")
+        return False
+
+
+def vector_distance_topic_adjustment(query_raw: str, answer: str, distance: float) -> float:
+    """Корректирует расстояние для выбора среди кандидатов разных вариантов запроса.
+
+    Эмбеддинг иногда ближе к «чужой» карточке (например Оленька), хотя по тексту вопроса
+    явно про Z-отчёт/печать — слегка «штрафуем» такие ответы, чтобы победил тематически верный FAQ."""
+    if not answer:
+        return distance
+    q = (query_raw or "").lower()
+    a = answer.lower()
+    adj = distance
+    penalty = float(os.getenv("VECTOR_TOPIC_MISMATCH_PENALTY", "0.22"))
+
+    z_like_query = any(
+        x in q
+        for x in (
+            "z-отч",
+            "z отч",
+            "z отчёт",
+            "з-отч",
+            "перепечат",
+            "не печатается",
+            "не печатается z",
+            "обрезан",
+            "обрезанный",
+        )
+    ) or ("печата" in q and ("отч" in q or " z" in q))
+
+    olenka_answer = "оленьк" in a or "оленька" in a
+    z_like_answer = any(
+        x in a for x in ("перепечатать z", "z-отч", "z отч", "перепечат", "закрыть кэшер")
+    )
+
+    if z_like_query and olenka_answer and not z_like_answer:
+        adj += penalty
+        logger.info(
+            f"🔀 Тематическая поправка вектора: +{penalty:.2f} к dist (вопрос про Z-отчёт/печать, "
+            f"ответ про Оленьку без инструкции по отчёту), было d={distance:.4f} → эфф. {adj:.4f}"
+        )
+
+    return adj
+
+
 # Оптимизированный поиск с параллельными запросами
 async def parallel_vector_search(query: str, threshold: float = None) -> Tuple[Optional[str], str, float, List[str]]:
-    """Параллельный векторный поиск с возвратом top_log"""
+    """Параллельный векторный поиск с возвратом top_log.
+    Два варианта текста запроса: исходный и после preprocess — иногда лучше совпадает с тем, как хранятся эмбеддинги."""
     if threshold is None:
         threshold = VECTOR_THRESHOLD
 
-    tasks = []
-    if collection_general and collection_general.count() > 0:
-        tasks.append(("vector_general", asyncio.create_task(
-            search_in_collection(collection_general, "general", query, threshold)
-        )))
-    if collection_technical and collection_technical.count() > 0:
-        tasks.append(("vector_technical", asyncio.create_task(
-            search_in_collection(collection_technical, "technical", query, threshold)
-        )))
-    
-    if not tasks:
-        return None, "none", 1.0, []
+    variants: List[str] = []
+    seen_q = set()
+    for q in (query.strip(), preprocess(query)):
+        if q and q not in seen_q:
+            seen_q.add(q)
+            variants.append(q)
 
     results = []
-    all_top_logs = []  # Собираем все top_log
+    all_top_logs: List = []
+    min_seen_distance = 1.0
 
-    for source_type, task in tasks:
-        try:
-            # Уменьшаем таймаут до 5 секунд для более быстрого ответа
-            answer, distance, top_log = await asyncio.wait_for(task, timeout=5.0)
-            all_top_logs.extend([(source_type, item) for item in top_log])
-            if answer and distance < threshold:
-                results.append((answer, source_type, distance))
-        except asyncio.TimeoutError:
-            logger.warning(f"⏱️ Таймаут векторного поиска в {source_type} (5s)")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
+    for qv in variants:
+        tasks = []
+        if collection_general and collection_general.count() > 0:
+            tasks.append(("vector_general", asyncio.create_task(
+                search_in_collection(collection_general, "general", qv, threshold)
+            )))
+        if collection_technical and collection_technical.count() > 0:
+            tasks.append(("vector_technical", asyncio.create_task(
+                search_in_collection(collection_technical, "technical", qv, threshold)
+            )))
+
+        if not tasks:
+            continue
+
+        for source_type, task in tasks:
+            try:
+                answer, distance, top_log = await asyncio.wait_for(task, timeout=5.0)
+                all_top_logs.extend([(source_type, item) for item in top_log])
+                if distance < min_seen_distance:
+                    min_seen_distance = distance
+                if answer and distance < threshold:
+                    results.append((answer, source_type, distance))
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Таймаут векторного поиска в {source_type} (5s)")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка векторного поиска в {source_type}: {e}")
 
     if results:
-        results.sort(key=lambda x: x[2])
-        best_answer, best_source, best_distance = results[0]
+        best_per_answer: Dict[str, Tuple[str, str, float]] = {}
+        for answer, source_type, distance in results:
+            key = (answer or "").strip()
+            if not key:
+                continue
+            prev = best_per_answer.get(key)
+            if prev is None or distance < prev[2]:
+                best_per_answer[key] = (answer, source_type, distance)
+        merged = list(best_per_answer.values())
+
+        query_full = query.strip()
+        scored: List[Tuple[float, str, str, float]] = []
+        for answer, source_type, distance in merged:
+            eff = vector_distance_topic_adjustment(query_full, answer, distance)
+            scored.append((eff, answer, source_type, distance))
+        scored.sort(key=lambda x: x[0])
+        _, best_answer, best_source, best_distance = scored[0]
         logger.info(f"🎯 ПАРАЛЛЕЛЬНЫЙ ПОИСК: {best_source} | dist={best_distance:.4f}")
         return best_answer, best_source, best_distance, all_top_logs
-    
-    return None, "none", 1.0, all_top_logs
+
+    return None, "none", min_seen_distance, all_top_logs
 
 
 # ====================== RATE LIMITING ======================
@@ -1037,7 +1268,7 @@ async def improve_with_groq(original_answer: str, question: str) -> Optional[str
         "ИНСТРУКЦИЯ:\n"
         "1. Упрощай язык, но НЕ теряй точность и технические детали.\n"
         "2. НИКОГДА не добавляй информацию, которой нет в исходном ответе.\n"
-        "3. Сохраняй ВСЕ ссылки, ID, артикулы, коды и термины без изменений.\n"
+        "3. Сохраняй ВСЕ ссылки (в т.ч. http/https на изображения .jpg/.png и т.п.), ID, артикулы, коды и термины без изменений.\n"
         "4. Не заменяй термины: 'касса' ≠ 'киоск', 'КСО' ≠ 'терминал оплаты' — это разные вещи.\n"
         "5. Если не понимаешь — верни оригинальный ответ без изменений.\n"
         "6. Максимум 800 символов, не длиннее оригинала более чем на 20%.\n"
@@ -1177,7 +1408,6 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None) -> bool:
             general_rows = general_result
             technical_rows = technical_result
             
-            logger.info(f"📥 Загружено: General={len(general_rows)}, Technical={len(technical_rows)}")
             valid_general_rows = [
                 row for row in general_rows
                 if len(row) >= 2 and row[0].strip()
@@ -1186,6 +1416,26 @@ async def update_vector_db(context: ContextTypes.DEFAULT_TYPE = None) -> bool:
                 row for row in technical_rows
                 if len(row) >= 2 and row[0].strip()
             ] if technical_rows else []
+
+            # Счётчик внизу Google Sheets — часто «все строки листа»; API отдаёт только строки с данными в A:B.
+            # General и Technical — разные вкладки: 169 строк на одном листе ≠ строки на другом.
+            logger.info(
+                f"📥 Google Sheets: сырых строк General={len(general_rows)}, Technical={len(technical_rows)}"
+            )
+            logger.info(
+                f"📥 В базу (есть A и B, вопрос в A не пустой): General={len(valid_general_rows)}, "
+                f"Technical={len(valid_technical_rows)}"
+            )
+            if len(general_rows) > len(valid_general_rows):
+                logger.info(
+                    f"   ↳ General: отфильтровано {len(general_rows) - len(valid_general_rows)} строк "
+                    "(нет столбца B / только один столбец / пустой вопрос в A)"
+                )
+            if len(technical_rows) > len(valid_technical_rows):
+                logger.info(
+                    f"   ↳ Technical: отфильтровано {len(technical_rows) - len(valid_technical_rows)} строк "
+                    "(нет столбца B / только один столбец / пустой вопрос в A)"
+                )
 
             # Обновляем только те коллекции, для которых есть валидные новые данные.
             # Это защищает от затирания рабочей базы при пустом/битом диапазоне.
@@ -1373,6 +1623,121 @@ async def send_long_message(bot, chat_id: int, text: str, max_retries: int = 3, 
     
     return False
 
+
+def extract_image_urls_from_text(text: str) -> Tuple[str, List[str]]:
+    """Убирает из текста прямые ссылки на изображения; возвращает очищенный текст и список URL по порядку."""
+    urls = IMAGE_URL_IN_TEXT_RE.findall(text or "")
+    body = IMAGE_URL_IN_TEXT_RE.sub(" ", text or "")
+    body = re.sub(r"\s+", " ", body).strip()
+    return body, urls
+
+
+def merge_preserved_image_urls(original_kb: str, reply_text: str) -> str:
+    """Восстанавливает в конце ответа прямые URL картинок из исходного ответа базы.
+    Groq и другие правки часто удаляют ссылки; без них send_photo по URL не вызывается."""
+    _, kb_urls = extract_image_urls_from_text(original_kb or "")
+    if not kb_urls:
+        return reply_text or ""
+    _, out_urls = extract_image_urls_from_text(reply_text or "")
+    have = set(out_urls)
+    missing = [u for u in kb_urls if u not in have]
+    if not missing:
+        return reply_text or ""
+    base = (reply_text or "").rstrip()
+    sep = "\n\n" if base else ""
+    return base + sep + "\n".join(missing)
+
+
+async def _send_photo_with_retry(
+    bot,
+    chat_id: int,
+    photo_url: str,
+    caption: Optional[str] = None,
+    max_retries: int = 3,
+    reply_to_message_id: Optional[int] = None,
+) -> bool:
+    """Отправляет фото по URL; при ошибке BadRequest fallback — текстом со ссылкой."""
+    cap = None
+    if caption:
+        cap = caption[:TELEGRAM_CAPTION_MAX]
+    for attempt in range(max_retries):
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_url,
+                caption=cap,
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TimedOut:
+            logger.warning(f"⏱️ Таймаут send_photo (попытка {attempt + 1}/{max_retries})")
+            await asyncio.sleep(2 ** attempt)
+        except NetworkError as e:
+            logger.error(f"🌐 Сетевая ошибка send_photo: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(3)
+        except BadRequest as e:
+            logger.warning(f"⚠️ send_photo BadRequest для URL: {e}")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=photo_url if not cap else f"{cap}\n\n{photo_url}"[:MAX_MESSAGE_LENGTH],
+                reply_to_message_id=reply_to_message_id,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка send_photo: {e}", exc_info=True)
+            return False
+    # После ретраев — дублируем ссылкой
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=photo_url if not cap else f"{cap}\n\n{photo_url}"[:MAX_MESSAGE_LENGTH],
+            reply_to_message_id=reply_to_message_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def send_reply_with_optional_media(
+    bot,
+    chat_id: int,
+    text: str,
+    max_retries: int = 3,
+    reply_to_message_id: Optional[int] = None,
+) -> bool:
+    """Отправляет ответ: при наличии прямых ссылок на картинки — фото + подпись/остаток текста."""
+    body, image_urls = extract_image_urls_from_text(text)
+    if not image_urls:
+        return await send_long_message(
+            bot, chat_id, body or text, max_retries=max_retries, reply_to_message_id=reply_to_message_id
+        )
+
+    cap = body[:TELEGRAM_CAPTION_MAX] if body else None
+    tail = body[TELEGRAM_CAPTION_MAX:] if len(body) > TELEGRAM_CAPTION_MAX else ""
+
+    ok = await _send_photo_with_retry(
+        bot,
+        chat_id,
+        image_urls[0],
+        caption=cap if cap else None,
+        max_retries=max_retries,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if not ok:
+        return False
+
+    for url in image_urls[1:]:
+        sub_ok = await _send_photo_with_retry(bot, chat_id, url, caption=None, max_retries=max_retries)
+        if not sub_ok:
+            return False
+
+    if tail:
+        return await send_long_message(bot, chat_id, tail, max_retries=max_retries, reply_to_message_id=None)
+    return True
+
 # ====================== ОПТИМИЗИРОВАННЫЙ ПОИСК ======================
 async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[str], str, float]:
     """Оптимизированный надежный поиск с параллельными запросами"""
@@ -1400,7 +1765,7 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
     # Это ускоряет поиск - не ждем завершения одного перед началом другого
     t0 = time.time()
     keyword_task = asyncio.create_task(optimized_keyword_search(clean_text))
-    vector_task = asyncio.create_task(parallel_vector_search(clean_text))
+    vector_task = asyncio.create_task(parallel_vector_search(query))
     
     # Ждем оба с общим таймаутом 8 секунд
     try:
@@ -1416,7 +1781,7 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
             logger.info(f"🔑 ОПТИМИЗИРОВАННЫЙ КЛЮЧЕВОЙ ПОИСК")
             return keyword_result, "keyword", 0.0
         
-        # Проверяем результат векторного поиска
+        # Проверяем результат векторного поиска (первый проход — полный исходный текст)
         if not isinstance(vector_result, Exception):
             vector_answer, vector_source, vector_distance, _ = vector_result
             if vector_answer and vector_distance < VECTOR_THRESHOLD:
@@ -1428,6 +1793,35 @@ async def optimized_robust_search(query: str, raw_text: str) -> Tuple[Optional[s
                     return vector_answer, vector_source, vector_distance
                 else:
                     logger.warning(f"⚠️ НЕСООТВЕТСТВИЕ в векторном поиске")
+            else:
+                # Второй проход: укороченные варианты длинного запроса (как в vector_query_candidates)
+                for alt_q in vector_query_candidates(query)[1:]:
+                    t1 = time.time()
+                    try:
+                        alt_res = await asyncio.wait_for(
+                            parallel_vector_search(alt_q),
+                            timeout=6.0
+                        )
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"⚠️ Доп. векторный запрос пропущен: {e}")
+                        continue
+                    search_timing["vector_alt"] = time.time() - t1
+                    va, vs, vd, _ = alt_res
+                    if va and vd < VECTOR_THRESHOLD and not is_mismatch(raw_text, va):
+                        if not await vector_answer_in_full_query_topk(query, va, vs):
+                            _eff_alt = min(VECTOR_THRESHOLD, VECTOR_ALT_FULL_QUERY_MAX_DIST)
+                            logger.warning(
+                                "⚠️ Альтернативный вектор отклонён: по полному запросу это же FAQ даёт "
+                                f"слишком большое расстояние (нужно d < {_eff_alt:.2f}) "
+                                f"или ответ не найден среди топ-{max(VECTOR_ALT_FULL_QUERY_TOPK, 35)} кандидатов"
+                            )
+                            continue
+                        stats["vector"] += 1
+                        save_stats()
+                        logger.info(
+                            f"🎯 ВЕКТОР (альтернативный запрос) | {alt_q[:50]}... | dist={vd:.4f}"
+                        )
+                        return va, vs, vd
     except asyncio.TimeoutError:
         search_timing["keyword"] = time.time() - t0
         search_timing["vector"] = time.time() - t0
@@ -2022,11 +2416,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final_text = f"{cached_answer}\n\n{emoji}"
         
         t0 = time.time()
-        await send_long_message(
-            context.bot, 
-            update.effective_chat.id, 
+        await send_reply_with_optional_media(
+            context.bot,
+            update.effective_chat.id,
             final_text,
-            reply_to_message_id=update.message.message_id
+            reply_to_message_id=update.message.message_id,
         )
         timing_breakdown["send_message"] = time.time() - t0
         return
@@ -2078,7 +2472,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     final_reply = best_answer
     timing_breakdown["groq_improve"] = 0.0
     
-    if best_answer and source in ["vector_general", "vector_technical", "keyword"] and len(best_answer) < 1200:
+    improve_ok = (
+        best_answer
+        and len(best_answer) < 1200
+        and (
+            source == "keyword"
+            or (
+                source in ["vector_general", "vector_technical"]
+                and distance <= VECTOR_GROQ_IMPROVE_MAX_DIST
+            )
+        )
+    )
+    if improve_ok:
         t0 = time.time()
         improved = await improve_with_groq(best_answer, raw_text)
         timing_breakdown["groq_improve"] = time.time() - t0
@@ -2089,7 +2494,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✨ GROQ УЛУЧШИЛ | user={user.id} | "
                 f"было={len(best_answer)} → стало={len(improved)}"
             )
-    
+    elif best_answer and source in ["vector_general", "vector_technical"] and len(best_answer) < 1200:
+        logger.info(
+            f"⏭️ Groq улучшение пропущено: слабое векторное совпадение "
+            f"(dist={distance:.3f} > {VECTOR_GROQ_IMPROVE_MAX_DIST})"
+        )
+
+    # Ссылки на фото из базы должны дойти до отправки (Groq часто их выкидывает).
+    if best_answer and final_reply:
+        final_reply = merge_preserved_image_urls(best_answer, final_reply)
+
     # ============ ЭТАП 6: Отправка ответа ============
     if not final_reply:
         query_type = classify_query_type(raw_text)
@@ -2130,13 +2544,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     emoji = get_source_emoji(source)
     final_text_with_emoji = f"{final_reply}\n\n{emoji}"
 
-    # Отправка сообщения
+    # Отправка сообщения (текст и при необходимости фото по прямым URL в ответе)
     t0 = time.time()
-    success = await send_long_message(
-        context.bot, 
-        update.effective_chat.id, 
+    success = await send_reply_with_optional_media(
+        context.bot,
+        update.effective_chat.id,
         final_text_with_emoji,
-        reply_to_message_id=update.message.message_id
+        reply_to_message_id=update.message.message_id,
     )
     timing_breakdown["send_message"] = time.time() - t0
     
@@ -2686,43 +3100,54 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean = preprocess(query)
     logger.info(f"🔍 ТЕСТ ПОИСКА: raw='{query}', clean='{clean}', verbose={verbose}")
 
-    # === 1. Ключевой поиск ===
+    kw_in_general = clean in keyword_exact_general
+    kw_in_technical = clean in keyword_exact_technical
+
+    eff_ceiling = min(VECTOR_THRESHOLD, VECTOR_AUTO_MAX_DISTANCE)
+
+    # === 1. Ключевой поиск (как в бою: in-memory индекс) ===
     keyword_answer = None
-    keyword_source = None
     keyword_time = 0.0
 
     try:
         start_t = time.time()
-        for coll_name, collection in [("General", collection_general), ("Technical", collection_technical)]:
-            if not collection:
-                continue
-            results = collection.get(
-                where={"query": {"$eq": clean}},
-                include=["metadatas"]
-            )
-            if results["metadatas"]:
-                keyword_answer = results["metadatas"][0].get("answer")
-                keyword_source = coll_name
-                break
+        keyword_answer = await optimized_keyword_search(clean)
         keyword_time = time.time() - start_t
     except Exception as e:
         logger.error(f"❌ Ошибка ключевого поиска: {e}")
         keyword_answer = f"⚠️ {e}"
 
-    # === 2. Векторный поиск ===
+    # === 2. Векторный поиск (как в бою: сырой запрос + при неудаче — куски) ===
     vector_answer = None
     vector_source = "none"
     vector_distance = 1.0
     top_log = []
     vector_time = 0.0
+    vector_tried: List[str] = []
 
     try:
         start_t = time.time()
-        vector_answer, vector_source, vector_distance, top_log = await parallel_vector_search(clean)
+        vector_tried.append(query[:80] + ("…" if len(query) > 80 else ""))
+        vector_answer, vector_source, vector_distance, top_log = await parallel_vector_search(query)
+        if not vector_answer:
+            for alt_q in vector_query_candidates(query)[1:]:
+                vector_tried.append(alt_q[:80] + ("…" if len(alt_q) > 80 else ""))
+                va, vs, vd, top_log = await parallel_vector_search(alt_q)
+                if va and await vector_answer_in_full_query_topk(query, va, vs):
+                    vector_answer, vector_source, vector_distance = va, vs, vd
+                    break
         vector_time = time.time() - start_t
     except Exception as e:
         logger.error(f"❌ Ошибка векторного поиска: {e}")
         vector_answer, vector_source, vector_distance, top_log = None, "error", 1.0, []
+
+    # Применяем те же проверки, что и при ответе пользователю
+    vector_accepted = bool(
+        vector_answer
+        and vector_distance < VECTOR_THRESHOLD
+        and vector_distance < eff_ceiling
+        and not is_mismatch(query, vector_answer or "")
+    )
 
     # === Формируем ответ ===
     result_lines = [
@@ -2730,7 +3155,9 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{'='*40}\n\n"
         f"📥 <b>Исходный:</b> <code>{query}</code>\n"
         f"🧹 <b>Очищенный:</b> <code>{clean}</code>\n"
-        f"🎚️ <b>Порог:</b> {VECTOR_THRESHOLD}\n"
+        f"🎚️ <b>Порог VECTOR_THRESHOLD:</b> {VECTOR_THRESHOLD}\n"
+        f"🧱 <b>Эфф. потолок</b> min(порог, VECTOR_AUTO_MAX): <code>{eff_ceiling}</code>\n"
+        f"📐 <b>Мин. margin топ1−топ2:</b> {VECTOR_CONFIDENCE_MARGIN}\n"
         f"⏱️ <b>База:</b> {'загружена' if (collection_general or collection_technical) else 'не загружена'}\n"
     ]
 
@@ -2739,13 +3166,19 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if verbose:
         result_lines.append(f"🧠 <b>Модель General</b>: ai-forever/sbert_large_nlu_ru\n")
         result_lines.append(f"🔧 <b>Модель Technical</b>: all-MiniLM-L6-v2\n\n")
+        result_lines.append(
+            f"🔎 <b>Ключ exact после preprocess</b> в индексе: "
+            f"General={'✅' if kw_in_general else '❌'}, "
+            f"Technical={'✅' if kw_in_technical else '❌'}\n"
+        )
+        result_lines.append(f"🔎 <b>repr(clean)</b>: <code>{repr(clean)}</code>\n\n")
 
     # ——— Ключевой поиск ———
-    result_lines.append("🔑 <b>КЛЮЧЕВОЙ ПОИСК</b>")
+    result_lines.append("🔑 <b>КЛЮЧЕВОЙ ПОИСК</b> (индекс)")
     if isinstance(keyword_answer, str) and keyword_answer.startswith("⚠️"):
         result_lines.append(f"❌ <b>Ошибка:</b> {keyword_answer}")
     elif keyword_answer:
-        result_lines.append(f"✅ <b>Найден в</b>: {keyword_source}")
+        result_lines.append(f"✅ <b>Найден</b> (exact/token индекс)")
         if verbose:
             result_lines.append(f"💬 <b>Ответ:</b> {keyword_answer[:200]}{'...' if len(keyword_answer) > 200 else ''}")
     else:
@@ -2756,24 +3189,40 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_lines.append("🎯 <b>ВЕКТОРНЫЙ ПОИСК</b>")
     if vector_source == "error":
         result_lines.append("❌ Ошибка выполнения")
-    elif vector_answer and vector_distance < VECTOR_THRESHOLD:
-        result_lines.append(f"✅ <b>Найден:</b> {vector_source}")
-        result_lines.append(f"📏 <b>Расстояние:</b> {vector_distance:.4f}")
+    elif vector_accepted:
+        result_lines.append(f"✅ <b>Будет принят как ответ бота</b>: {vector_source}")
+        result_lines.append(f"📏 <b>Расстояние:</b> {vector_distance:.4f} (&lt; {eff_ceiling})")
         if verbose:
             result_lines.append(f"💬 <b>Ответ:</b> {vector_answer[:200]}{'...' if len(vector_answer) > 200 else ''}")
     else:
-        result_lines.append("❌ Не прошёл по порогу")
+        result_lines.append("❌ Не пройден фильтры уверенности / порог / mismatch")
         result_lines.append(f"📏 <b>Лучшее расстояние:</b> {vector_distance:.4f}")
+    if vector_tried and verbose:
+        result_lines.append(f"🔁 <b>Варианты запроса:</b> " + " | ".join(f"<code>{t}</code>" for t in vector_tried))
     result_lines.append(f"⏱️ <b>Время:</b> {vector_time*1000:.1f} мс\n")
 
     # ——— ТОП-3 ———
-    if top_log and (verbose or len([l for l in top_log if float(l[1].split()[0]) < VECTOR_THRESHOLD]) > 0):
-        top3 = sorted(top_log, key=lambda x: float(x[1].split()[0]))[:3]
+    if top_log and verbose:
+        flat_logs = [x[1] if isinstance(x, (list, tuple)) and len(x) > 1 else x for x in top_log]
+
+        def _dist_key(entry):
+            try:
+                s = entry if isinstance(entry, str) else str(entry)
+                return float(s.split()[0])
+            except (ValueError, IndexError):
+                return 999.0
+
+        top3 = sorted(flat_logs, key=_dist_key)[:3]
         result_lines.append("📌 <b>ТОП-3 РЕЗУЛЬТАТА</b>")
-        for i, (_, item) in enumerate(top3, 1):
-            dist = item.split()[0]
-            preview = " ".join(item.split()[2:])[:60]
-            status = "✅" if float(dist) < VECTOR_THRESHOLD else "❌"
+        for i, item in enumerate(top3, 1):
+            parts = item.split()
+            dist = parts[0] if parts else "?"
+            preview = " ".join(parts[2:])[:60] if len(parts) > 2 else item[:60]
+            try:
+                ok = float(dist) < eff_ceiling
+            except ValueError:
+                ok = False
+            status = "✅" if ok else "❌"
             result_lines.append(f"{i}. {status} <code>{dist}</code> → {preview}")
         result_lines.append("")
 
@@ -2790,11 +3239,11 @@ async def testquery_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ——— Рекомендации ———
     result_lines.append("💡 <b>РЕКОМЕНДАЦИИ</b>")
-    if keyword_answer or (vector_answer and vector_distance < VECTOR_THRESHOLD):
-        result_lines.append("• ✅ Ответ будет найден и показан пользователю")
+    if keyword_answer or vector_accepted:
+        result_lines.append("• ✅ Ответ будет найден и показан пользователю (keyword или уверенный вектор)")
     else:
-        result_lines.append("• ❌ Ответ не найден — сработает Groq fallback")
-        result_lines.append("• Проверьте: написание, наличие в таблице, выполнен ли /reload")
+        result_lines.append("• ❌ По базе ответ не принят — сработает Groq fallback или «не найдено»")
+        result_lines.append("• Проверьте: формулировку, наличие в таблице, /reload, порог и AUTO_MAX")
     result_lines.append("")
 
     if verbose:
@@ -2847,6 +3296,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/logs — последние 200 строк лога\n"
         "/metrics — метрики производительности и времени ответа\n"
         "/threshold <число> — установить порог векторного поиска (0.0–1.0)\n\n"
+        "📐 Строка в логе при старте: «Векторные фильтры:»\n"
+        "• threshold — текущий VECTOR_THRESHOLD (команда /threshold и файл threshold.json; "
+        "в Chroma меньше distance = ближе к вопросу; ответ берётся только если distance строго меньше порога).\n"
+        "• auto_max_distance — потолок VECTOR_AUTO_MAX_DISTANCE (env), режет слишком «далёкие» совпадения "
+        "даже при большом threshold.\n"
+        "• effective_ceiling — min(threshold, auto_max_distance): фактический потолок расстояния для автоответа.\n"
+        "• confidence_margin — VECTOR_CONFIDENCE_MARGIN (env): разрыв топ-1−топ-2 логируется; приём ответа не блокируется.\n"
+        "• alt_full_query_max_dist — VECTOR_ALT_FULL_QUERY_MAX_DIST (env): отдельный строгий потолок для проверки "
+        "совпадений по «кускам» длинного сообщения по полному тексту.\n"
+        "• groq_improve_max_dist — VECTOR_GROQ_IMPROVE_MAX_DIST (env): улучшение ответа через Groq только если "
+        "векторное расстояние не хуже этого значения (иначе улучшение пропускается).\n"
+        "Дополнительно (env): VECTOR_QUERY_MIN_LEN_FOR_SPLIT — длина текста, после которой бот пробует "
+        "ещё короткие варианты запроса для эмбеддинга.\n\n"
         "🔔 **Алерты:**\n"
         "Бот автоматически уведомляет админов при превышении порога ошибок (10%)\n"
         "после минимум 20 запросов. Кулдаун между алертами: 1 час.\n\n"
@@ -3164,7 +3626,15 @@ if __name__ == "__main__":
     logger.info(f"🧪 ТЕСТ preprocess('касса доставки'): '{preprocess('касса доставки')}'")
 
     VECTOR_THRESHOLD = load_threshold()
-    
+    logger.info(
+        f"📐 Векторные фильтры: threshold={VECTOR_THRESHOLD}, "
+        f"auto_max_distance={VECTOR_AUTO_MAX_DISTANCE}, "
+        f"effective_ceiling={min(VECTOR_THRESHOLD, VECTOR_AUTO_MAX_DISTANCE):.3f}, "
+        f"alt_full_query_max_dist={VECTOR_ALT_FULL_QUERY_MAX_DIST}, "
+        f"confidence_margin={VECTOR_CONFIDENCE_MARGIN} (не блокирует приём), "
+        f"groq_improve_max_dist={VECTOR_GROQ_IMPROVE_MAX_DIST}"
+    )
+
     adminlist = load_adminlist()
     logger.info(f"📋 Текущих админов в списке: {len(adminlist)}")
     load_stats()
